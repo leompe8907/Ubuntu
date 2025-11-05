@@ -195,6 +195,8 @@ class AuthAuditLog(models.Model):
             models.Index(fields=['timestamp']),
             models.Index(fields=['subscriber_code']),
             models.Index(fields=['action_type']),
+            # Índice para optimizar consultas de rate limiting por UDID
+            models.Index(fields=['udid', 'timestamp']),
         ]
     
     def __str__(self):
@@ -310,6 +312,8 @@ class EncryptedCredentialsLog(models.Model):
             models.Index(fields=['timestamp']),
             models.Index(fields=['subscriber_code', 'app_type']),
             models.Index(fields=['udid']),
+            # Índice para optimizar consultas de rate limiting por UDID
+            models.Index(fields=['udid', 'timestamp']),
         ]
     
     def __str__(self):
@@ -376,6 +380,10 @@ class UDIDAuthRequest(models.Model):
             models.Index(fields=['sn']),
             models.Index(fields=['subscriber_code', 'sn']),
             models.Index(fields=['status', 'expires_at']),
+            # Índices para optimizar consultas de rate limiting
+            models.Index(fields=['device_fingerprint', 'created_at']),
+            models.Index(fields=['udid', 'created_at']),
+            models.Index(fields=['temp_token', 'created_at']),
         ]
     
     def save(self, *args, **kwargs):

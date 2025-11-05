@@ -42,6 +42,14 @@ class RequestUDIDManualView(APIView):
         """
         Paso 1: Generar UDID único para solicitud manual
         """
+        client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
+        logger.info(
+            f"RequestUDIDManualView: Request recibido - "
+            f"ip={client_ip}, user_agent={user_agent[:100] if user_agent else 'N/A'}"
+        )
+        
         try:
             # CAPA 1: Rate limiting por Device Fingerprint (en lugar de IP)
             device_fingerprint = generate_device_fingerprint(request)
@@ -53,6 +61,11 @@ class RequestUDIDManualView(APIView):
             )
             
             if not is_allowed:
+                logger.warning(
+                    f"RequestUDIDManualView: Rate limit excedido - "
+                    f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}, "
+                    f"retry_after={retry_after}s"
+                )
                 return Response({
                     "error": "Rate limit exceeded",
                     "message": "Too many requests from this device. Please try again later.",
@@ -64,7 +77,6 @@ class RequestUDIDManualView(APIView):
 
             # Generar UDID único
             udid = self.generate_unique_udid()
-            client_ip = get_client_ip(request)
             
             # Crear solicitud con device_fingerprint
             auth_request = UDIDAuthRequest.objects.create(
@@ -96,6 +108,12 @@ class RequestUDIDManualView(APIView):
             )
             
             # ✅ Incluir device_fingerprint en la respuesta
+            logger.info(
+                f"RequestUDIDManualView: UDID generado exitosamente - "
+                f"udid={udid}, device_fingerprint={device_fingerprint[:8]}..., "
+                f"ip={client_ip}, expires_at={auth_request.expires_at}"
+            )
+            
             return Response({
                 "udid": auth_request.udid,
                 "expires_at": auth_request.expires_at,
@@ -109,6 +127,10 @@ class RequestUDIDManualView(APIView):
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
+            logger.error(
+                f"RequestUDIDManualView: Error interno - "
+                f"ip={client_ip}, error={str(e)}", exc_info=True
+            )
             return Response({
                 "error": "Internal server error"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -128,10 +150,21 @@ class ValidateAndAssociateUDIDView(APIView):
         Valida y asocia un UDID con un subscriber.
         PROTEGIDO POR: UDID Rate Limiting
         """
+        client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
+        logger.info(
+            f"ValidateAndAssociateUDIDView: Request recibido - "
+            f"ip={client_ip}, data_keys={list(request.data.keys()) if request.data else 'N/A'}"
+        )
+        
         serializer = UDIDAssociationSerializer(data=request.data)
         
         if not serializer.is_valid():
-            logger.warning(f"Datos inválidos: {serializer.errors}")
+            logger.warning(
+                f"ValidateAndAssociateUDIDView: Datos inválidos - "
+                f"ip={client_ip}, errors={serializer.errors}"
+            )
             return Response({"errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         
         data = serializer.validated_data
@@ -157,6 +190,11 @@ class ValidateAndAssociateUDIDView(APIView):
             )
             
             if not is_allowed:
+                logger.warning(
+                    f"ValidateAndAssociateUDIDView: Rate limit excedido - "
+                    f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                    f"ip={client_ip}, retry_after={retry_after}s"
+                )
                 return Response({
                     "error": "Rate limit exceeded",
                     "message": "Too many association attempts for this UDID. Please try again later.",
@@ -196,7 +234,11 @@ class ValidateAndAssociateUDIDView(APIView):
 
             transaction.on_commit(_notify)
 
-        logger.info(f"[OK] Asociación exitosa para UDID: {udid_request.udid}")
+        logger.info(
+            f"ValidateAndAssociateUDIDView: Asociación exitosa - "
+            f"udid={udid_request.udid}, subscriber_code={subscriber.subscriber_code}, "
+            f"sn={sn}, operator_id={operator_id}, method={method}, ip={client_ip}"
+        )
         
         # Incrementar contador de rate limiting
         if udid:
@@ -224,6 +266,7 @@ class ValidateAndAssociateUDIDView(APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
     def associate_udid_with_subscriber(self, auth_request, subscriber, sn, operator_id, method, request):
+        """Método auxiliar para asociar UDID con subscriber (con logging interno)"""
         now = timezone.now()
         client_ip  = get_client_ip(request)
         user_agent = request.META.get("HTTP_USER_AGENT", "")
@@ -271,12 +314,27 @@ class AuthenticateWithUDIDView(APIView):
         app_type = request.data.get('app_type', 'android_tv')
         app_version = request.data.get('app_version', '1.0')
         client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+
+        logger.info(
+            f"AuthenticateWithUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"app_type={app_type}, app_version={app_version}, ip={client_ip}"
+        )
 
         if not udid:
+            logger.warning(
+                f"AuthenticateWithUDIDView: UDID faltante - ip={client_ip}"
+            )
             return Response({"error": "UDID is required"}, status=status.HTTP_400_BAD_REQUEST)
         
         # Validar app_type usando la función centralizada
         if not is_valid_app_type(app_type):
+            logger.warning(
+                f"AuthenticateWithUDIDView: app_type inválido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"app_type={app_type}, ip={client_ip}"
+            )
             return Response({
                 "error": f"Invalid app_type. Must be one of: android_tv, samsung_tv, lg_tv, set_top_box, mobile_app, web_player",
                 "received": app_type
@@ -292,6 +350,12 @@ class AuthenticateWithUDIDView(APIView):
         
         if should_delay and retry_delay > 0:
             # Aplicar delay de retry para distribuir reconexiones
+            logger.info(
+                f"AuthenticateWithUDIDView: Retry delay aplicado - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"retry_delay={retry_delay}s, attempt={attempt_number}, "
+                f"is_reconnection={is_reconnection}, ip={client_ip}"
+            )
             return Response({
                 "error": "Service temporarily unavailable",
                 "message": "System is handling high reconnection volume. Please retry after a short delay.",
@@ -448,6 +512,14 @@ class AuthenticateWithUDIDView(APIView):
                 if is_reconnection:
                     reset_retry_info(udid, 'reconnection')
 
+                logger.info(
+                    f"AuthenticateWithUDIDView: Autenticación exitosa - "
+                    f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                    f"subscriber_code={req.subscriber_code}, sn={req.sn}, "
+                    f"app_type={app_type}, app_version={app_version}, "
+                    f"is_reconnection={is_reconnection}, ip={client_ip}"
+                )
+
                 return Response({
                     "encrypted_credentials": encrypted_result,
                     "security_info": {
@@ -468,6 +540,12 @@ class AuthenticateWithUDIDView(APIView):
             if is_reconnection:
                 get_retry_info(udid, 'reconnection')  # Esto incrementa el contador
             
+            logger.error(
+                f"AuthenticateWithUDIDView: Error interno - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"app_type={app_type}, ip={client_ip}, error={str(e)}", exc_info=True
+            )
+            
             return Response({
                 "error": "Internal server error",
                 "details": str(e)
@@ -484,8 +562,17 @@ class ValidateStatusUDIDView(APIView):
         # ✅ Obtener UDID solo de query parameters o headers, NO del body
         udid = request.query_params.get('udid') or request.META.get('HTTP_X_UDID')
         client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+
+        logger.info(
+            f"ValidateStatusUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., ip={client_ip}"
+        )
 
         if not udid:
+            logger.warning(
+                f"ValidateStatusUDIDView: UDID faltante - ip={client_ip}"
+            )
             return Response({
                 "error": "UDID is required as query parameter or X-UDID header",
                 "usage_examples": {
@@ -515,6 +602,10 @@ class ValidateStatusUDIDView(APIView):
             req = UDIDAuthRequest.objects.get(udid=udid)
         except UDIDAuthRequest.DoesNotExist:
             # ✅ Log del intento con UDID inválido
+            logger.warning(
+                f"ValidateStatusUDIDView: UDID no encontrado - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., ip={client_ip}"
+            )
             AuthAuditLog.objects.create(
                 action_type='udid_validated',
                 udid=udid,
@@ -528,6 +619,11 @@ class ValidateStatusUDIDView(APIView):
 
         # ✅ Verificar si está revocado
         if req.status == 'revoked':
+            logger.info(
+                f"ValidateStatusUDIDView: UDID revocado - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"subscriber_code={req.subscriber_code}, ip={client_ip}"
+            )
             # Log del intento con UDID revocado
             AuthAuditLog.objects.create(
                 action_type='udid_validated',

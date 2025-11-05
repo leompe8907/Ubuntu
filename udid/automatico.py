@@ -36,6 +36,14 @@ class RequestUDIDView(APIView):
         Genera un UDID único para el dispositivo.
         PROTEGIDO POR: Device Fingerprint Rate Limiting
         """
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
+        logger.info(
+            f"RequestUDIDView: Request recibido - "
+            f"ip={client_ip}, user_agent={user_agent[:100] if user_agent else 'N/A'}"
+        )
+        
         try:
             # CAPA 1: Rate limiting por Device Fingerprint
             device_fingerprint = generate_device_fingerprint(request)
@@ -48,6 +56,11 @@ class RequestUDIDView(APIView):
             )
             
             if not is_allowed:
+                logger.warning(
+                    f"RequestUDIDView: Rate limit excedido - "
+                    f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}, "
+                    f"retry_after={retry_after}s"
+                )
                 return Response({
                     "error": "Rate limit exceeded",
                     "message": "Too many requests from this device. Please try again later.",
@@ -91,6 +104,12 @@ class RequestUDIDView(APIView):
                 }
             )
 
+            logger.info(
+                f"RequestUDIDView: UDID generado exitosamente - "
+                f"udid={generated_udid}, device_fingerprint={device_fingerprint[:8]}..., "
+                f"ip={client_ip}, expires_at={auth_request.expires_at}"
+            )
+            
             return Response({
                 "udid": auth_request.udid,
                 "temp_token": auth_request.temp_token,
@@ -103,7 +122,10 @@ class RequestUDIDView(APIView):
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
-            logger.error(f"Error en RequestUDIDView: {str(e)}", exc_info=True)
+            logger.error(
+                f"RequestUDIDView: Error interno - "
+                f"ip={client_ip}, error={str(e)}", exc_info=True
+            )
             return Response({
                 "error": "Internal server error",
                 "message": "An error occurred while processing your request"
@@ -117,14 +139,29 @@ class ValidateUDIDView(APIView):
         Valida un UDID con subscriber_code.
         PROTEGIDO POR: Combined Rate Limiting (UDID + Temp Token)
         """
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         # Intentar obtener parámetros del body primero, luego de query params
         udid = request.data.get('udid') or request.query_params.get('udid')
         temp_token = request.data.get('temp_token') or request.query_params.get('temp_token')
         subscriber_code = request.data.get('subscriber_code') or request.query_params.get('subscriber_code')
         operator_id = request.data.get('operator_id') or request.query_params.get('operator_id')
 
+        logger.info(
+            f"ValidateUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"subscriber_code={subscriber_code}, operator_id={operator_id}, ip={client_ip}"
+        )
+
         # Validaciones iniciales
         if not all([udid, temp_token, subscriber_code]):
+            logger.warning(
+                f"ValidateUDIDView: Parámetros incompletos - "
+                f"udid={'presente' if udid else 'faltante'}, "
+                f"temp_token={'presente' if temp_token else 'faltante'}, "
+                f"subscriber_code={'presente' if subscriber_code else 'faltante'}, ip={client_ip}"
+            )
             return Response({
                 "error": "Parámetros incompletos.",
                 "required": ["udid", "temp_token", "subscriber_code"]
@@ -138,6 +175,11 @@ class ValidateUDIDView(APIView):
         )
         
         if not is_allowed:
+            logger.warning(
+                f"ValidateUDIDView: Rate limit excedido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"reason={reason}, ip={client_ip}, retry_after={retry_after}s"
+            )
             return Response({
                 "error": "Rate limit exceeded",
                 "message": f"Too many validation attempts. {reason}",
@@ -150,17 +192,31 @@ class ValidateUDIDView(APIView):
         try:
             req = UDIDAuthRequest.objects.get(udid=udid, temp_token=temp_token)
         except UDIDAuthRequest.DoesNotExist:
+            logger.warning(
+                f"ValidateUDIDView: UDID o token inválido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., ip={client_ip}"
+            )
             return Response({
                 "error": "Solicitud inválida o token incorrecto."
             }, status=status.HTTP_404_NOT_FOUND)
 
         if req.status != "pending":
+            logger.warning(
+                f"ValidateUDIDView: UDID no está en estado pending - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"status={req.status}, ip={client_ip}"
+            )
             return Response({
                 "error": "El UDID ya fue validado, usado o revocado.",
                 "current_status": req.status
             }, status=status.HTTP_400_BAD_REQUEST)
 
         if req.is_expired():
+            logger.warning(
+                f"ValidateUDIDView: Token expirado - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"expires_at={req.expires_at}, ip={client_ip}"
+            )
             req.status = "expired"
             req.save()
             return Response({
@@ -168,6 +224,11 @@ class ValidateUDIDView(APIView):
             }, status=status.HTTP_400_BAD_REQUEST)
 
         if not ListOfSubscriber.objects.filter(code=subscriber_code).exists():
+            logger.warning(
+                f"ValidateUDIDView: Subscriber code inválido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"subscriber_code={subscriber_code}, ip={client_ip}"
+            )
             return Response({
                 "error": "Subscriber code no válido."
             }, status=status.HTTP_404_NOT_FOUND)
@@ -212,12 +273,24 @@ class GetSubscriberInfoView(APIView):
     permission_classes = [AllowAny]
     
     def get(self, request):
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         udid = request.query_params.get('udid')
         app_type = request.query_params.get('app_type')
         app_version = request.query_params.get('app_version', '1.0')
 
+        logger.info(
+            f"GetSubscriberInfoView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"app_type={app_type}, app_version={app_version}, ip={client_ip}"
+        )
+
         #✅ Validar que se haya pasado el UDID
         if not udid:
+            logger.warning(
+                f"GetSubscriberInfoView: UDID faltante - ip={client_ip}"
+            )
             return Response({
                 "error": "Parámetro 'udid' requerido."
             }, status=status.HTTP_400_BAD_REQUEST)
@@ -230,6 +303,11 @@ class GetSubscriberInfoView(APIView):
         )
         
         if not is_allowed:
+            logger.warning(
+                f"GetSubscriberInfoView: Rate limit excedido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"ip={client_ip}, retry_after={retry_after}s"
+            )
             return Response({
                 "error": "Rate limit exceeded",
                 "message": "Too many requests for this UDID. Please try again later.",
@@ -488,6 +566,13 @@ class GetSubscriberInfoView(APIView):
         # Incrementar contador de rate limiting
         increment_rate_limit_counter('udid', udid)
 
+        logger.info(
+            f"GetSubscriberInfoView: Información obtenida exitosamente - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"subscriber_code={subscriber_code}, sn_assigned={selected_subscriber.sn}, "
+            f"app_type={app_type}, available_smartcards={len(available_sns)}, ip={client_ip}"
+        )
+
         return Response({
             "subscriber_code": subscriber_code,
             "data": response_data,
@@ -570,11 +655,23 @@ class RevokeUDIDView(APIView):
     permission_classes = [AllowAny]
     
     def post(self, request):
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         udid = request.data.get('udid')
         operator = request.data.get('operator_id', 'manual')
         reason = request.data.get('reason', 'Revocación manual')
 
+        logger.info(
+            f"RevokeUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"operator={operator}, reason={reason}, ip={client_ip}"
+        )
+
         if not udid:
+            logger.warning(
+                f"RevokeUDIDView: UDID faltante - ip={client_ip}"
+            )
             return Response({"error": "Parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Rate limiting por UDID (previene revocaciones masivas)
@@ -705,6 +802,16 @@ class SNUsageStatsView(APIView):
     permission_classes = [AllowAny]
     
     def get(self, request):
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
+        subscriber_code = request.query_params.get('subscriber_code')
+        
+        logger.info(
+            f"SNUsageStatsView: Request recibido - "
+            f"subscriber_code={subscriber_code}, ip={client_ip}"
+        )
+        
         # Rate limiting por device fingerprint
         device_fingerprint = generate_device_fingerprint(request)
         is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
@@ -726,9 +833,10 @@ class SNUsageStatsView(APIView):
         # Incrementar contador
         increment_rate_limit_counter('device_fp', device_fingerprint)
         
-        subscriber_code = request.query_params.get('subscriber_code')
-        
         if not subscriber_code:
+            logger.warning(
+                f"SNUsageStatsView: subscriber_code faltante - ip={client_ip}"
+            )
             return Response({"error": "Parámetro 'subscriber_code' requerido."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Obtener todas las smartcards del subscriber
@@ -1023,10 +1131,22 @@ class ValidateDeviceAssociationView(APIView):
         """
         Endpoint para validar si un dispositivo tiene SN asociada
         """
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         udid = request.data.get('udid')
         device_fingerprint = request.data.get('device_fingerprint')
         
+        logger.info(
+            f"ValidateDeviceAssociationView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"device_fingerprint={'presente' if device_fingerprint else 'faltante'}, ip={client_ip}"
+        )
+        
         if not udid:
+            logger.warning(
+                f"ValidateDeviceAssociationView: UDID faltante - ip={client_ip}"
+            )
             return Response({
                 "error": "Parámetro 'udid' requerido"
             }, status=status.HTTP_400_BAD_REQUEST)
@@ -1108,11 +1228,23 @@ class OperatorRevokeUDIDView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         udid = request.data.get("udid")
         operator_id = request.data.get("operator_id", "manual")
         reason = request.data.get("reason", "Revocación operativa")
 
+        logger.info(
+            f"OperatorRevokeUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"operator_id={operator_id}, reason={reason}, ip={client_ip}"
+        )
+
         if not udid:
+            logger.warning(
+                f"OperatorRevokeUDIDView: UDID faltante - ip={client_ip}"
+            )
             return Response({"error": "El parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Rate limiting por UDID (previene revocaciones masivas)
@@ -1177,12 +1309,24 @@ class UserReleaseUDIDView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        client_ip = request.META.get('REMOTE_ADDR')
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         udid = request.data.get("udid")
         confirm = request.data.get("confirm", False)
         reason = request.data.get("reason", "Liberación solicitada por el usuario")
         operator_id = "user_request"
 
+        logger.info(
+            f"UserReleaseUDIDView: Request recibido - "
+            f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+            f"confirm={confirm}, reason={reason}, ip={client_ip}"
+        )
+
         if not udid:
+            logger.warning(
+                f"UserReleaseUDIDView: UDID faltante - ip={client_ip}"
+            )
             return Response({"error": "El parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
         
         # Rate limiting por UDID (previene liberaciones masivas)

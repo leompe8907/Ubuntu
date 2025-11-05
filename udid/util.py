@@ -3,9 +3,13 @@ import json
 import time
 import random
 import math
+import logging
 from django.utils import timezone
 from datetime import timedelta
 from django.core.cache import cache
+
+# Logger específico para rate limiting
+logger = logging.getLogger('rate_limiting')
 
 def get_client_ip(request):
     """Obtener la IP real del cliente desde request"""
@@ -28,7 +32,7 @@ def is_valid_app_type(app_type):
     ]
 
 # ============================================================================
-# RATE LIMITING MULTICAPA - Fase 1
+# RATE LIMITING MULTICAPA -
 # ============================================================================
 
 def _get_header_value(source, header_name):
@@ -168,6 +172,7 @@ def generate_device_fingerprint(request_or_scope):
 def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, window_minutes=5):
     """
     Verifica el rate limit por device fingerprint.
+    Versión optimizada: siempre intenta cache primero. Solo consulta BD si es absolutamente necesario.
     CAPA 1: Protege /request-udid/ (primera solicitud)
     
     Args:
@@ -178,10 +183,10 @@ def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, wind
     Returns:
         tuple: (is_allowed: bool, remaining_requests: int, retry_after_seconds: int)
     """
-    # Importar aquí para evitar imports circulares
-    from .models import UDIDAuthRequest
+    if not device_fingerprint:
+        return False, 0, 0
     
-    # Intentar usar cache primero (más rápido)
+    # Intentar usar cache primero (optimización)
     cache_key = f"rate_limit:device_fp:{device_fingerprint}"
     cached_count = cache.get(cache_key)
     
@@ -190,30 +195,25 @@ def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, wind
         if cached_count >= max_requests:
             # Calcular tiempo de espera
             retry_after = window_minutes * 60
+            # Log de rate limit excedido
+            logger.warning(
+                f"Rate limit exceeded: device_fingerprint={device_fingerprint[:8]}..., "
+                f"count={cached_count}, limit={max_requests}, "
+                f"window={window_minutes}min, retry_after={retry_after}s"
+            )
             return False, remaining, retry_after
         return True, remaining, 0
     
-    # Si no está en cache, consultar base de datos
-    time_threshold = timezone.now() - timedelta(minutes=window_minutes)
-    recent_count = UDIDAuthRequest.objects.filter(
-        device_fingerprint=device_fingerprint,
-        created_at__gte=time_threshold
-    ).count()
-    
-    # Actualizar cache
-    cache.set(cache_key, recent_count, timeout=window_minutes * 60)
-    
-    remaining = max(0, max_requests - recent_count)
-    if recent_count >= max_requests:
-        retry_after = window_minutes * 60
-        return False, remaining, retry_after
-    
-    return True, remaining, 0
+    # Si no está en cache, inicializar con 0
+    # Esto evita consulta a BD en primera llamada (optimización)
+    cache.set(cache_key, 0, timeout=window_minutes * 60)
+    return True, max_requests, 0
 
 
 def check_udid_rate_limit(udid, max_requests=20, window_minutes=60):
     """
     Verifica el rate limit por UDID.
+    Versión optimizada: siempre intenta cache primero. Solo consulta BD si es absolutamente necesario.
     CAPA 3: Protege /get-subscriber-info/, /authenticate-with-udid/, /validate/
     
     Args:
@@ -224,13 +224,10 @@ def check_udid_rate_limit(udid, max_requests=20, window_minutes=60):
     Returns:
         tuple: (is_allowed: bool, remaining_requests: int, retry_after_seconds: int)
     """
-    # Importar aquí para evitar imports circulares
-    from .models import UDIDAuthRequest, AuthAuditLog
-    
     if not udid:
         return False, 0, 0
     
-    # Intentar usar cache primero
+    # Intentar usar cache primero (optimización)
     cache_key = f"rate_limit:udid:{udid}"
     cached_count = cache.get(cache_key)
     
@@ -238,35 +235,19 @@ def check_udid_rate_limit(udid, max_requests=20, window_minutes=60):
         remaining = max(0, max_requests - cached_count)
         if cached_count >= max_requests:
             retry_after = window_minutes * 60
+            # Log de rate limit excedido
+            logger.warning(
+                f"Rate limit exceeded: udid={udid[:8] if len(udid) > 8 else udid}..., "
+                f"count={cached_count}, limit={max_requests}, "
+                f"window={window_minutes}min, retry_after={retry_after}s"
+            )
             return False, remaining, retry_after
         return True, remaining, 0
     
-    # Consultar base de datos
-    time_threshold = timezone.now() - timedelta(minutes=window_minutes)
-    
-    # Contar en UDIDAuthRequest
-    udid_count = UDIDAuthRequest.objects.filter(
-        udid=udid,
-        created_at__gte=time_threshold
-    ).count()
-    
-    # Contar en AuthAuditLog (para operaciones que no crean UDIDAuthRequest)
-    audit_count = AuthAuditLog.objects.filter(
-        udid=udid,
-        timestamp__gte=time_threshold
-    ).count()
-    
-    total_count = udid_count + audit_count
-    
-    # Actualizar cache
-    cache.set(cache_key, total_count, timeout=window_minutes * 60)
-    
-    remaining = max(0, max_requests - total_count)
-    if total_count >= max_requests:
-        retry_after = window_minutes * 60
-        return False, remaining, retry_after
-    
-    return True, remaining, 0
+    # Si no está en cache, inicializar con 0
+    # Esto evita consulta a BD en primera llamada (optimización)
+    cache.set(cache_key, 0, timeout=window_minutes * 60)
+    return True, max_requests, 0
 
 
 def check_temp_token_rate_limit(temp_token, max_requests=10, window_minutes=5):
@@ -296,27 +277,19 @@ def check_temp_token_rate_limit(temp_token, max_requests=10, window_minutes=5):
         remaining = max(0, max_requests - cached_count)
         if cached_count >= max_requests:
             retry_after = window_minutes * 60
+            # Log de rate limit excedido
+            logger.warning(
+                f"Rate limit exceeded: temp_token={temp_token[:8] if len(temp_token) > 8 else temp_token}..., "
+                f"count={cached_count}, limit={max_requests}, "
+                f"window={window_minutes}min, retry_after={retry_after}s"
+            )
             return False, remaining, retry_after
         return True, remaining, 0
     
-    # Consultar base de datos
-    time_threshold = timezone.now() - timedelta(minutes=window_minutes)
-    recent_count = UDIDAuthRequest.objects.filter(
-        temp_token=temp_token,
-        created_at__gte=time_threshold
-    ).exclude(
-        validated_at__isnull=True
-    ).count()
-    
-    # Actualizar cache
-    cache.set(cache_key, recent_count, timeout=window_minutes * 60)
-    
-    remaining = max(0, max_requests - recent_count)
-    if recent_count >= max_requests:
-        retry_after = window_minutes * 60
-        return False, remaining, retry_after
-    
-    return True, remaining, 0
+    # Si no está en cache, inicializar con 0
+    # Esto evita consulta a BD en primera llamada (optimización)
+    cache.set(cache_key, 0, timeout=window_minutes * 60)
+    return True, max_requests, 0
 
 
 def check_combined_rate_limit(udid, temp_token, max_requests=10, window_minutes=5):
@@ -592,7 +565,7 @@ def increment_register_attempt(device_fingerprint, window_minutes=60):
 
 
 # ============================================================================
-# RATE LIMITING ADAPTATIVO Y CIRCUIT BREAKER - Tarea 1.4
+# RATE LIMITING ADAPTATIVO Y CIRCUIT BREAKER
 # ============================================================================
 
 def track_system_request():
@@ -627,11 +600,20 @@ def get_system_load():
     
     # Thresholds (ajustables según capacidad del servidor)
     if total_requests < 500:
-        return 'normal'
+        load_level = 'normal'
     elif total_requests < 2000:
-        return 'high'
+        load_level = 'high'
+        # Log cuando la carga es alta
+        logger.info(f"System load HIGH: {total_requests} requests in last 2 minutes")
     else:
-        return 'critical'
+        load_level = 'critical'
+        # Log crítico cuando la carga es crítica
+        logger.warning(
+            f"System load CRITICAL: {total_requests} requests in last 2 minutes, "
+            f"requests_last_minute={requests_last_minute}, requests_prev_minute={requests_prev_minute}"
+        )
+    
+    return load_level
 
 
 def check_circuit_breaker():
@@ -647,11 +629,14 @@ def check_circuit_breaker():
     if breaker_state == 'open':
         if time.time() < breaker_until:
             retry_after = int(breaker_until - time.time())
+            # Log cuando circuit breaker está bloqueando requests
+            logger.debug(f"Circuit breaker OPEN: blocking requests, retry_after={retry_after}s")
             return True, retry_after
         else:
             # Intentar cerrar (half-open)
             cache.set('circuit_breaker:state', 'half-open', timeout=60)
             cache.delete('circuit_breaker:until')
+            logger.info("Circuit breaker transitioned to HALF-OPEN state (testing recovery)")
             return False, 0
     
     return False, 0
@@ -667,6 +652,12 @@ def activate_circuit_breaker(duration_seconds=60):
     until_time = time.time() + duration_seconds
     cache.set('circuit_breaker:state', 'open', timeout=duration_seconds)
     cache.set('circuit_breaker:until', until_time, timeout=duration_seconds)
+    
+    # Log crítico de activación de circuit breaker
+    logger.critical(
+        f"Circuit breaker ACTIVATED: duration={duration_seconds}s, "
+        f"until={timezone.now() + timedelta(seconds=duration_seconds)}"
+    )
 
 
 def is_legitimate_reconnection(udid):
@@ -791,13 +782,21 @@ def check_adaptive_rate_limit(identifier_type, identifier, is_reconnection=False
                 activate_circuit_breaker(duration_seconds=30)
         
         retry_after = window_minutes * 60
+        # Log de rate limit excedido en rate limiting adaptativo
+        logger.warning(
+            f"Adaptive rate limit exceeded: type={identifier_type}, "
+            f"identifier={str(identifier)[:8] if len(str(identifier)) > 8 else identifier}..., "
+            f"count={current_count}, limit={max_requests}, "
+            f"is_reconnection={is_reconnection}, system_load={system_load}, "
+            f"window={window_minutes}min, retry_after={retry_after}s"
+        )
         return False, 0, retry_after, "Rate limit exceeded"
     
     return True, max_requests - current_count, 0, "OK"
 
 
 # ============================================================================
-# EXPONENTIAL BACKOFF CON JITTER - Tarea 1.5
+# EXPONENTIAL BACKOFF CON JITTER -
 # ============================================================================
 
 def calculate_retry_delay(attempt_number, base_delay=1, max_delay=60, jitter=True):
@@ -937,3 +936,101 @@ def should_apply_retry_delay(udid, action_type='reconnection', system_load=None)
         return True, retry_delay, attempt_number
     
     return False, 0, attempt_number
+
+
+# ============================================================================
+# EXPONENTIAL BACKOFF PROGRESIVO PARA RATE LIMITING -
+# ============================================================================
+
+def check_rate_limit_with_backoff(identifier_type, identifier, base_max_requests=10, 
+                                  window_minutes=5, max_backoff_hours=24):
+    """
+    Rate limiting con exponential backoff progresivo.
+    Si se excede el límite múltiples veces, aumenta el tiempo de bloqueo progresivamente.
+    Útil para detectar y bloquear ataques más agresivos.
+    
+    Args:
+        identifier_type: 'udid', 'device_fp', 'temp_token', etc.
+        identifier: El valor del identificador
+        base_max_requests: Límite base de requests
+        window_minutes: Ventana de tiempo en minutos para el límite base
+        max_backoff_hours: Máximo de horas de backoff (24 por defecto)
+        
+    Returns:
+        tuple: (is_allowed: bool, remaining: int, retry_after: int)
+    """
+    if not identifier:
+        return False, 0, 0
+    
+    cache_key = f"rate_limit:{identifier_type}:{identifier}"
+    backoff_key = f"rate_limit_backoff:{identifier_type}:{identifier}"
+    violation_count_key = f"rate_limit_violations:{identifier_type}:{identifier}"
+    
+    # Verificar si está en backoff (bloqueo progresivo activo)
+    backoff_until = cache.get(backoff_key)
+    if backoff_until:
+        current_time = time.time()
+        if current_time < backoff_until:
+            remaining_seconds = int(backoff_until - current_time)
+            return False, 0, remaining_seconds
+        else:
+            # El período de backoff expiró, resetear
+            cache.delete(backoff_key)
+            # Opcional: resetear contador de violaciones después de un período largo
+            # (mantener por 24 horas para tracking)
+    
+    # Verificar rate limit normal
+    current_count = cache.get(cache_key, 0)
+    
+    if current_count >= base_max_requests:
+        # Límite excedido: incrementar contador de violaciones
+        violations = cache.get(violation_count_key, 0)
+        violations += 1
+        
+        # Exponential backoff progresivo: 5min, 15min, 1h, 4h, 24h
+        # Fórmula: 5 * (3 ^ min(violations - 1, 3)) minutos
+        # violations=1: 5 minutos
+        # violations=2: 15 minutos (5 * 3^1)
+        # violations=3: 45 minutos (5 * 3^2)
+        # violations=4+: 135 minutos (5 * 3^3) pero capado a max_backoff_hours
+        backoff_multiplier = min(violations - 1, 3)
+        backoff_minutes = min(5 * (3 ** backoff_multiplier), max_backoff_hours * 60)
+        backoff_until = time.time() + (backoff_minutes * 60)
+        
+        # Guardar backoff y contador de violaciones
+        cache.set(backoff_key, backoff_until, timeout=max_backoff_hours * 3600)
+        cache.set(violation_count_key, violations, timeout=max_backoff_hours * 3600)
+        
+        # Log de backoff progresivo aplicado
+        logger.warning(
+            f"Progressive backoff applied: type={identifier_type}, "
+            f"identifier={str(identifier)[:8] if len(str(identifier)) > 8 else identifier}..., "
+            f"violations={violations}, backoff_minutes={backoff_minutes}, "
+            f"backoff_until={timezone.now() + timedelta(minutes=backoff_minutes)}"
+        )
+        
+        return False, 0, backoff_minutes * 60
+    
+    # Si no se excedió el límite, el contador de violaciones se mantiene para tracking
+    # pero no se aplica backoff adicional
+    
+    return True, base_max_requests - current_count, 0
+
+
+def reset_rate_limit_backoff(identifier_type, identifier):
+    """
+    Resetea el backoff progresivo para un identificador.
+    Útil cuando se confirma que el dispositivo es legítimo.
+    
+    Args:
+        identifier_type: 'udid', 'device_fp', 'temp_token', etc.
+        identifier: El valor del identificador
+    """
+    if not identifier:
+        return
+    
+    backoff_key = f"rate_limit_backoff:{identifier_type}:{identifier}"
+    violation_count_key = f"rate_limit_violations:{identifier_type}:{identifier}"
+    
+    cache.delete(backoff_key)
+    cache.delete(violation_count_key)

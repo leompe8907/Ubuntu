@@ -19,12 +19,22 @@ from udid.util import (
     reset_login_attempts,
     check_register_rate_limit,
     increment_register_attempt,
+    check_adaptive_rate_limit,
+    get_system_load,
+    check_circuit_breaker,
+    get_client_ip,
 )
+import logging
+
+logger = logging.getLogger(__name__)
 
 class RegisterUserView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+        
         data = request.data
         username = data.get('username')
         password = data.get('password')
@@ -33,19 +43,49 @@ class RegisterUserView(APIView):
         email = data.get('email')
         operador = data.get('operador')
         documento = data.get('documento')
+        
+        logger.info(
+            f"RegisterUserView: Request recibido - "
+            f"username={username}, email={email}, operador={operador}, ip={client_ip}"
+        )
+
+        # Verificar circuit breaker antes de procesar
+        breaker_active, breaker_retry_after = check_circuit_breaker()
+        if breaker_active:
+            return Response({
+                "error": "Service temporarily unavailable",
+                "message": "System is under high load. Please try again later.",
+                "retry_after": breaker_retry_after
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+                "Retry-After": str(breaker_retry_after)
+            })
 
         # Rate limiting por device fingerprint
         device_fingerprint = generate_device_fingerprint(request)
-        is_allowed, remaining, retry_after = check_register_rate_limit(
-            device_fingerprint, max_requests=3, window_minutes=60
-        )
+        
+        # Usar rate limiting adaptativo si la carga del sistema es alta
+        system_load = get_system_load()
+        if system_load in ['high', 'critical']:
+            # Durante alta carga, usar rate limiting adaptativo más restrictivo
+            is_allowed, remaining, retry_after, reason = check_adaptive_rate_limit(
+                'device_fp', device_fingerprint, is_reconnection=False,
+                base_max_requests=2, base_window_minutes=60
+            )
+        else:
+            # Carga normal: usar rate limiting estándar
+            is_allowed, remaining, retry_after = check_register_rate_limit(
+                device_fingerprint, max_requests=3, window_minutes=60
+            )
+            reason = None
         
         if not is_allowed:
             return Response({
                 "error": "Rate limit exceeded",
                 "message": "Too many registration attempts from this device. Please try again later.",
                 "retry_after": retry_after,
-                "remaining_requests": remaining
+                "remaining_requests": remaining,
+                "system_load": system_load,
+                "reason": reason
             }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(retry_after)
             })
@@ -106,6 +146,12 @@ class RegisterUserView(APIView):
             # Incrementar contador de registro exitoso
             increment_register_attempt(device_fingerprint, window_minutes=60)
             
+            logger.info(
+                f"RegisterUserView: Usuario registrado exitosamente - "
+                f"username={username}, user_id={user.id}, email={email}, "
+                f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}"
+            )
+            
             # Si todo sale bien, devuelve una respuesta de éxito 201 Created
             return Response({
                 "message": "Usuario registrado exitosamente.",
@@ -118,23 +164,29 @@ class RegisterUserView(APIView):
             }, status=status.HTTP_201_CREATED)
 
         except IntegrityError as e:
-            # Si una IntegrityError ocurre aquí, probablemente sea por algo más,
-            # pero con esta corrección ya no debería ser por el OneToOneField.
-            # Podría ser si document_number fuera unique=True y se intentara un duplicado.
+            logger.error(
+                f"RegisterUserView: Error de integridad - "
+                f"username={username}, email={email}, ip={client_ip}, error={str(e)}", exc_info=True
+            )
             increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": f"Error de integridad en la base de datos: {str(e)}. El usuario pudo haberse creado pero el perfil no se completó."
             }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
+            logger.warning(
+                f"RegisterUserView: Error de validación - "
+                f"username={username}, ip={client_ip}, errors={e.message_dict}"
+            )
             increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": "Error de validación de datos del perfil.",
                 "details": e.message_dict
             }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            # Si ocurre un error aquí, es un problema del servidor.
-            # Es importante que si el usuario se creó pero el perfil no,
-            # sepas que ocurrió.
+            logger.error(
+                f"RegisterUserView: Error inesperado - "
+                f"username={username}, ip={client_ip}, error={str(e)}", exc_info=True
+            )
             increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": "Error inesperado al registrar el usuario.",
@@ -146,22 +198,64 @@ class LoginView(APIView):
     def post(self, request):
         username = request.data.get('username')
         password = request.data.get('password')
+        client_ip = get_client_ip(request)
+        user_agent = request.META.get('HTTP_USER_AGENT', '')
+
+        logger.info(
+            f"LoginView: Request recibido - "
+            f"username={username}, ip={client_ip}"
+        )
 
         if not all([username, password]):
+            logger.warning(
+                f"LoginView: Credenciales faltantes - "
+                f"username={'presente' if username else 'faltante'}, "
+                f"password={'presente' if password else 'faltante'}, ip={client_ip}"
+            )
             return Response({"error": "username y password son requeridos"}, status=400)
+
+        # Verificar circuit breaker antes de procesar
+        breaker_active, breaker_retry_after = check_circuit_breaker()
+        if breaker_active:
+            return Response({
+                "error": "Service temporarily unavailable",
+                "message": "System is under high load. Please try again later.",
+                "retry_after": breaker_retry_after
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+                "Retry-After": str(breaker_retry_after)
+            })
 
         # Rate limiting por username + device fingerprint
         device_fingerprint = generate_device_fingerprint(request)
-        is_allowed, remaining, retry_after = check_login_rate_limit(
-            username, device_fingerprint, max_attempts=5, window_minutes=15
-        )
+        
+        # Usar rate limiting adaptativo si la carga del sistema es alta
+        system_load = get_system_load()
+        if system_load in ['high', 'critical']:
+            # Durante alta carga, usar rate limiting adaptativo más restrictivo
+            is_allowed, remaining, retry_after, reason = check_adaptive_rate_limit(
+                'device_fp', device_fingerprint, is_reconnection=False,
+                base_max_requests=3, base_window_minutes=15
+            )
+        else:
+            # Carga normal: usar rate limiting estándar
+            is_allowed, remaining, retry_after = check_login_rate_limit(
+                username, device_fingerprint, max_attempts=5, window_minutes=15
+            )
+            reason = None
         
         if not is_allowed:
+            logger.warning(
+                f"LoginView: Rate limit excedido - "
+                f"username={username}, device_fingerprint={device_fingerprint[:8]}..., "
+                f"system_load={system_load}, ip={client_ip}, retry_after={retry_after}s"
+            )
             return Response({
                 "error": "Too many login attempts",
                 "message": "Please try again later",
                 "retry_after": retry_after,
-                "remaining_attempts": remaining
+                "remaining_attempts": remaining,
+                "system_load": system_load,
+                "reason": reason
             }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(retry_after)
             })
@@ -171,6 +265,12 @@ class LoginView(APIView):
         if user is None:
             # Incrementar contador de intentos fallidos
             increment_login_attempt(username, device_fingerprint, window_minutes=15)
+            
+            logger.warning(
+                f"LoginView: Credenciales inválidas - "
+                f"username={username}, device_fingerprint={device_fingerprint[:8]}..., "
+                f"remaining_attempts={remaining - 1}, ip={client_ip}"
+            )
             
             return Response({
                 "error": "Credenciales inválidas",
@@ -187,6 +287,12 @@ class LoginView(APIView):
             operator_code = user.userprofile.operator_code
         except:
             operator_code = None
+
+        logger.info(
+            f"LoginView: Login exitoso - "
+            f"username={username}, user_id={user.id}, operator_code={operator_code}, "
+            f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}"
+        )
 
         return Response({
             'refresh': str(refresh),
