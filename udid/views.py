@@ -42,8 +42,8 @@ class RequestUDIDManualView(APIView):
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=3,  # 3 requests por fingerprint cada 15 minutos
-                window_minutes=15
+                max_requests=3,  # 3 requests por fingerprint cada 5 minutos
+                window_minutes=5
             )
             
             if not is_allowed:
@@ -69,6 +69,9 @@ class RequestUDIDManualView(APIView):
                 device_fingerprint=device_fingerprint
             )
             
+            # ✅ Verificar que se guardó correctamente (recargar desde BD)
+            auth_request.refresh_from_db()
+            
             # Incrementar contador
             increment_rate_limit_counter('device_fp', device_fingerprint)
             
@@ -81,18 +84,21 @@ class RequestUDIDManualView(APIView):
                 details={
                     'method': 'manual_request',
                     'device_fingerprint': device_fingerprint,
+                    'device_fingerprint_stored': auth_request.device_fingerprint,  # ✅ Verificar almacenamiento
                     'rate_limit_remaining': remaining - 1
                 }
             )
             
+            # ✅ Incluir device_fingerprint en la respuesta
             return Response({
                 "udid": auth_request.udid,
                 "expires_at": auth_request.expires_at,
                 "status": auth_request.status,
                 "expires_in_minutes": 15,
+                "device_fingerprint": auth_request.device_fingerprint,  # ✅ Agregado a la respuesta
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 15 * 60
+                    "reset_in_seconds": 5 * 60
                 }
             }, status=status.HTTP_201_CREATED)
             

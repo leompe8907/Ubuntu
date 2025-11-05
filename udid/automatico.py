@@ -43,8 +43,8 @@ class RequestUDIDView(APIView):
             # Verificar rate limit
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=3,  # 3 requests por fingerprint cada 15 minutos
-                window_minutes=15
+                max_requests=3,  # 3 requests por fingerprint cada 5 minutos
+                window_minutes=5
             )
             
             if not is_allowed:
@@ -98,7 +98,7 @@ class RequestUDIDView(APIView):
                 "status": auth_request.status,
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 15 * 60
+                    "reset_in_seconds": 5 * 60
                 }
             }, status=status.HTTP_201_CREATED)
             

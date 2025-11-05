@@ -54,7 +54,7 @@ def generate_device_fingerprint(request):
     return device_fingerprint
 
 
-def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, window_minutes=15):
+def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, window_minutes=5):
     """
     Verifica el rate limit por device fingerprint.
     CAPA 1: Protege /request-udid/ (primera solicitud)
