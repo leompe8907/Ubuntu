@@ -40,11 +40,11 @@ class RequestUDIDView(APIView):
             # CAPA 1: Rate limiting por Device Fingerprint
             device_fingerprint = generate_device_fingerprint(request)
             
-            # Verificar rate limit
+            # Verificar rate limit (ajustado: más restrictivo)
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=3,  # 3 requests por fingerprint cada 5 minutos
-                window_minutes=5
+                max_requests=2,  # Reducido de 3 a 2 requests por fingerprint
+                window_minutes=10  # Aumentado de 5 a 10 minutos
             )
             
             if not is_allowed:
@@ -98,7 +98,7 @@ class RequestUDIDView(APIView):
                 "status": auth_request.status,
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 5 * 60
+                    "reset_in_seconds": 10 * 60  # Actualizado a 10 minutos
                 }
             }, status=status.HTTP_201_CREATED)
             
@@ -222,10 +222,10 @@ class GetSubscriberInfoView(APIView):
                 "error": "Parámetro 'udid' requerido."
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # CAPA 3: Rate limiting por UDID
+        # CAPA 3: Rate limiting por UDID (ajustado: más restrictivo)
         is_allowed, remaining, retry_after = check_udid_rate_limit(
             udid,
-            max_requests=20,  # 20 requests por UDID cada hora
+            max_requests=10,  # Reducido de 20 a 10 requests por UDID cada hora
             window_minutes=60
         )
         
@@ -568,6 +568,7 @@ class GetSubscriberInfoView(APIView):
 
 class RevokeUDIDView(APIView):
     permission_classes = [AllowAny]
+    
     def post(self, request):
         udid = request.data.get('udid')
         operator = request.data.get('operator_id', 'manual')
@@ -575,6 +576,24 @@ class RevokeUDIDView(APIView):
 
         if not udid:
             return Response({"error": "Parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Rate limiting por UDID (previene revocaciones masivas)
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid, max_requests=3, window_minutes=60
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many revocation attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador
+        increment_rate_limit_counter('udid', udid)
 
         try:
             req = UDIDAuthRequest.objects.get(udid=udid)
@@ -610,7 +629,29 @@ class RevokeUDIDView(APIView):
 
 class ListUDIDRequestsView(APIView):
     permission_classes = [AllowAny]
+    
     def get(self, request):
+        # Rate limiting por device fingerprint (previene abuso de queries)
+        device_fingerprint = generate_device_fingerprint(request)
+        is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
+            device_fingerprint,
+            max_requests=10,  # 10 consultas por dispositivo cada 5 minutos
+            window_minutes=5
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many requests. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador
+        increment_rate_limit_counter('device_fp', device_fingerprint)
+        
         subscriber_code = request.query_params.get('subscriber_code')
         status_filter = request.query_params.get('status')
         udid = request.query_params.get('udid')
@@ -651,11 +692,40 @@ class ListUDIDRequestsView(APIView):
                 "attempts_count": obj.attempts_count,
             })
 
-        return Response(data, status=status.HTTP_200_OK)
+        return Response({
+            "results": data,
+            "count": len(data),
+            "rate_limit": {
+                "remaining": remaining - 1,
+                "reset_in_seconds": 5 * 60
+            }
+        }, status=status.HTTP_200_OK)
 
 class SNUsageStatsView(APIView):
     permission_classes = [AllowAny]
+    
     def get(self, request):
+        # Rate limiting por device fingerprint
+        device_fingerprint = generate_device_fingerprint(request)
+        is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
+            device_fingerprint,
+            max_requests=10,  # 10 consultas por dispositivo cada 5 minutos
+            window_minutes=5
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many requests. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador
+        increment_rate_limit_counter('device_fp', device_fingerprint)
+        
         subscriber_code = request.query_params.get('subscriber_code')
         
         if not subscriber_code:
@@ -726,7 +796,11 @@ class SNUsageStatsView(APIView):
             "available_smartcards": available_count,
             "usage_by_app_type": app_type_stats,
             "smartcards": smartcards_status,
-            "policy": "Each smartcard can only be active on one app type at a time"
+            "policy": "Each smartcard can only be active on one app type at a time",
+            "rate_limit": {
+                "remaining": remaining - 1,
+                "reset_in_seconds": 5 * 60
+            }
         }, status=status.HTTP_200_OK)
 
 class ValidateUDIDView(APIView):
@@ -957,6 +1031,24 @@ class ValidateDeviceAssociationView(APIView):
                 "error": "Parámetro 'udid' requerido"
             }, status=status.HTTP_400_BAD_REQUEST)
         
+        # Rate limiting por UDID
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid, max_requests=10, window_minutes=5
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many validation attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador
+        increment_rate_limit_counter('udid', udid)
+        
         # Obtener información del cliente
         client_ip = request.META.get('REMOTE_ADDR')
         user_agent = request.META.get('HTTP_USER_AGENT', '')
@@ -1022,6 +1114,24 @@ class OperatorRevokeUDIDView(APIView):
 
         if not udid:
             return Response({"error": "El parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Rate limiting por UDID (previene revocaciones masivas)
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid, max_requests=3, window_minutes=60
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many revocation attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador
+        increment_rate_limit_counter('udid', udid)
 
         try:
             req = UDIDAuthRequest.objects.get(udid=udid)
@@ -1074,6 +1184,25 @@ class UserReleaseUDIDView(APIView):
 
         if not udid:
             return Response({"error": "El parámetro 'udid' es requerido."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Rate limiting por UDID (previene liberaciones masivas)
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid, max_requests=3, window_minutes=60
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many release attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+        
+        # Incrementar contador solo si no es confirmación
+        if not confirm:
+            increment_rate_limit_counter('udid', udid)
 
         try:
             req = UDIDAuthRequest.objects.get(udid=udid)

@@ -99,6 +99,7 @@ else:
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "udid.middleware.SystemLoadTrackingMiddleware",  # Rastreo de carga para rate limiting adaptativo
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",

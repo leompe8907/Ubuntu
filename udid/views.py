@@ -24,7 +24,13 @@ import json
 
 from .management.commands.keyGenerator import hybrid_encrypt_for_app
 from .serializers import UDIDAssociationSerializer, PublicSubscriberInfoSerializer
-from .util import get_client_ip, compute_encrypted_hash, json_serialize_credentials, is_valid_app_type, generate_device_fingerprint, check_device_fingerprint_rate_limit, check_udid_rate_limit, check_combined_rate_limit, increment_rate_limit_counter
+from .util import (
+    get_client_ip, compute_encrypted_hash, json_serialize_credentials, is_valid_app_type,
+    generate_device_fingerprint, check_device_fingerprint_rate_limit, check_udid_rate_limit,
+    check_combined_rate_limit, increment_rate_limit_counter,
+    is_legitimate_reconnection, check_adaptive_rate_limit,
+    should_apply_retry_delay, reset_retry_info, get_retry_info
+)
 from .models import UDIDAuthRequest, AuthAuditLog, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
 
 logger = logging.getLogger(__name__)
@@ -42,8 +48,8 @@ class RequestUDIDManualView(APIView):
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=3,  # 3 requests por fingerprint cada 5 minutos
-                window_minutes=5
+                max_requests=2,  # Reducido de 3 a 2 requests por fingerprint
+                window_minutes=10  # Aumentado de 5 a 10 minutos
             )
             
             if not is_allowed:
@@ -98,7 +104,7 @@ class RequestUDIDManualView(APIView):
                 "device_fingerprint": auth_request.device_fingerprint,  # ✅ Agregado a la respuesta
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 5 * 60
+                    "reset_in_seconds": 10 * 60  # Actualizado a 10 minutos
                 }
             }, status=status.HTTP_201_CREATED)
             
@@ -146,7 +152,7 @@ class ValidateAndAssociateUDIDView(APIView):
         if udid:
             is_allowed, remaining, retry_after = check_udid_rate_limit(
                 udid,
-                max_requests=10,  # 10 asociaciones por UDID cada hora
+                max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
                 window_minutes=60
             )
             
@@ -276,22 +282,61 @@ class AuthenticateWithUDIDView(APIView):
                 "received": app_type
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # CAPA 3: Rate limiting por UDID
-        is_allowed, remaining, retry_after = check_udid_rate_limit(
-            udid,
-            max_requests=10,  # 10 autenticaciones por UDID cada hora
-            window_minutes=60
+        # Verificar si es reconexión legítima
+        is_reconnection = is_legitimate_reconnection(udid)
+        
+        # Verificar si se debe aplicar delay de retry (exponential backoff con jitter)
+        should_delay, retry_delay, attempt_number = should_apply_retry_delay(
+            udid, action_type='reconnection'
         )
         
-        if not is_allowed:
+        if should_delay and retry_delay > 0:
+            # Aplicar delay de retry para distribuir reconexiones
             return Response({
-                "error": "Rate limit exceeded",
-                "message": "Too many authentication attempts for this UDID. Please try again later.",
-                "retry_after": retry_after,
-                "remaining_requests": remaining
-            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
-                "Retry-After": str(retry_after)
+                "error": "Service temporarily unavailable",
+                "message": "System is handling high reconnection volume. Please retry after a short delay.",
+                "retry_after": retry_delay,
+                "attempt": attempt_number,
+                "is_reconnection": is_reconnection
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+                "Retry-After": str(retry_delay),
+                "X-Retry-After": str(retry_delay)
             })
+
+        # Rate limiting adaptativo (usa check_adaptive_rate_limit si es reconexión)
+        if is_reconnection:
+            is_allowed, remaining, retry_after, reason = check_adaptive_rate_limit(
+                'udid', udid, is_reconnection=True
+            )
+        else:
+            is_allowed, remaining, retry_after = check_udid_rate_limit(
+                udid,
+                max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
+                window_minutes=60
+            )
+        
+        if not is_allowed:
+            # Si es reconexión y fue rechazada, calcular delay adicional
+            if is_reconnection:
+                retry_delay, _ = get_retry_info(udid, 'reconnection')
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "System is handling high reconnection volume. Please retry.",
+                    "retry_after": retry_delay,
+                    "is_reconnection": True,
+                    "reason": reason if is_reconnection else None
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_delay)
+                })
+            else:
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "Too many authentication attempts for this UDID. Please try again later.",
+                    "retry_after": retry_after,
+                    "remaining_requests": remaining
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_after)
+                })
 
         try:
             with transaction.atomic():
@@ -398,6 +443,10 @@ class AuthenticateWithUDIDView(APIView):
                 
                 # Incrementar contador de rate limiting
                 increment_rate_limit_counter('udid', udid)
+                
+                # Si es exitoso, resetear retry info (reconexión exitosa)
+                if is_reconnection:
+                    reset_retry_info(udid, 'reconnection')
 
                 return Response({
                     "encrypted_credentials": encrypted_result,
@@ -415,6 +464,10 @@ class AuthenticateWithUDIDView(APIView):
                 }, status=status.HTTP_200_OK)
 
         except Exception as e:
+            # En caso de error, incrementar retry info (para next retry)
+            if is_reconnection:
+                get_retry_info(udid, 'reconnection')  # Esto incrementa el contador
+            
             return Response({
                 "error": "Internal server error",
                 "details": str(e)
@@ -441,10 +494,10 @@ class ValidateStatusUDIDView(APIView):
                 }
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # CAPA 3: Rate limiting por UDID
+        # CAPA 3: Rate limiting por UDID (ajustado: más restrictivo)
         is_allowed, remaining, retry_after = check_udid_rate_limit(
             udid,
-            max_requests=30,  # 30 validaciones por UDID cada 5 minutos
+            max_requests=20,  # Reducido de 30 a 20 validaciones por UDID cada 5 minutos
             window_minutes=5
         )
         

@@ -12,6 +12,14 @@ from django.core.exceptions import ValidationError
 from django.contrib.auth.hashers import make_password
 
 from udid.models import UserProfile
+from udid.util import (
+    generate_device_fingerprint,
+    check_login_rate_limit,
+    increment_login_attempt,
+    reset_login_attempts,
+    check_register_rate_limit,
+    increment_register_attempt,
+)
 
 class RegisterUserView(APIView):
     permission_classes = [AllowAny]
@@ -26,6 +34,22 @@ class RegisterUserView(APIView):
         operador = data.get('operador')
         documento = data.get('documento')
 
+        # Rate limiting por device fingerprint
+        device_fingerprint = generate_device_fingerprint(request)
+        is_allowed, remaining, retry_after = check_register_rate_limit(
+            device_fingerprint, max_requests=3, window_minutes=60
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many registration attempts from this device. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+
         # ... (Validaciones de campos requeridos y de duplicados de User) ...
         missing_fields = []
         if not username: missing_fields.append('username')
@@ -37,13 +61,17 @@ class RegisterUserView(APIView):
         if not documento: missing_fields.append('documento')
 
         if missing_fields:
+            # Incrementar contador aunque falle la validación (previene abuso)
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": f"Faltan campos requeridos: {', '.join(missing_fields)}"
             }, status=status.HTTP_400_BAD_REQUEST)
 
         if User.objects.filter(username=username).exists():
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({"error": "El nombre de usuario ya existe."}, status=status.HTTP_400_BAD_REQUEST)
         if User.objects.filter(email=email).exists():
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({"error": "El correo electrónico ya está registrado."}, status=status.HTTP_400_BAD_REQUEST)
 
         # **ATENCIÓN**: Si `document_number` debería ser único,
@@ -51,6 +79,7 @@ class RegisterUserView(APIView):
         # De lo contrario, esta validación solo previene duplicados en la misma ejecución
         # pero la DB los permitirá si se inserta desde otro lado o si se remueve esta validación.
         if UserProfile.objects.filter(document_number=documento).exists():
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({"error": "Este documento ya está registrado."}, status=status.HTTP_400_BAD_REQUEST)
 
         # ✅ Crear usuario y actualizar perfil
@@ -74,21 +103,30 @@ class RegisterUserView(APIView):
             user_profile.document_number = documento
             user_profile.save() # Guardar los cambios en el perfil
 
+            # Incrementar contador de registro exitoso
+            increment_register_attempt(device_fingerprint, window_minutes=60)
+            
             # Si todo sale bien, devuelve una respuesta de éxito 201 Created
             return Response({
                 "message": "Usuario registrado exitosamente.",
                 "user_id": user.id,
-                "username": user.username
+                "username": user.username,
+                "rate_limit": {
+                    "remaining": remaining - 1,
+                    "reset_in_seconds": 60 * 60
+                }
             }, status=status.HTTP_201_CREATED)
 
         except IntegrityError as e:
             # Si una IntegrityError ocurre aquí, probablemente sea por algo más,
             # pero con esta corrección ya no debería ser por el OneToOneField.
             # Podría ser si document_number fuera unique=True y se intentara un duplicado.
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": f"Error de integridad en la base de datos: {str(e)}. El usuario pudo haberse creado pero el perfil no se completó."
             }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": "Error de validación de datos del perfil.",
                 "details": e.message_dict
@@ -97,12 +135,14 @@ class RegisterUserView(APIView):
             # Si ocurre un error aquí, es un problema del servidor.
             # Es importante que si el usuario se creó pero el perfil no,
             # sepas que ocurrió.
+            increment_register_attempt(device_fingerprint, window_minutes=60)
             return Response({
                 "error": "Error inesperado al registrar el usuario.",
                 "details": str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 class LoginView(APIView):
     permission_classes = [AllowAny]
+    
     def post(self, request):
         username = request.data.get('username')
         password = request.data.get('password')
@@ -110,10 +150,35 @@ class LoginView(APIView):
         if not all([username, password]):
             return Response({"error": "username y password son requeridos"}, status=400)
 
+        # Rate limiting por username + device fingerprint
+        device_fingerprint = generate_device_fingerprint(request)
+        is_allowed, remaining, retry_after = check_login_rate_limit(
+            username, device_fingerprint, max_attempts=5, window_minutes=15
+        )
+        
+        if not is_allowed:
+            return Response({
+                "error": "Too many login attempts",
+                "message": "Please try again later",
+                "retry_after": retry_after,
+                "remaining_attempts": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+
         user = authenticate(username=username, password=password)
 
         if user is None:
-            return Response({"error": "Credenciales inválidas"}, status=status.HTTP_401_UNAUTHORIZED)
+            # Incrementar contador de intentos fallidos
+            increment_login_attempt(username, device_fingerprint, window_minutes=15)
+            
+            return Response({
+                "error": "Credenciales inválidas",
+                "remaining_attempts": remaining - 1
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Login exitoso: resetear contador de intentos
+        reset_login_attempts(username, device_fingerprint)
 
         refresh = RefreshToken.for_user(user)
 
@@ -128,5 +193,9 @@ class LoginView(APIView):
             'access': str(refresh.access_token),
             'username': user.username,
             'email': user.email,
-            'operator_code': operator_code
+            'operator_code': operator_code,
+            'rate_limit': {
+                'remaining_attempts': 5,  # Reseteado después de login exitoso
+                'reset_in_seconds': 0
+            }
         }, status=status.HTTP_200_OK)
