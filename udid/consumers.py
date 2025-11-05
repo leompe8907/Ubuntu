@@ -7,6 +7,12 @@ from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
 
 from .services import authenticate_with_udid_service
+from .util import (
+    generate_device_fingerprint,
+    check_websocket_rate_limit,
+    increment_websocket_connection,
+    decrement_websocket_connection,
+)
 
 def _get_header(scope, key: str) -> str:
     """Obtiene un header HTTP del scope ASGI en minúsculas."""
@@ -39,11 +45,36 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         self.app_version = None
         self.group_name = None
         self.done = False
+        self.device_fingerprint = None
 
         # tareas async opcionales
         self.timeout_task = None
         self.poll_task = None
 
+        # Rate limiting: verificar antes de aceptar conexión
+        # Obtener device fingerprint del scope
+        self.device_fingerprint = await sync_to_async(generate_device_fingerprint)(self.scope)
+        
+        # Verificar rate limit (UDID aún no disponible, solo device fingerprint)
+        is_allowed, remaining, retry_after = await sync_to_async(check_websocket_rate_limit)(
+            udid=None,  # Aún no se conoce el UDID
+            device_fingerprint=self.device_fingerprint,
+            max_connections=5,
+            window_minutes=5
+        )
+        
+        if not is_allowed:
+            # Rechazar conexión si excede el límite
+            await self.close(code=4001, reason=f"Too many connections. Retry after {retry_after}s")
+            return
+        
+        # Incrementar contador de conexiones activas
+        await sync_to_async(increment_websocket_connection)(
+            udid=None,
+            device_fingerprint=self.device_fingerprint,
+            window_minutes=5
+        )
+        
         await self.accept()
 
     async def receive(self, text_data=None, bytes_data=None):
@@ -70,6 +101,30 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         self.app_version = (data.get("app_version") or "1.0").strip()
         if not self.udid:
             return await self._send_err("missing_udid", "UDID es requerido", close=True)
+        
+        # Verificar rate limit con UDID (ahora que lo conocemos)
+        if self.udid:
+            is_allowed, remaining, retry_after = await sync_to_async(check_websocket_rate_limit)(
+                udid=self.udid,
+                device_fingerprint=self.device_fingerprint,
+                max_connections=5,
+                window_minutes=5
+            )
+            
+            if not is_allowed:
+                await self._send_err(
+                    "rate_limit_exceeded",
+                    f"Too many connections for this device. Retry after {retry_after}s",
+                    close=True
+                )
+                return
+            
+            # Incrementar contador con UDID ahora que lo conocemos
+            await sync_to_async(increment_websocket_connection)(
+                udid=self.udid,
+                device_fingerprint=self.device_fingerprint,
+                window_minutes=5
+            )
 
         # Metadatos de cliente (para auditoría del servicio)
         client_ip = (self.scope.get("client") or [""])[0] or ""
@@ -229,6 +284,13 @@ class AuthWaitWS(AsyncWebsocketConsumer):
 
     async def _cleanup(self):
         self.done = True
+
+        # Decrementar contador de conexiones WebSocket
+        if self.device_fingerprint:
+            await sync_to_async(decrement_websocket_connection)(
+                udid=self.udid,
+                device_fingerprint=self.device_fingerprint
+            )
 
         if getattr(self, "group_name", None):
             try:

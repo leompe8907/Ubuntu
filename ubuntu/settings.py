@@ -62,7 +62,7 @@ ASGI_APPLICATION = 'ubuntu.asgi.application'
 REDIS_URL = os.getenv("REDIS_URL")
 
 # Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
-UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "600"))  # 10 min
+UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "60"))  # Reducido de 600 a 60 segundos para mejor protección
 
 # Si querés habilitar un polling de respaldo (además del evento push)
 UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
@@ -216,6 +216,13 @@ CORS_ALLOW_HEADERS = [
     'x-app-version',
     'x-device-id',
     'x-app-type',
+    # Headers mejorados para device fingerprint (móviles y Smart TVs)
+    'x-os-version',        # Versión del sistema operativo
+    'x-device-model',      # Modelo del dispositivo
+    'x-build-id',          # Build fingerprint (Android)
+    'x-tv-serial',         # Serial number (Smart TVs)
+    'x-tv-model',          # Modelo específico (Smart TVs)
+    'x-firmware-version',  # Versión de firmware (Smart TVs)
 ]
 
 #* Configurar Seguridad para API Server
@@ -314,14 +321,36 @@ CRON_CLASSES = [
 ]
 
 #* Configuración de cache para Django
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake',
-        'TIMEOUT': 300,
-        'OPTIONS': {
-            'MAX_ENTRIES': 1000,
-            'CULL_FREQUENCY': 3,
+# Migrado a Redis distribuido para rate limiting entre múltiples instancias
+if REDIS_URL:
+    # Usar Redis como cache backend (distribuido)
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                'SOCKET_CONNECT_TIMEOUT': 5,
+                'SOCKET_TIMEOUT': 5,
+                'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+                'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+            },
+            'KEY_PREFIX': 'udid_cache',
+            'TIMEOUT': 300,  # 5 minutos por defecto
         }
     }
-}
+else:
+    # Fallback a cache local si Redis no está disponible (solo para desarrollo)
+    # ⚠️ ADVERTENCIA: En producción con múltiples instancias, esto causará problemas
+    # de rate limiting. Asegúrate de configurar REDIS_URL.
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'unique-snowflake',
+            'TIMEOUT': 300,
+            'OPTIONS': {
+                'MAX_ENTRIES': 1000,
+                'CULL_FREQUENCY': 3,
+            }
+        }
+    }

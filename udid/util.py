@@ -28,25 +28,133 @@ def is_valid_app_type(app_type):
 # RATE LIMITING MULTICAPA - Fase 1
 # ============================================================================
 
-def generate_device_fingerprint(request):
+def _get_header_value(source, header_name):
     """
-    Genera un fingerprint único del dispositivo basado en características del request.
+    Obtiene el valor de un header desde request.META (HTTP) o scope (WebSocket).
+    
+    Args:
+        source: Request object (tiene .META) o scope dict (tiene ['headers'])
+        header_name: Nombre del header en formato Django (ej: 'HTTP_X_DEVICE_ID')
+        
+    Returns:
+        str: Valor del header o string vacío
+    """
+    # Si es un request object (HTTP)
+    if hasattr(source, 'META'):
+        return source.META.get(header_name, '')
+    
+    # Si es un scope dict (WebSocket)
+    elif isinstance(source, dict) and 'headers' in source:
+        headers = dict(source.get('headers', []))
+        
+        # Convertir nombre de header Django a formato HTTP estándar
+        # 'HTTP_X_DEVICE_ID' -> 'x-device-id'
+        # 'HTTP_USER_AGENT' -> 'user-agent'
+        header_key = header_name.lower()
+        
+        # Remover prefijo 'HTTP_' si existe
+        if header_key.startswith('http_'):
+            header_key = header_key[5:]  # Remover 'http_'
+        
+        # Convertir snake_case a kebab-case
+        header_key = header_key.replace('_', '-')
+        
+        # Buscar en headers (los headers en scope están en formato (bytes, bytes))
+        header_key_bytes = header_key.encode().lower()
+        
+        # Buscar en el diccionario de headers
+        for key, value in headers.items():
+            if isinstance(key, bytes) and key.lower() == header_key_bytes:
+                if isinstance(value, bytes):
+                    return value.decode(errors='ignore')
+                return str(value)
+        
+        return ''
+    
+    return ''
+
+
+def _build_device_fingerprint_string(headers_dict):
+    """
+    Construye el string de fingerprint a partir de un diccionario de headers.
+    Función centralizada para evitar duplicación de código.
+    
+    Args:
+        headers_dict: Diccionario con todos los headers necesarios
+        
+    Returns:
+        str: String para hashear
+    """
+    app_type = headers_dict.get('app_type', '')
+    
+    # Combinar factores según el tipo de app para mayor robustez
+    if app_type in ['android_tv', 'samsung_tv', 'lg_tv', 'set_top_box']:
+        # Smart TV: usar serial, model, firmware (más difícil de falsificar)
+        fingerprint_string = (
+            f"{app_type}|{headers_dict.get('tv_serial', '')}|"
+            f"{headers_dict.get('tv_model', '')}|{headers_dict.get('firmware_version', '')}|"
+            f"{headers_dict.get('device_id', '')}|{headers_dict.get('app_version', '')}|"
+            f"{headers_dict.get('user_agent', '')}"
+        )
+    elif app_type in ['android_mobile', 'ios_mobile', 'mobile_app']:
+        # Móvil: usar device_id, build_id, model, os_version (identificadores nativos)
+        fingerprint_string = (
+            f"{app_type}|{headers_dict.get('device_id', '')}|"
+            f"{headers_dict.get('build_id', '')}|{headers_dict.get('device_model', '')}|"
+            f"{headers_dict.get('os_version', '')}|{headers_dict.get('app_version', '')}|"
+            f"{headers_dict.get('user_agent', '')}"
+        )
+    else:
+        # Fallback: usar headers básicos + app_type si está disponible
+        fingerprint_string = (
+            f"{headers_dict.get('user_agent', '')}|"
+            f"{headers_dict.get('accept_language', '')}|"
+            f"{headers_dict.get('accept_encoding', '')}|"
+            f"{headers_dict.get('accept', '')}|{app_type}|"
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('device_id', '')}"
+        )
+    
+    return fingerprint_string
+
+
+def generate_device_fingerprint(request_or_scope):
+    """
+    Genera un fingerprint único del dispositivo basado en características del request/scope.
+    Mejorado para móviles y Smart TVs con headers específicos.
+    Funciona tanto con objetos request (HTTP) como con scope dict (WebSocket).
+    
     CAPA 1: Para primera solicitud sin UDID
     
     Args:
-        request: Request object de Django
+        request_or_scope: Request object de Django (HTTP) o scope dict (WebSocket)
         
     Returns:
         str: Hash único del dispositivo (32 caracteres)
     """
-    # Combinar múltiples características del dispositivo
-    user_agent = request.META.get('HTTP_USER_AGENT', '')
-    accept_language = request.META.get('HTTP_ACCEPT_LANGUAGE', '')
-    accept_encoding = request.META.get('HTTP_ACCEPT_ENCODING', '')
-    accept = request.META.get('HTTP_ACCEPT', '')
+    # Extraer headers desde request o scope
+    headers_dict = {
+        # Factores básicos (siempre disponibles)
+        'user_agent': _get_header_value(request_or_scope, 'HTTP_USER_AGENT'),
+        'accept_language': _get_header_value(request_or_scope, 'HTTP_ACCEPT_LANGUAGE'),
+        'accept_encoding': _get_header_value(request_or_scope, 'HTTP_ACCEPT_ENCODING'),
+        'accept': _get_header_value(request_or_scope, 'HTTP_ACCEPT'),
+        
+        # Factores específicos de móviles/Smart TVs
+        'device_id': _get_header_value(request_or_scope, 'HTTP_X_DEVICE_ID'),
+        'app_version': _get_header_value(request_or_scope, 'HTTP_X_APP_VERSION'),
+        'app_type': _get_header_value(request_or_scope, 'HTTP_X_APP_TYPE'),
+        'os_version': _get_header_value(request_or_scope, 'HTTP_X_OS_VERSION'),
+        'device_model': _get_header_value(request_or_scope, 'HTTP_X_DEVICE_MODEL'),
+        'build_id': _get_header_value(request_or_scope, 'HTTP_X_BUILD_ID'),
+        
+        # Para Smart TVs
+        'tv_serial': _get_header_value(request_or_scope, 'HTTP_X_TV_SERIAL'),
+        'tv_model': _get_header_value(request_or_scope, 'HTTP_X_TV_MODEL'),
+        'firmware_version': _get_header_value(request_or_scope, 'HTTP_X_FIRMWARE_VERSION'),
+    }
     
-    # Crear string único combinando características
-    fingerprint_string = f"{user_agent}|{accept_language}|{accept_encoding}|{accept}"
+    # Construir string de fingerprint
+    fingerprint_string = _build_device_fingerprint_string(headers_dict)
     
     # Generar hash SHA256 y tomar primeros 32 caracteres
     device_fingerprint = hashlib.sha256(fingerprint_string.encode()).hexdigest()[:32]
@@ -263,3 +371,105 @@ def increment_rate_limit_counter(identifier_type, identifier):
     except ValueError:
         # Si no existe, inicializar
         cache.set(cache_key, 1, timeout=3600)  # 1 hora por defecto
+
+
+def check_websocket_rate_limit(udid, device_fingerprint, max_connections=5, window_minutes=5):
+    """
+    Verifica rate limit para conexiones WebSocket.
+    Limita conexiones simultáneas por UDID y device fingerprint.
+    
+    Args:
+        udid: UDID único del dispositivo (puede ser None si aún no se conoce)
+        device_fingerprint: Fingerprint único del dispositivo
+        max_connections: Máximo de conexiones simultáneas permitidas
+        window_minutes: Ventana de tiempo en minutos
+        
+    Returns:
+        tuple: (is_allowed: bool, remaining_connections: int, retry_after_seconds: int)
+    """
+    if not device_fingerprint:
+        # Si no hay fingerprint, no podemos hacer rate limiting
+        # Permitir pero con límite más restrictivo
+        return True, 1, 0
+    
+    # Limitar por device fingerprint (siempre disponible)
+    cache_key_fp = f"ws_rate_limit:fp:{device_fingerprint}"
+    current_connections_fp = cache.get(cache_key_fp, 0)
+    
+    if current_connections_fp >= max_connections:
+        retry_after = window_minutes * 60
+        return False, 0, retry_after
+    
+    # Limitar por UDID si está disponible (más específico)
+    if udid:
+        cache_key_udid = f"ws_rate_limit:udid:{udid}"
+        current_connections_udid = cache.get(cache_key_udid, 0)
+        
+        if current_connections_udid >= max_connections:
+            retry_after = window_minutes * 60
+            return False, 0, retry_after
+    
+    # Si pasa ambas verificaciones, está permitido
+    remaining = max_connections - max(current_connections_fp, current_connections_udid if udid else 0)
+    return True, remaining, 0
+
+
+def increment_websocket_connection(udid, device_fingerprint, window_minutes=5):
+    """
+    Incrementa el contador de conexiones WebSocket activas.
+    
+    Args:
+        udid: UDID único del dispositivo (puede ser None)
+        device_fingerprint: Fingerprint único del dispositivo
+        window_minutes: Ventana de tiempo en minutos para el timeout
+    """
+    timeout = window_minutes * 60
+    
+    # Incrementar contador por device fingerprint
+    cache_key_fp = f"ws_rate_limit:fp:{device_fingerprint}"
+    try:
+        cache.incr(cache_key_fp)
+    except ValueError:
+        cache.set(cache_key_fp, 1, timeout=timeout)
+    else:
+        # Si existe, actualizar timeout
+        cache.expire(cache_key_fp, timeout)
+    
+    # Incrementar contador por UDID si está disponible
+    if udid:
+        cache_key_udid = f"ws_rate_limit:udid:{udid}"
+        try:
+            cache.incr(cache_key_udid)
+        except ValueError:
+            cache.set(cache_key_udid, 1, timeout=timeout)
+        else:
+            cache.expire(cache_key_udid, timeout)
+
+
+def decrement_websocket_connection(udid, device_fingerprint):
+    """
+    Decrementa el contador de conexiones WebSocket activas.
+    Se llama cuando una conexión se cierra.
+    
+    Args:
+        udid: UDID único del dispositivo (puede ser None)
+        device_fingerprint: Fingerprint único del dispositivo
+    """
+    # Decrementar contador por device fingerprint
+    cache_key_fp = f"ws_rate_limit:fp:{device_fingerprint}"
+    try:
+        current = cache.get(cache_key_fp, 0)
+        if current > 0:
+            cache.set(cache_key_fp, current - 1)
+    except Exception:
+        pass  # Ignorar errores en limpieza
+    
+    # Decrementar contador por UDID si está disponible
+    if udid:
+        cache_key_udid = f"ws_rate_limit:udid:{udid}"
+        try:
+            current = cache.get(cache_key_udid, 0)
+            if current > 0:
+                cache.set(cache_key_udid, current - 1)
+        except Exception:
+            pass  # Ignorar errores en limpieza
