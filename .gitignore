@@ -52,9 +52,22 @@ cover/
 
 # Django stuff:
 *.log
+server.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+
+# Logs directory
+logs/
+*.log.*
+
+# Test files and scripts (no deben ir a producción)
+test_*.py
+*_test.py
+scripts/test_*.py
+
+# Scripts de utilidad/desarrollo (opcional - comentar si quieres incluirlos)
+# desasociar_todos_udids.py
 
 # Flask stuff:
 instance/

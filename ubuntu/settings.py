@@ -68,6 +68,10 @@ UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "60"))  # Reducido de 600
 UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
 UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
 
+# Configuración para pruebas de carga (aumentar límites temporalmente)
+UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "15"))  # Default: 15 min, para pruebas: 60 min
+UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
+
 # Channel layer con Redis
 if REDIS_URL:
     import ssl
@@ -339,21 +343,40 @@ CRON_CLASSES = [
 # Migrado a Redis distribuido para rate limiting entre múltiples instancias
 if REDIS_URL:
     # Usar Redis como cache backend (distribuido)
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-            'LOCATION': REDIS_URL,
-            'OPTIONS': {
-                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-                'SOCKET_CONNECT_TIMEOUT': 5,
-                'SOCKET_TIMEOUT': 5,
-                'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
-                'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
-            },
-            'KEY_PREFIX': 'udid_cache',
-            'TIMEOUT': 300,  # 5 minutos por defecto
+    # Verificar si django-redis está instalado
+    try:
+        import django_redis
+        # Usar django-redis si está disponible (mejor para producción)
+        CACHES = {
+            'default': {
+                'BACKEND': 'django_redis.cache.RedisCache',
+                'LOCATION': REDIS_URL,
+                'OPTIONS': {
+                    'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                    'SOCKET_CONNECT_TIMEOUT': 5,
+                    'SOCKET_TIMEOUT': 5,
+                    'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+                    'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                },
+                'KEY_PREFIX': 'udid_cache',
+                'TIMEOUT': 300,  # 5 minutos por defecto
+            }
         }
-    }
+    except ImportError:
+        # Fallback al backend nativo de Django (sin CLIENT_CLASS)
+        CACHES = {
+            'default': {
+                'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                'LOCATION': REDIS_URL,
+                'OPTIONS': {
+                    'SOCKET_CONNECT_TIMEOUT': 5,
+                    'SOCKET_TIMEOUT': 5,
+                    'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                },
+                'KEY_PREFIX': 'udid_cache',
+                'TIMEOUT': 300,  # 5 minutos por defecto
+            }
+        }
 else:
     # Fallback a cache local si Redis no está disponible (solo para desarrollo)
     # ⚠️ ADVERTENCIA: En producción con múltiples instancias, esto causará problemas

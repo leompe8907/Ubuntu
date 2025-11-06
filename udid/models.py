@@ -388,7 +388,10 @@ class UDIDAuthRequest(models.Model):
     
     def save(self, *args, **kwargs):
         if not self.expires_at:
-            self.expires_at = timezone.now() + timedelta(minutes=15)
+            # Tiempo de expiración configurable para pruebas de carga
+            from django.conf import settings
+            expiration_minutes = getattr(settings, 'UDID_EXPIRATION_MINUTES', 15)
+            self.expires_at = timezone.now() + timedelta(minutes=expiration_minutes)
         if not self.udid:
             self.udid = str(uuid.uuid4())
         if not self.temp_token:
@@ -418,10 +421,12 @@ class UDIDAuthRequest(models.Model):
     
     def is_valid(self):
         """✅ Mejorado: Considera el estado para determinar validez"""
+        from django.conf import settings
+        max_attempts = getattr(settings, 'UDID_MAX_ATTEMPTS', 5)
         return (
             self.status == 'pending' and
             not self.is_expired() and
-            self.attempts_count < 5
+            self.attempts_count < max_attempts
         )
     
     def stop_expiration(self):
