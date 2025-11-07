@@ -13,7 +13,8 @@ import hashlib
 import json
 import logging
 
-from udid.models import UDIDAuthRequest, ListOfSubscriber, AuthAuditLog, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
+from udid.models import UDIDAuthRequest, ListOfSubscriber, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
+from udid.utils.log_buffer import log_audit_async
 from udid.util import (
     generate_device_fingerprint,
     check_device_fingerprint_rate_limit,
@@ -91,8 +92,8 @@ class RequestUDIDView(APIView):
             # Incrementar contador en cache
             increment_rate_limit_counter('device_fp', device_fingerprint)
             
-            # Log de auditoría
-            AuthAuditLog.objects.create(
+            # Log de auditoría (asíncrono)
+            log_audit_async(
                 action_type='udid_generated',
                 udid=generated_udid,
                 client_ip=client_ip,
@@ -244,8 +245,8 @@ class ValidateUDIDView(APIView):
         increment_rate_limit_counter('udid', udid)
         increment_rate_limit_counter('temp_token', temp_token)
 
-        # Log de auditoría
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='udid_validated',
             udid=udid,
             subscriber_code=subscriber_code,
@@ -603,7 +604,8 @@ class GetSubscriberInfoView(APIView):
         if extra_details:
             details.update(extra_details)
             
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='login_failed',
             udid=req.udid,
             subscriber_code=req.subscriber_code,
@@ -613,8 +615,8 @@ class GetSubscriberInfoView(APIView):
         )
 
     def _log_successful_delivery(self, req, subscriber, app_credentials, request, available_count):
-        """Log de entrega exitosa"""
-        AuthAuditLog.objects.create(
+        """Log de entrega exitosa (asíncrono)"""
+        log_audit_async(
             action_type='udid_used',
             udid=req.udid,
             subscriber_code=req.subscriber_code,
@@ -704,8 +706,8 @@ class RevokeUDIDView(APIView):
         req.validated_by_operator = operator
         req.save()
 
-        # Guardar log incluyendo el SN si está disponible
-        AuthAuditLog.objects.create(
+        # Guardar log incluyendo el SN si está disponible (asíncrono)
+        log_audit_async(
             action_type='account_locked',
             subscriber_code=req.subscriber_code,
             udid=req.udid,
@@ -954,8 +956,8 @@ class ValidateUDIDView(APIView):
         req.validated_by_operator = operator_id
         req.save()
 
-        # Log de auditoría
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='udid_validated',
             udid=udid,
             subscriber_code=subscriber_code,
@@ -1180,8 +1182,8 @@ class ValidateDeviceAssociationView(APIView):
             client_ip=client_ip
         )
         
-        # Log de auditoría
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='device_validation',
             udid=udid,
             client_ip=client_ip,
@@ -1282,7 +1284,8 @@ class OperatorRevokeUDIDView(APIView):
         req.validated_by_operator = operator_id
         req.save()
 
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='account_locked',
             subscriber_code=req.subscriber_code,
             udid=req.udid,
@@ -1381,7 +1384,8 @@ class UserReleaseUDIDView(APIView):
         req.validated_by_operator = operator_id
         req.save()
 
-        AuthAuditLog.objects.create(
+        # Log de auditoría (asíncrono)
+        log_audit_async(
             action_type='account_locked',
             subscriber_code=req.subscriber_code,
             udid=req.udid,

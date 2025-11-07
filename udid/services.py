@@ -2,9 +2,10 @@
 from django.db import transaction
 from django.utils import timezone
 
-from .models import (UDIDAuthRequest,AuthAuditLog,SubscriberInfo,AppCredentials,EncryptedCredentialsLog,)
+from .models import (UDIDAuthRequest,SubscriberInfo,AppCredentials,EncryptedCredentialsLog,)
 from .management.commands.keyGenerator import hybrid_encrypt_for_app
 from .util import compute_encrypted_hash, json_serialize_credentials
+from .utils.log_buffer import log_audit_async
 
 FATAL_CODES = {
     "invalid_udid",
@@ -42,8 +43,8 @@ def authenticate_with_udid_service(
                 if req.status != "expired":
                     req.status = "expired"
                     req.save(update_fields=["status"])
-                # Audit opcional (intento con UDID expirado)
-                AuthAuditLog.objects.create(
+                # Audit opcional (intento con UDID expirado) - asíncrono
+                log_audit_async(
                     action_type="udid_validated",
                     subscriber_code=getattr(req, "subscriber_code", None),
                     udid=udid,
@@ -143,7 +144,8 @@ def authenticate_with_udid_service(
             req.mark_credentials_delivered(app_credentials)
             req.mark_as_used()
 
-            AuthAuditLog.objects.create(
+            # Log de auditoría (asíncrono)
+            log_audit_async(
                 action_type="udid_used",
                 udid=req.udid,
                 subscriber_code=req.subscriber_code,

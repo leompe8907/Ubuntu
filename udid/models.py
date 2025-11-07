@@ -508,3 +508,140 @@ class UserProfile(models.Model):
 def create_user_profile(sender, instance, created, **kwargs):
     if created:
         UserProfile.objects.create(user=instance)
+
+
+# ============================================================================
+# FASE 2: API Keys y Tenants
+# ============================================================================
+
+class Tenant(models.Model):
+    """
+    Modelo para representar un tenant (cliente/organización).
+    Cada tenant puede tener múltiples API keys y está asociado a un plan.
+    """
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'tenants'
+        indexes = [
+            models.Index(fields=['name']),
+            models.Index(fields=['is_active']),
+        ]
+    
+    def __str__(self):
+        return f"{self.name} ({'Active' if self.is_active else 'Inactive'})"
+
+
+class Plan(models.Model):
+    """
+    Modelo para representar un plan de servicio con límites de cuota.
+    Define los límites de rate limiting y recursos para cada plan.
+    """
+    name = models.CharField(max_length=50, unique=True)
+    description = models.TextField(null=True, blank=True)
+    
+    # Límites de rate limiting
+    max_requests_per_minute = models.IntegerField(default=60)
+    max_requests_per_hour = models.IntegerField(default=1000)
+    max_requests_per_day = models.IntegerField(default=10000)
+    
+    # Límites de recursos
+    max_concurrent_connections = models.IntegerField(default=10)
+    max_websocket_connections = models.IntegerField(default=5)
+    
+    # Características del plan
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'plans'
+        indexes = [
+            models.Index(fields=['name']),
+            models.Index(fields=['is_active']),
+        ]
+    
+    def __str__(self):
+        return f"{self.name} ({self.max_requests_per_minute}/min)"
+
+
+class APIKey(models.Model):
+    """
+    Modelo para representar una API key asociada a un tenant y plan.
+    Las API keys se usan para autenticar requests y aplicar cuotas.
+    """
+    key = models.CharField(max_length=128, unique=True, db_index=True)
+    name = models.CharField(max_length=100, null=True, blank=True)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='api_keys')
+    plan = models.ForeignKey(Plan, on_delete=models.PROTECT, related_name='api_keys')
+    
+    # Estado de la API key
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    
+    # Metadatos
+    created_by = models.ForeignKey(
+        User, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True,
+        related_name='created_api_keys'
+    )
+    description = models.TextField(null=True, blank=True)
+    
+    class Meta:
+        db_table = 'api_keys'
+        indexes = [
+            models.Index(fields=['key']),
+            models.Index(fields=['tenant', 'is_active']),
+            models.Index(fields=['is_active', 'expires_at']),
+            models.Index(fields=['last_used_at']),
+        ]
+        verbose_name = 'API Key'
+        verbose_name_plural = 'API Keys'
+    
+    def is_valid(self):
+        """
+        Verifica si la API key es válida (activa y no expirada).
+        """
+        if not self.is_active:
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        return True
+    
+    def mark_as_used(self):
+        """Marca la API key como usada (actualiza last_used_at)"""
+        self.last_used_at = timezone.now()
+        self.save(update_fields=['last_used_at'])
+    
+    @classmethod
+    def find_by_key(cls, api_key):
+        """
+        Encuentra una API key por su valor original.
+        Compara directamente la key (para compatibilidad con migración).
+        En producción, debería comparar hashes.
+        
+        Args:
+            api_key: API key original a buscar
+            
+        Returns:
+            APIKey: Instancia de APIKey si se encuentra, None si no
+        """
+        try:
+            return cls.objects.get(key=api_key, is_active=True)
+        except cls.DoesNotExist:
+            return None
+        except cls.MultipleObjectsReturned:
+            # Si hay múltiples, retornar el primero
+            return cls.objects.filter(key=api_key, is_active=True).first()
+    
+    def __str__(self):
+        return f"{self.name or 'Unnamed'} ({self.tenant.name}) - {self.key[:16]}..."

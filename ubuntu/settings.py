@@ -14,17 +14,20 @@ import os
 import dj_database_url
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from config import DjangoConfig
 
+# Validar configuración cargada desde DjangoConfig
 DjangoConfig.validate()
+
+
+# ============================================================================
+# PATHS Y CONFIGURACIÓN BASE
+# ============================================================================
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 #* SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = DjangoConfig.SECRET_KEY 
@@ -32,14 +35,13 @@ SECRET_KEY = DjangoConfig.SECRET_KEY
 #* SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = DjangoConfig.DEBUG
 
-#ALLOWED_HOSTS = DjangoConfig.ALLOWED_HOSTS
 ALLOWED_HOSTS = DjangoConfig.ALLOWED_HOSTS
 WS_ALLOWED_ORIGINS = DjangoConfig.WS_ALLOWED_ORIGINS
 WS_ALLOWED_ORIGIN_REGEXES = DjangoConfig.WS_ALLOWED_ORIGIN_REGEXES
 
-# ALLOWED_HOSTS = []
-
-#* Application definition
+# ============================================================================
+# APLICACIONES INSTALADAS
+# ============================================================================
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -52,18 +54,96 @@ INSTALLED_APPS = [
     'rest_framework',
     'django_cron',
     'django_filters',
-    "channels",
+    'channels',  # Soporte WebSockets
     'udid',
 ]
 
+# ============================================================================
+# CONFIGURACIÓN DE CHANNELS
+# ============================================================================
 # Configuración de Channels
 ASGI_APPLICATION = 'ubuntu.asgi.application'
 
-REDIS_URL = os.getenv("REDIS_URL")
+# Configuración de Redis
+# Por defecto, usar localhost:6379 si no está configurado (desarrollo local)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Configuración de Redis Sentinel para alta disponibilidad
+# Si vas a usar Redis Sentinel, se mantiene la lógica existente
+REDIS_SENTINEL = os.getenv("REDIS_SENTINEL", None)
+REDIS_SENTINEL_MASTER = os.getenv("REDIS_SENTINEL_MASTER", "mymaster")
+
+# Parsear REDIS_SENTINEL si está configurado
+if REDIS_SENTINEL:
+    REDIS_SENTINEL = [
+        (h, int(p)) for h, p in (hp.split(":") for hp in REDIS_SENTINEL.split(","))
+    ]
+else:
+    REDIS_SENTINEL = None
+
+# Timeouts de conexión
+REDIS_SOCKET_CONNECT_TIMEOUT = int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5"))
+REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == "true"
+# Aumentado a 100 para mejor manejo de carga (50 para rate limiting + 50 para WebSockets)
+REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
+
+
+# ============================================================================
+# CHANNEL LAYERS (comunicación WS y backend asíncrono)
+# ============================================================================
+
+# Channel layer con Redis
+# Si REDIS_CHANNEL_LAYER_URL está configurado, se usa para WebSockets
+# Si no, se usa REDIS_URL para ambos
+REDIS_CHANNEL_LAYER_URL = os.getenv("REDIS_CHANNEL_LAYER_URL", REDIS_URL)
+REDIS_RATE_LIMIT_URL = os.getenv("REDIS_RATE_LIMIT_URL", REDIS_URL)  # Default: mismo que REDIS_URL
+
+# Configuración robusta para Channels
+host_cfg = {"address": REDIS_CHANNEL_LAYER_URL}
+if urlparse(REDIS_CHANNEL_LAYER_URL).scheme == "rediss":
+    # Si usas TLS, channels-redis lo maneja automáticamente
+    host_cfg["ssl"] = True
+
+# Manejo de Sentinel o conexión directa
+if REDIS_SENTINEL:
+    # 🟢 Nueva configuración: soporte real para Redis Sentinel (alta disponibilidad)
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [{
+                    "sentinels": REDIS_SENTINEL,
+                    "master_name": REDIS_SENTINEL_MASTER,
+                    "db": 0,
+                }],
+                "capacity": 2000,# Número máximo de mensajes en un canal (aumentado de default 100)
+                "expiry": 10, # Tiempo de expiración de mensajes en segundos
+                "group_expiry": 900,
+            },
+        }
+    }
+else:
+    # Configuración normal de Redis directo
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [host_cfg],
+                "capacity": 2000,  # mensajes por canal
+                "expiry": 10,      # segundos
+                "group_expiry": 900,  # persistencia de grupos WS
+            },
+        }
+    }
+
+
+# ============================================================================
+# PARÁMETROS DE UDID / CARGA / CONCURRENCIA
+# ============================================================================
 
 # Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
 UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "60"))  # Reducido de 600 a 60 segundos para mejor protección
-
 # Si querés habilitar un polling de respaldo (además del evento push)
 UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
 UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
@@ -72,38 +152,45 @@ UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
 UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "15"))  # Default: 15 min, para pruebas: 60 min
 UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
 
-# Channel layer con Redis
-if REDIS_URL:
-    import ssl
-    
-    # Crear contexto SSL que no verifique certificados
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [
-                    {
-                        "address": REDIS_URL,
-                        "ssl_cert_reqs": None,  # No requiere certificado
-                    }
-                ],
-            },
-        }
-    }
-else:
-    CHANNEL_LAYERS = {
-        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}
-    }
+# Configuración del semáforo global de concurrencia
+GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "500"))  # Máximo de slots simultáneos
 
+# Circuit breaker para Redis
+# Aumentado threshold a 10 para ser menos sensible durante picos de carga
+REDIS_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("REDIS_CIRCUIT_BREAKER_THRESHOLD", "10"))  # Fallos consecutivos
+REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "30"))  # Segundos (reducido para recuperación más rápida)
+
+# Separación de Redis para rate limiting y channel layer (opcional)
+
+
+# ============================================================================
+# FASE 2: Backpressure y Degradación
+# ============================================================================
+
+# Configuración de la cola de requests
+REQUEST_QUEUE_MAX_SIZE = int(os.getenv("REQUEST_QUEUE_MAX_SIZE", "1000"))
+REQUEST_QUEUE_MAX_WAIT_TIME = int(os.getenv("REQUEST_QUEUE_MAX_WAIT_TIME", "10"))  # Segundos
+
+# Configuración de degradación elegante
+DEGRADATION_BASELINE_LOAD = int(os.getenv("DEGRADATION_BASELINE_LOAD", "100"))  # Carga base (concurrentes)
+DEGRADATION_MEDIUM_THRESHOLD = float(os.getenv("DEGRADATION_MEDIUM_THRESHOLD", "1.5"))  # 1.5x carga base
+DEGRADATION_HIGH_THRESHOLD = float(os.getenv("DEGRADATION_HIGH_THRESHOLD", "2.0"))  # 2.0x carga base
+DEGRADATION_CRITICAL_THRESHOLD = float(os.getenv("DEGRADATION_CRITICAL_THRESHOLD", "3.0"))  # 3.0x carga base
+
+
+
+
+# ============================================================================
+# MIDDLEWARE
+# ============================================================================
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
-    "udid.middleware.SystemLoadTrackingMiddleware",  # Rastreo de carga para rate limiting adaptativo
+    "udid.middleware.SystemLoadTrackingMiddleware",
+    "udid.middleware.GlobalConcurrencyMiddleware",
+    "udid.middleware.BackpressureMiddleware",
+    "udid.middleware.APIKeyAuthMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -133,9 +220,12 @@ TEMPLATES = [
 WSGI_APPLICATION = 'ubuntu.wsgi.application'
 
 
-# Database
+# ============================================================================
+# BASE DE DATOS
+# ============================================================================
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# SQLite3
 # DATABASES = {
 #     'default': {
 #         'ENGINE': 'django.db.backends.sqlite3',
@@ -143,20 +233,35 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 #     }
 # }
 
+# Docker Compose Postgres
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'udid',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': "127.0.0.1",
-        'PORT': "3307",
-        'OPTIONS': {
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("POSTGRES_DB", "udid"),
+        "USER": os.getenv("POSTGRES_USER", "dev"),
+        "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
+        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
     }
 }
 
+# Xampp MariaDB
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'udid',
+#         'USER': 'root',
+#         'PASSWORD': '',
+#         'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+#         'PORT': os.getenv("MYSQL_PORT", "3307"),
+#         'OPTIONS': {
+#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#         },
+#     }
+# }
+
+# Heroku Postgres
 # DATABASES = {
 #     'default': dj_database_url.config()
 # }
@@ -181,34 +286,12 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
-# Internationalization
-# https://docs.djangoproject.com/en/5.2/topics/i18n/
-
-LANGUAGE_CODE = 'en-us'
-
-TIME_ZONE = 'UTC'
-
-USE_I18N = True
-
-USE_L10N = True
-
-USE_TZ = False
-
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
-STATIC_URL = 'static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles'
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
-
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+# ============================================================================
+# CORS Y SEGURIDAD
+# ============================================================================
 
 #* CORS settings
 CORS_ALLOW_ALL_ORIGINS = False
-
 CORS_ALLOW_CREDENTIALS = True
 
 # DjangoConfig.CORS_ORIGIN_WHITELIST
@@ -242,13 +325,15 @@ CORS_ALLOW_HEADERS = [
     'x-tv-serial',         # Serial number (Smart TVs)
     'x-tv-model',          # Modelo específico (Smart TVs)
     'x-firmware-version',  # Versión de firmware (Smart TVs)
+    'x-api-key',           # API key para autenticación
 ]
 
 #* Configurar Seguridad para API Server
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = False  # Para APIs móviles
+CSRF_USE_SESSIONS = False
 X_FRAME_OPTIONS = 'DENY'
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
@@ -258,9 +343,36 @@ CSRF_TRUSTED_ORIGINS = [
     'https://*.herokuapp.com',
 ]
 
-# Deshabilitar CSRF para APIs (ya que usas JWT)
-CSRF_COOKIE_SECURE = False  # Para APIs móviles
-CSRF_USE_SESSIONS = False
+
+# ============================================================================
+# STATIC FILES / LOCALIZACIÓN
+# ============================================================================
+
+# Internationalization
+# https://docs.djangoproject.com/en/5.2/topics/i18n/
+
+LANGUAGE_CODE = 'en-us'
+TIME_ZONE = 'UTC'
+USE_I18N = True
+USE_L10N = True
+USE_TZ = False
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.2/howto/static-files/
+
+STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# ============================================================================
+# REST FRAMEWORK / JWT
+# ============================================================================
+
 
 #* Configurar Django Rest Framework
 REST_FRAMEWORK = {
@@ -285,6 +397,10 @@ SIMPLE_JWT = {
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
 }
+
+# ============================================================================
+# LOGGING
+# ============================================================================
 
 #* Configuracion de LOGGING
 LOGGING = {
@@ -334,10 +450,17 @@ LOGGING = {
 import logging.config
 logging.config.dictConfig(LOGGING)
 
+# ============================================================================
+# CRON JOBS
+# ============================================================================
 # * Configuración de tareas periódicas con django-cron
 CRON_CLASSES = [
     "udid.cron.MergeSyncCronJob",
 ]
+
+# ============================================================================
+# CACHE: Redis distribuido (opcional)
+# ============================================================================
 
 #* Configuración de cache para Django
 # Migrado a Redis distribuido para rate limiting entre múltiples instancias

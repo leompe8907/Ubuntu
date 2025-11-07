@@ -216,16 +216,22 @@ subscribers_disponibles = []
 udids_generados = []  # Lista de UDIDs generados para pruebas de desasociación
 udids_lock = threading.Lock()
 
-def conectar_websocket(udid, app_type='android_tv', app_version='1.0', timeout=10):
+def conectar_websocket(udid, app_type='android_tv', app_version='1.0', timeout=30):
     """
     Conectar al WebSocket y autenticar con UDID.
     Retorna (exitoso, tiempo_respuesta, resultado)
+    
+    Mejoras:
+    - Timeout aumentado a 30 segundos (más realista bajo carga)
+    - Espera activa del mensaje auth_with_udid:result después de recibir "pending"
+    - Mejor manejo de errores y logging
     """
     if not WEBSOCKET_AVAILABLE:
         return False, 0, {"error": "websocket-client no disponible"}
     
     resultado = {"exitoso": False, "error": None, "data": None}
     tiempo_inicio = time.time()
+    recibio_pending = False
     
     try:
         # Crear conexión WebSocket
@@ -252,53 +258,93 @@ def conectar_websocket(udid, app_type='android_tv', app_version='1.0', timeout=1
         # Esperar respuesta (con timeout)
         tiempo_limite = time.time() + timeout
         respuesta_recibida = False
+        ultimo_ping = time.time()
         
         while time.time() < tiempo_limite:
             try:
-                ws.settimeout(1.0)  # Timeout corto para polling
+                # Timeout de recv: 2 segundos para permitir polling activo
+                ws.settimeout(2.0)
                 respuesta = ws.recv()
+                
                 if isinstance(respuesta, bytes):
                     _ws_count_rx(len(respuesta))
                 else:
                     _ws_count_rx(len(respuesta.encode('utf-8')))
-                data = json.loads(respuesta)
                 
+                data = json.loads(respuesta)
                 tipo = data.get("type")
                 
                 if tipo == "auth_with_udid:result":
-                    # Respuesta inmediata exitosa
+                    # Respuesta final (inmediata o después de validación)
                     resultado["exitoso"] = data.get("status") == "ok"
                     resultado["data"] = data.get("result")
                     respuesta_recibida = True
                     break
+                    
                 elif tipo == "pending":
-                    # Esperar evento udid.validated
-                    # En un escenario real, esperaríamos el evento
-                    # Para el test, esperamos un tiempo corto
-                    time.sleep(0.5)
+                    # UDID aún no validado - esperar evento udid.validated
+                    # Continuar esperando activamente mensajes (no hacer sleep largo)
+                    recibio_pending = True
+                    # No hacer break, continuar esperando mensajes
                     continue
+                    
                 elif tipo == "error":
+                    # Error fatal - no se puede resolver esperando
                     resultado["error"] = data.get("error") or data.get("detail")
                     respuesta_recibida = True
                     break
+                    
                 elif tipo == "pong":
-                    # Heartbeat, continuar esperando
+                    # Heartbeat - actualizar timestamp y continuar
+                    ultimo_ping = time.time()
                     continue
                     
+                elif tipo == "timeout":
+                    # Timeout del servidor
+                    resultado["error"] = data.get("detail") or "Timeout del servidor"
+                    respuesta_recibida = True
+                    break
+                    
             except websocket.WebSocketTimeoutException:
-                # Timeout en recv, continuar esperando
+                # Timeout en recv - verificar si aún tenemos tiempo
+                tiempo_restante = tiempo_limite - time.time()
+                if tiempo_restante <= 0:
+                    break
+                # Si recibimos "pending" antes, seguir esperando activamente
+                # Si no, puede ser que la conexión esté muerta
+                if recibio_pending:
+                    # Enviar ping para mantener conexión viva
+                    if time.time() - ultimo_ping > 10:
+                        try:
+                            ws.send(json.dumps({"type": "ping"}))
+                            ultimo_ping = time.time()
+                        except:
+                            pass
                 continue
+                
+            except websocket.WebSocketConnectionClosedException:
+                resultado["error"] = "Conexión WebSocket cerrada inesperadamente"
+                break
+                
             except Exception as e:
-                resultado["error"] = str(e)
+                resultado["error"] = f"Error recibiendo mensaje: {str(e)}"
                 break
         
         if not respuesta_recibida:
-            resultado["error"] = "Timeout esperando respuesta del WebSocket"
+            if recibio_pending:
+                resultado["error"] = f"Timeout esperando validación del UDID (esperado hasta {timeout}s después de recibir 'pending')"
+            else:
+                resultado["error"] = f"Timeout esperando respuesta del WebSocket (esperado hasta {timeout}s)"
         
-        ws.close()
+        try:
+            ws.close()
+        except:
+            pass
         
+    except websocket.WebSocketException as e:
+        resultado["error"] = f"Error de conexión WebSocket: {str(e)}"
     except Exception as e:
-        resultado["error"] = str(e)
+        resultado["error"] = f"Error inesperado: {str(e)}"
     
     tiempo_respuesta = time.time() - tiempo_inicio
     return resultado["exitoso"], tiempo_respuesta, resultado
@@ -635,7 +681,7 @@ def simular_usuario_completo(usuario_id, delay_inicial=0):
                 udid=udid,
                 app_type='android_tv',
                 app_version='1.0',
-                timeout=10
+                timeout=30  # Aumentado a 30 segundos para dar tiempo a la validación bajo carga
             )
             step_time = time.time() - step_start
             
