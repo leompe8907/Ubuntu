@@ -220,7 +220,14 @@ def CallListSmartcards(session_id, offset=0, limit=100):
         if response.get('success'):
             return response.get('answer', {})
         else:
-            raise Exception(response.get('errorMessage', 'Error desconocido'))
+            # Intentar obtener el mensaje de error de diferentes campos posibles
+            error_msg = (
+                response.get('errorMessage') or 
+                response.get('error') or 
+                response.get('message') or
+                f"Error desconocido. Respuesta completa: {response}"
+            )
+            raise Exception(error_msg)
 
     except Exception as e:
         logger.error(f"Fallo al obtener smartcards: {str(e)}")

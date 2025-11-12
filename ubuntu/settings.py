@@ -234,32 +234,32 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # }
 
 # Docker Compose Postgres
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "udid"),
-        "USER": os.getenv("POSTGRES_USER", "dev"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
-    }
-}
-
-# Xampp MariaDB
 # DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'udid',
-#         'USER': 'root',
-#         'PASSWORD': '',
-#         'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
-#         'PORT': os.getenv("MYSQL_PORT", "3307"),
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#         },
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.getenv("POSTGRES_DB", "udid"),
+#         "USER": os.getenv("POSTGRES_USER", "dev"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
+#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
+#         "CONN_MAX_AGE": 60,
 #     }
 # }
+
+# Xampp MariaDB
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'udid',
+        'USER': 'root',
+        'PASSWORD': '',
+        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+        'PORT': os.getenv("MYSQL_PORT", "3307"),
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
 
 # Heroku Postgres
 # DATABASES = {

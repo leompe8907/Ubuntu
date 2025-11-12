@@ -20,15 +20,6 @@ except ImportError:
     REDIS_HA_AVAILABLE = False
     logger.warning("redis_ha module not available, using direct Redis connections")
 
-# Semáforo en memoria como fallback cuando Redis no está disponible
-import threading
-_in_memory_semaphore = {
-    'current_slots': 0,
-    'max_slots': 500,
-    'lock': threading.Lock(),
-    'slots': {}  # {slot_id: expiration_time}
-}
-
 def get_client_ip(request):
     """Obtener la IP real del cliente desde request"""
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -1282,77 +1273,6 @@ def _get_dynamic_timeout():
         return 30  # Valor por defecto seguro
 
 
-def _acquire_in_memory_semaphore(timeout=None, max_slots=None):
-    """
-    Semáforo en memoria como fallback cuando Redis no está disponible.
-    Thread-safe usando locks.
-    
-    Args:
-        timeout: TTL del slot en segundos
-        max_slots: Máximo número de slots simultáneos
-        
-    Returns:
-        tuple: (acquired: bool, slot_id: str or None, retry_after: int)
-    """
-    global _in_memory_semaphore
-    
-    if max_slots is None:
-        from django.conf import settings
-        max_slots = getattr(settings, 'GLOBAL_SEMAPHORE_SLOTS', 500)
-    
-    if timeout is None:
-        timeout = _get_dynamic_timeout()
-    
-    with _in_memory_semaphore['lock']:
-        # Limpiar slots expirados
-        now = time.time()
-        expired_slots = [
-            slot_id for slot_id, exp_time in _in_memory_semaphore['slots'].items()
-            if exp_time < now
-        ]
-        for slot_id in expired_slots:
-            del _in_memory_semaphore['slots'][slot_id]
-            _in_memory_semaphore['current_slots'] -= 1
-        
-        # Verificar si hay slots disponibles
-        current_slots = _in_memory_semaphore['current_slots']
-        if current_slots >= max_slots:
-            retry_after = max(1, timeout // 6)
-            logger.warning(
-                f"In-memory semaphore full: {current_slots}/{max_slots} slots, "
-                f"retry_after={retry_after}s"
-            )
-            return False, None, retry_after
-        
-        # Adquirir slot
-        slot_id = str(uuid.uuid4())
-        _in_memory_semaphore['slots'][slot_id] = now + timeout
-        _in_memory_semaphore['current_slots'] += 1
-        _in_memory_semaphore['max_slots'] = max_slots
-        
-        logger.debug(f"Acquired in-memory semaphore slot: {slot_id}, current_slots={_in_memory_semaphore['current_slots']}/{max_slots}")
-        return True, slot_id, 0
-
-
-def _release_in_memory_semaphore(slot_id):
-    """
-    Libera un slot del semáforo en memoria.
-    
-    Args:
-        slot_id: ID del slot a liberar
-    """
-    global _in_memory_semaphore
-    
-    if not slot_id:
-        return
-    
-    with _in_memory_semaphore['lock']:
-        if slot_id in _in_memory_semaphore['slots']:
-            del _in_memory_semaphore['slots'][slot_id]
-            _in_memory_semaphore['current_slots'] -= 1
-            logger.debug(f"Released in-memory semaphore slot: {slot_id}")
-
-
 def _count_slots_scan(redis_client, pattern):
     """
     Cuenta slots usando SCAN en lugar de KEYS para evitar bloqueos.
@@ -1411,9 +1331,9 @@ def acquire_global_semaphore(timeout=None, max_slots=None):
         if REDIS_HA_AVAILABLE:
             redis_client = get_redis_client_safe()
             if not redis_client:
-                # Si Redis no está disponible (circuit breaker abierto), usar semáforo en memoria
-                logger.warning("Redis not available (circuit breaker open), using in-memory semaphore")
-                return _acquire_in_memory_semaphore(timeout, max_slots)
+                # Si Redis no está disponible (circuit breaker abierto), permitir (fail-open)
+                logger.warning("Redis not available (circuit breaker open), semaphore disabled")
+                return True, None, 0
         else:
             # Fallback a conexión directa
             if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
@@ -1494,15 +1414,12 @@ def release_global_semaphore(slot_id):
         if REDIS_HA_AVAILABLE:
             redis_client = get_redis_client_safe()
             if not redis_client:
-                # Si Redis no está disponible, liberar del semáforo en memoria
-                _release_in_memory_semaphore(slot_id)
+                # Si Redis no está disponible, no hacer nada (fail-open)
                 return
         else:
             # Fallback a conexión directa
             if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
-                # Redis no configurado, liberar del semáforo en memoria
-                _release_in_memory_semaphore(slot_id)
-                return
+                return  # Redis no configurado, no hacer nada
             redis_client = redis.from_url(settings.REDIS_URL)
         semaphore_key = "global_semaphore:slots"
         

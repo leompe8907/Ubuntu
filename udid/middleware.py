@@ -110,9 +110,11 @@ class APIKeyAuthMiddleware(MiddlewareMixin):
     """
     Middleware que autentica requests por API key y aplica cuotas del plan.
     
-    La API key se puede enviar en:
+    La API key se debe enviar en:
     - Header: X-API-Key
-    - Header: Authorization: Bearer <api_key>
+    
+    NOTA: El header Authorization: Bearer está reservado para JWT tokens
+    y NO debe usarse para API keys para evitar conflictos.
     
     Si no se proporciona API key, el request continúa normalmente (no es obligatorio).
     Si se proporciona, se valida y se aplican las cuotas del plan asociado.
@@ -127,14 +129,9 @@ class APIKeyAuthMiddleware(MiddlewareMixin):
                 request.path.startswith('/auth/')):
             return None
         
-        # Obtener API key del header
+        # Obtener API key SOLO del header X-API-Key
+        # NO usar Authorization: Bearer para API keys (está reservado para JWT)
         api_key = request.META.get('HTTP_X_API_KEY')
-        
-        # También verificar Authorization header (Bearer token)
-        if not api_key:
-            auth_header = request.META.get('HTTP_AUTHORIZATION', '')
-            if auth_header.startswith('Bearer '):
-                api_key = auth_header[7:]  # Remover "Bearer "
         
         # Si no hay API key, continuar sin autenticación (opcional)
         if not api_key:

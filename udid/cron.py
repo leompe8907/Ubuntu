@@ -19,9 +19,14 @@ class MergeSyncCronJob(CronJobBase):
     def do(self):
         logger.info("[CRON] Iniciando de Tareas")
 
-        cleint = CVClient()
-        cleint.login()
-        session_id = cleint.session_id
+        client = CVClient()
+        success, error_message = client.login()
+        
+        if not success:
+            logger.error(f"[CRON] Error al hacer login: {error_message}")
+            return
+        
+        session_id = client.session_id
 
         logger.info(f"[CRON] Session ID: {session_id}")
 
