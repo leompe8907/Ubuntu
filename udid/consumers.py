@@ -37,14 +37,16 @@ class AuthWaitWS(AsyncWebsocketConsumer):
       -> {"type":"ping"}  <- {"type":"pong"}
     """
 
-    # Configuraciones (podés sobreescribir en settings.py)
-    TIMEOUT_SECONDS = getattr(settings, "UDID_WAIT_TIMEOUT", 600)
-    ENABLE_POLLING = getattr(settings, "UDID_ENABLE_POLLING", False)
-    POLL_INTERVAL = getattr(settings, "UDID_POLL_INTERVAL", 2)
+    # Configuraciones
+    TIMEOUT_AUTOMATIC = getattr(settings, "UDID_WAIT_TIMEOUT_AUTOMATIC", 180)  # Validación automática
+    TIMEOUT_MANUAL = getattr(settings, "UDID_WAIT_TIMEOUT_MANUAL", 180)  # Validación manual
+    TIMEOUT_SECONDS = getattr(settings, "UDID_WAIT_TIMEOUT", TIMEOUT_AUTOMATIC)  # Default: automático
+    ENABLE_POLLING = getattr(settings, "UDID_ENABLE_POLLING", False) # Si querés habilitar un polling de respaldo (además del evento push)
+    POLL_INTERVAL = getattr(settings, "UDID_POLL_INTERVAL", 2) # Intervalo de polling
     PING_INTERVAL = getattr(settings, "UDID_WS_PING_INTERVAL", 30)  # segundos
-    INACTIVITY_TIMEOUT = getattr(settings, "UDID_WS_INACTIVITY_TIMEOUT", 60)  # segundos
-    MAX_CONNECTIONS_PER_TOKEN = getattr(settings, "UDID_WS_MAX_PER_TOKEN", 5)
-    MAX_GLOBAL_CONNECTIONS = getattr(settings, "UDID_WS_MAX_GLOBAL", 1000)
+    INACTIVITY_TIMEOUT = getattr(settings, "UDID_WS_INACTIVITY_TIMEOUT", 120)  # Tiempo de inactividad del WS: 120s
+    MAX_CONNECTIONS_PER_TOKEN = getattr(settings, "UDID_WS_MAX_PER_TOKEN", 3) # Límite de WebSocket por dispositivo/UDID
+    MAX_GLOBAL_CONNECTIONS = getattr(settings, "UDID_WS_MAX_GLOBAL", 1000) # Límite global del sistema
 
     async def connect(self):
         self.udid = None
@@ -123,6 +125,10 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         # Heartbeat (mantener viva la conexión)
         if data.get("type") == "ping":
             return await self._send_json({"type": "pong"})
+        
+        # Manejar respuesta pong del cliente (actualizar actividad)
+        if data.get("type") == "pong":
+            return 
 
         # Mensaje esperado
         if data.get("type") != "auth_with_udid":
@@ -208,6 +214,16 @@ class AuthWaitWS(AsyncWebsocketConsumer):
             await self._send_result(res, status="error")
             return await self.close()
 
+        # ✅ MEJORADO: Determinar timeout según método de validación
+        from .models import UDIDAuthRequest
+        try:
+            udid_request = await sync_to_async(UDIDAuthRequest.objects.get)(udid=self.udid)
+            # Usar timeout según método: manual = 180s, automatic = 60s
+            timeout_seconds = self.TIMEOUT_MANUAL if udid_request.method == 'manual' else self.TIMEOUT_AUTOMATIC
+        except Exception:
+            # Si no se puede obtener, usar default
+            timeout_seconds = self.TIMEOUT_SECONDS
+
         # 2) Aún no está listo → responder pending y suscribirse al grupo
         self.group_name = f"udid_{self.udid}"
         try:
@@ -237,11 +253,11 @@ class AuthWaitWS(AsyncWebsocketConsumer):
             "type": "pending",
             "status": res.get("status") or "not_validated",  # puede ser "validated" si es not_associated
             "detail": res.get("error") or "Esperando validación/asociación de UDID…",
-            "timeout": self.TIMEOUT_SECONDS,
+            "timeout": timeout_seconds,  # ✅ Usar timeout determinado
         })
 
-        # Timeout
-        self.timeout_task = asyncio.create_task(self._timeout())
+        # Timeout con el tiempo determinado
+        self.timeout_task = asyncio.create_task(self._timeout_with_seconds(timeout_seconds))
 
         # Polling opcional como respaldo (si el evento no llega)
         if self.ENABLE_POLLING:
@@ -302,9 +318,14 @@ class AuthWaitWS(AsyncWebsocketConsumer):
                 await self.close(code=1011)
 
     async def _timeout(self):
-        await asyncio.sleep(self.TIMEOUT_SECONDS)
+        """Timeout usando TIMEOUT_SECONDS (default)"""
+        await self._timeout_with_seconds(self.TIMEOUT_SECONDS)
+    
+    async def _timeout_with_seconds(self, timeout_seconds: int):
+        """✅ MEJORADO: Timeout con tiempo configurable"""
+        await asyncio.sleep(timeout_seconds)
         if not self.done:
-            await self._send_json({"type": "timeout", "detail": "No se recibió validación/asociación a tiempo."})
+            await self._send_json({"type": "timeout", "detail": f"No se recibió validación/asociación a tiempo (timeout: {timeout_seconds}s)."})
             await self._finish()
 
     async def _poll_every(self, seconds: int):

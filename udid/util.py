@@ -95,6 +95,8 @@ def _build_device_fingerprint_string(headers_dict):
     Construye el string de fingerprint a partir de un diccionario de headers.
     Función centralizada para evitar duplicación de código.
     
+    ✅ MEJORADO: Incluye MAC address para mayor robustez
+    
     Args:
         headers_dict: Diccionario con todos los headers necesarios
         
@@ -102,32 +104,34 @@ def _build_device_fingerprint_string(headers_dict):
         str: String para hashear
     """
     app_type = headers_dict.get('app_type', '')
+    mac_address = headers_dict.get('mac_address', '')  # ✅ NUEVO: MAC address
     
     # Combinar factores según el tipo de app para mayor robustez
     if app_type in ['android_tv', 'samsung_tv', 'lg_tv', 'set_top_box']:
-        # Smart TV: usar serial, model, firmware (más difícil de falsificar)
+        # Smart TV: usar serial, model, firmware, MAC (más difícil de falsificar)
         fingerprint_string = (
             f"{app_type}|{headers_dict.get('tv_serial', '')}|"
             f"{headers_dict.get('tv_model', '')}|{headers_dict.get('firmware_version', '')}|"
-            f"{headers_dict.get('device_id', '')}|{headers_dict.get('app_version', '')}|"
-            f"{headers_dict.get('user_agent', '')}"
+            f"{headers_dict.get('device_id', '')}|{mac_address}|"  # ✅ Agregado MAC
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('user_agent', '')}"
         )
     elif app_type in ['android_mobile', 'ios_mobile', 'mobile_app']:
-        # Móvil: usar device_id, build_id, model, os_version (identificadores nativos)
+        # Móvil: usar device_id, build_id, model, os_version, MAC (identificadores nativos)
         fingerprint_string = (
             f"{app_type}|{headers_dict.get('device_id', '')}|"
             f"{headers_dict.get('build_id', '')}|{headers_dict.get('device_model', '')}|"
-            f"{headers_dict.get('os_version', '')}|{headers_dict.get('app_version', '')}|"
-            f"{headers_dict.get('user_agent', '')}"
+            f"{headers_dict.get('os_version', '')}|{mac_address}|"  # ✅ Agregado MAC
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('user_agent', '')}"
         )
     else:
-        # Fallback: usar headers básicos + app_type si está disponible
+        # Fallback: usar headers básicos + app_type + MAC si está disponible
         fingerprint_string = (
             f"{headers_dict.get('user_agent', '')}|"
             f"{headers_dict.get('accept_language', '')}|"
             f"{headers_dict.get('accept_encoding', '')}|"
             f"{headers_dict.get('accept', '')}|{app_type}|"
-            f"{headers_dict.get('app_version', '')}|{headers_dict.get('device_id', '')}"
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('device_id', '')}|"
+            f"{mac_address}"  # ✅ Agregado MAC
         )
     
     return fingerprint_string
@@ -139,6 +143,10 @@ def generate_device_fingerprint(request_or_scope):
     Mejorado para móviles y Smart TVs con headers específicos.
     Funciona tanto con objetos request (HTTP) como con scope dict (WebSocket).
     
+    ✅ MEJORADO: 
+    - Soporte para fingerprint local (si el dispositivo lo envía directamente)
+    - Incluye MAC address para mayor robustez
+    
     CAPA 1: Para primera solicitud sin UDID
     
     Args:
@@ -147,6 +155,17 @@ def generate_device_fingerprint(request_or_scope):
     Returns:
         str: Hash único del dispositivo (32 caracteres)
     """
+    # ✅ NUEVO: Si el dispositivo envía fingerprint directamente, usarlo (más estable)
+    direct_fingerprint = _get_header_value(request_or_scope, 'HTTP_X_DEVICE_FINGERPRINT')
+    if direct_fingerprint and len(direct_fingerprint) == 32:
+        # Validar que sea hexadecimal válido
+        try:
+            int(direct_fingerprint, 16)
+            return direct_fingerprint  # Usar fingerprint del dispositivo
+        except ValueError:
+            # Si no es válido, continuar con generación normal
+            pass
+    
     # Extraer headers desde request o scope
     headers_dict = {
         # Factores básicos (siempre disponibles)
@@ -167,6 +186,9 @@ def generate_device_fingerprint(request_or_scope):
         'tv_serial': _get_header_value(request_or_scope, 'HTTP_X_TV_SERIAL'),
         'tv_model': _get_header_value(request_or_scope, 'HTTP_X_TV_MODEL'),
         'firmware_version': _get_header_value(request_or_scope, 'HTTP_X_FIRMWARE_VERSION'),
+        
+        # ✅ NUEVO: MAC address para mayor robustez
+        'mac_address': _get_header_value(request_or_scope, 'HTTP_X_MAC_ADDRESS'),
     }
     
     # Construir string de fingerprint

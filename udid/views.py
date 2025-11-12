@@ -156,10 +156,10 @@ class RequestUDIDManualView(APIView):
                 "expires_at": auth_request.expires_at,
                 "status": auth_request.status,
                 "expires_in_minutes": 15,
-                "device_fingerprint": auth_request.device_fingerprint,  # ✅ Agregado a la respuesta
+                "device_fingerprint": auth_request.device_fingerprint,
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 10 * 60  # Actualizado a 10 minutos
+                    "reset_in_seconds": 10 * 60
                 }
             }, status=status.HTTP_201_CREATED)
             
@@ -288,50 +288,18 @@ class ValidateAndAssociateUDIDView(APIView):
 
             # Notificar a los WebSockets que esperan este UDID: al commit
             def _notify():
-                """
-                Notifica a los WebSockets suscritos al grupo del UDID.
-                Implementa retry logic para manejar errores temporales de Redis.
-                """
-                import time
-                max_retries = 3
-                retry_delay = 0.5  # segundos
-                
-                for attempt in range(max_retries):
-                    try:
-                        channel_layer = get_channel_layer()
-                        if not channel_layer:
-                            logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
-                            return
-                        
-                        # Intentar enviar notificación
+                try:
+                    channel_layer = get_channel_layer()
+                    if channel_layer:
                         async_to_sync(channel_layer.group_send)(
                             f"udid_{udid}",              # 👈 mismo group que usa el consumer
                             {"type": "udid.validated", "udid": udid}  # 👈 llama a AuthWaitWS.udid_validated
                         )
-                        logger.info("Notificado udid.validated para %s (intento %d/%d)", udid, attempt + 1, max_retries)
-                        return  # Éxito, salir
-                        
-                    except Exception as e:
-                        error_msg = str(e)
-                        is_retryable = any(keyword in error_msg.lower() for keyword in [
-                            'timeout', 'connection', 'network', 'unavailable', 'broken pipe'
-                        ])
-                        
-                        if attempt < max_retries - 1 and is_retryable:
-                            # Error retryable, esperar y reintentar
-                            logger.warning(
-                                "Error notificando WebSocket para udid %s (intento %d/%d): %s. Reintentando...",
-                                udid, attempt + 1, max_retries, error_msg
-                            )
-                            time.sleep(retry_delay * (attempt + 1))  # Backoff exponencial
-                            continue
-                        else:
-                            # Error no retryable o último intento
-                            logger.exception(
-                                "Error notificando WebSocket para udid %s (intento %d/%d): %s",
-                                udid, attempt + 1, max_retries, error_msg
-                            )
-                            return  # Salir después del último intento
+                        logger.info("Notificado udid.validated para %s", udid)
+                    else:
+                        logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
+                except Exception as e:
+                    logger.exception("Error notificando WebSocket para udid %s: %s", udid, e)
 
             transaction.on_commit(_notify)
 
@@ -909,7 +877,7 @@ class ValidateStatusUDIDView(APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 class DisassociateUDIDView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         """
@@ -1040,6 +1008,7 @@ class ListSubscribersWithUDIDView(APIView):
     permission_classes = [IsAuthenticated]
     """
     Devuelve una lista paginada de suscriptores con información de UDID si aplica.
+    Requiere autenticación JWT.
     """
     def get(self, request):
         try:

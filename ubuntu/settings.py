@@ -35,8 +35,13 @@ SECRET_KEY = DjangoConfig.SECRET_KEY
 #* SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = DjangoConfig.DEBUG
 
+#* Configuración de ALLOWED_HOSTS
 ALLOWED_HOSTS = DjangoConfig.ALLOWED_HOSTS
+
+#* Configuración de WS_ALLOWED_ORIGINS
 WS_ALLOWED_ORIGINS = DjangoConfig.WS_ALLOWED_ORIGINS
+
+#* Configuración de WS_ALLOWED_ORIGIN_REGEXES
 WS_ALLOWED_ORIGIN_REGEXES = DjangoConfig.WS_ALLOWED_ORIGIN_REGEXES
 
 # ============================================================================
@@ -61,19 +66,26 @@ INSTALLED_APPS = [
 # ============================================================================
 # CONFIGURACIÓN DE CHANNELS
 # ============================================================================
-# Configuración de Channels
+# ASGI_APPLICATION: Ruta al módulo ASGI que maneja las conexiones WebSocket y HTTP asíncronas
+# Channels usa ASGI (Asynchronous Server Gateway Interface) en lugar de WSGI para soportar WebSockets
 ASGI_APPLICATION = 'ubuntu.asgi.application'
 
-# Configuración de Redis
+# REDIS_URL: URL de conexión a Redis (usado como backend para Channel Layers y cache)
 # Por defecto, usar localhost:6379 si no está configurado (desarrollo local)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Configuración de Redis Sentinel para alta disponibilidad
-# Si vas a usar Redis Sentinel, se mantiene la lógica existente
+# REDIS_SENTINEL: Configuración de Redis Sentinel para alta disponibilidad y failover automático
+# Formato: "host1:puerto1,host2:puerto2,host3:puerto3" (múltiples instancias Sentinel)
+# Si está configurado, se usa Sentinel en lugar de conexión directa a Redis
+# None = no usar Sentinel (conexión directa)
 REDIS_SENTINEL = os.getenv("REDIS_SENTINEL", None)
+
+# REDIS_SENTINEL_MASTER: Nombre del master de Redis que Sentinel debe monitorear
+# Este es el nombre del servicio master configurado en la configuración de Sentinel
 REDIS_SENTINEL_MASTER = os.getenv("REDIS_SENTINEL_MASTER", "mymaster")
 
-# Parsear REDIS_SENTINEL si está configurado
+# Parsear REDIS_SENTINEL: Convierte el string de configuración en lista de tuplas (host, puerto)
+# Ejemplo: "192.168.1.1:26379,192.168.1.2:26379" -> [("192.168.1.1", 26379), ("192.168.1.2", 26379)]
 if REDIS_SENTINEL:
     REDIS_SENTINEL = [
         (h, int(p)) for h, p in (hp.split(":") for hp in REDIS_SENTINEL.split(","))
@@ -81,11 +93,21 @@ if REDIS_SENTINEL:
 else:
     REDIS_SENTINEL = None
 
-# Timeouts de conexión
+# REDIS_SOCKET_CONNECT_TIMEOUT: Tiempo máximo (segundos) para establecer conexión con Redis
+# Si Redis no responde en este tiempo, se considera fallo de conexión
 REDIS_SOCKET_CONNECT_TIMEOUT = int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5"))
+
+# REDIS_SOCKET_TIMEOUT: Tiempo máximo (segundos) para esperar respuesta de Redis en operaciones
+# Si Redis no responde en este tiempo, se considera timeout de operación
 REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+
+# REDIS_RETRY_ON_TIMEOUT: Si es True, reintenta automáticamente operaciones que fallan por timeout
+# Útil para manejar picos de carga temporal donde Redis puede tardar más en responder
 REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == "true"
+
+# REDIS_MAX_CONNECTIONS: Número máximo de conexiones simultáneas al pool de conexiones de Redis
 # Aumentado a 100 para mejor manejo de carga (50 para rate limiting + 50 para WebSockets)
+# Más conexiones = mejor rendimiento bajo carga, pero más recursos del servidor Redis
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
 
 
@@ -93,46 +115,81 @@ REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
 # CHANNEL LAYERS (comunicación WS y backend asíncrono)
 # ============================================================================
 
-# Channel layer con Redis
-# Si REDIS_CHANNEL_LAYER_URL está configurado, se usa para WebSockets
-# Si no, se usa REDIS_URL para ambos
+# REDIS_CHANNEL_LAYER_URL: URL específica de Redis para Channel Layers (WebSockets y mensajería asíncrona)
+# Permite separar el Redis de WebSockets del Redis de cache/rate limiting si es necesario
+# Si no está configurado, se usa REDIS_URL por defecto
 REDIS_CHANNEL_LAYER_URL = os.getenv("REDIS_CHANNEL_LAYER_URL", REDIS_URL)
-REDIS_RATE_LIMIT_URL = os.getenv("REDIS_RATE_LIMIT_URL", REDIS_URL)  # Default: mismo que REDIS_URL
 
-# Configuración robusta para Channels
+# REDIS_RATE_LIMIT_URL: URL específica de Redis para rate limiting (control de frecuencia de peticiones)
+# Permite usar un Redis separado para rate limiting si necesitas escalar independientemente
+# Default: mismo que REDIS_URL (comparte Redis con Channel Layers)
+REDIS_RATE_LIMIT_URL = os.getenv("REDIS_RATE_LIMIT_URL", REDIS_URL)
+
+# host_cfg: Diccionario de configuración para la conexión a Redis en Channel Layers
+# Contiene la dirección y opcionalmente configuración SSL si se usa rediss:// (Redis con TLS)
 host_cfg = {"address": REDIS_CHANNEL_LAYER_URL}
+
+# Detectar si se usa Redis con TLS (rediss://) y habilitar SSL automáticamente
+# channels-redis detecta el esquema "rediss" y configura SSL automáticamente
 if urlparse(REDIS_CHANNEL_LAYER_URL).scheme == "rediss":
     # Si usas TLS, channels-redis lo maneja automáticamente
     host_cfg["ssl"] = True
 
 # Manejo de Sentinel o conexión directa
+# Si REDIS_SENTINEL está configurado, se usa configuración de alta disponibilidad
 if REDIS_SENTINEL:
-    # 🟢 Nueva configuración: soporte real para Redis Sentinel (alta disponibilidad)
+    # Configuración con Redis Sentinel: soporte real para alta disponibilidad y failover automático
+    # Sentinel monitorea múltiples instancias de Redis y cambia automáticamente si el master falla
     CHANNEL_LAYERS = {
         "default": {
+            # BACKEND: Backend de Channels que usa Redis como almacenamiento de mensajes
+            # channels_redis es el backend oficial que permite comunicación entre procesos/servidores
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
+                # hosts: Lista de configuraciones de hosts de Redis
+                # Con Sentinel, se especifican los sentinels y el nombre del master
                 "hosts": [{
+                    # sentinels: Lista de tuplas (host, puerto) de las instancias Sentinel
+                    # Sentinel se encarga de encontrar el master actual automáticamente
                     "sentinels": REDIS_SENTINEL,
+                    # master_name: Nombre del servicio master que Sentinel debe monitorear
+                    # Debe coincidir con el nombre configurado en la configuración de Sentinel
                     "master_name": REDIS_SENTINEL_MASTER,
+                    # db: Número de base de datos de Redis a usar (0-15, por defecto 0)
                     "db": 0,
                 }],
-                "capacity": 2000,# Número máximo de mensajes en un canal (aumentado de default 100)
-                "expiry": 10, # Tiempo de expiración de mensajes en segundos
+                # capacity: Número máximo de mensajes que se pueden almacenar en un canal antes de bloquear
+                # Si un canal alcanza este límite, los nuevos mensajes esperan hasta que haya espacio
+                # Aumentado a 2000 para manejar picos de tráfico (default: 100)
+                "capacity": 2000,
+                # expiry: Tiempo de expiración de mensajes en segundos
+                # Los mensajes no leídos se eliminan automáticamente después de este tiempo
+                # Previene acumulación infinita de mensajes en canales abandonados
+                "expiry": 10,
+                # group_expiry: Tiempo en segundos antes de que un grupo de WebSocket expire
+                # Los grupos permiten enviar mensajes a múltiples consumidores WebSocket simultáneamente
+                # 900 segundos = 15 minutos de persistencia del grupo
                 "group_expiry": 900,
             },
         }
     }
 else:
-    # Configuración normal de Redis directo
+    # Configuración normal de Redis directo: conexión simple sin alta disponibilidad
+    # Usado en desarrollo o cuando no necesitas failover automático
     CHANNEL_LAYERS = {
         "default": {
+            # BACKEND: Backend de Channels que usa Redis como almacenamiento de mensajes
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
+                # hosts: Lista de configuraciones de hosts de Redis
+                # Con conexión directa, se especifica la URL completa del servidor Redis
                 "hosts": [host_cfg],
-                "capacity": 2000,  # mensajes por canal
-                "expiry": 10,      # segundos
-                "group_expiry": 900,  # persistencia de grupos WS
+                # capacity: Número máximo de mensajes por canal antes de bloquear (2000 mensajes)
+                "capacity": 2000,
+                # expiry: Tiempo de expiración de mensajes no leídos (10 segundos)
+                "expiry": 10,
+                # group_expiry: Tiempo de persistencia de grupos WebSocket (900 segundos = 15 minutos)
+                "group_expiry": 900,
             },
         }
     }
@@ -143,7 +200,11 @@ else:
 # ============================================================================
 
 # Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
-UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "60"))  # Reducido de 600 a 60 segundos para mejor protección
+UDID_WAIT_TIMEOUT_AUTOMATIC = int(os.getenv("UDID_WAIT_TIMEOUT_AUTOMATIC", "180"))  # Validación automática: 90s
+UDID_WAIT_TIMEOUT_MANUAL = int(os.getenv("UDID_WAIT_TIMEOUT_MANUAL", "180"))  # Validación manual: 180s
+
+# Compatibilidad hacia atrás
+UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", str(UDID_WAIT_TIMEOUT_AUTOMATIC)))
 # Si querés habilitar un polling de respaldo (además del evento push)
 UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
 UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
@@ -155,12 +216,13 @@ UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 inten
 # Configuración del semáforo global de concurrencia
 GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "500"))  # Máximo de slots simultáneos
 
+# Límites de WebSocket reducidos para reducir carga del servidor
+UDID_WS_MAX_PER_TOKEN = int(os.getenv("UDID_WS_MAX_PER_TOKEN", "1"))  # Reducido de 3 a 1 conexiones por dispositivo/UDID
+
 # Circuit breaker para Redis
 # Aumentado threshold a 10 para ser menos sensible durante picos de carga
 REDIS_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("REDIS_CIRCUIT_BREAKER_THRESHOLD", "10"))  # Fallos consecutivos
 REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "30"))  # Segundos (reducido para recuperación más rápida)
-
-# Separación de Redis para rate limiting y channel layer (opcional)
 
 
 # ============================================================================
@@ -304,28 +366,29 @@ CORS_ORIGIN_WHITELIST = [
 ]
 
 CORS_ALLOW_HEADERS = [
-    'accept',
-    'accept-encoding',
-    'authorization',
-    'content-type',
-    'dnt',
-    'origin',
-    'user-agent',
-    'x-csrftoken',
-    'x-requested-with',
-    'content-encoding',
-    'x-udid',  # Header personalizado para UDID
-    'x-app-version',
-    'x-device-id',
-    'x-app-type',
-    # Headers mejorados para device fingerprint (móviles y Smart TVs)
-    'x-os-version',        # Versión del sistema operativo
-    'x-device-model',      # Modelo del dispositivo
-    'x-build-id',          # Build fingerprint (Android)
-    'x-tv-serial',         # Serial number (Smart TVs)
-    'x-tv-model',          # Modelo específico (Smart TVs)
-    'x-firmware-version',  # Versión de firmware (Smart TVs)
-    'x-api-key',           # API key para autenticación
+    'accept',               # Tipo de contenido que el cliente acepta recibir
+    'accept-encoding',      # Codificaciones de contenido que el cliente acepta (gzip, deflate, etc.)
+    'authorization',        # Token de autenticación (Bearer token, JWT, etc.)
+    'content-type',         # Tipo de contenido del cuerpo de la petición (application/json, etc.)
+    'dnt',                  # Do Not Track: indica la preferencia del usuario sobre el rastreo
+    'origin',               # Origen de la petición (protocolo, dominio y puerto)
+    'user-agent',           # Información del navegador/cliente que realiza la petición
+    'x-csrftoken',          # Token CSRF para protección contra ataques Cross-Site Request Forgery
+    'x-requested-with',     # Indica que la petición fue realizada mediante XMLHttpRequest (AJAX)
+    'content-encoding',     # Codificación del contenido del cuerpo de la petición
+    'x-udid',               # Header personalizado para UDID (Unique Device Identifier)
+    'x-app-version',        # Versión de la aplicación móvil o cliente
+    'x-device-id',          # Identificador único del dispositivo
+    'x-app-type',           # Tipo de aplicación (iOS, Android, Web, etc.)
+    'x-os-version',         # Versión del sistema operativo del dispositivo
+    'x-device-model',       # Modelo del dispositivo (iPhone 12, Samsung Galaxy S21, etc.)
+    'x-build-id',           # Build fingerprint (Android) - identificador único de la compilación
+    'x-tv-serial',          # Número de serie del dispositivo Smart TV
+    'x-tv-model',           # Modelo específico del Smart TV
+    'x-firmware-version',   # Versión de firmware del dispositivo (especialmente para Smart TVs)
+    'x-api-key',            # API key para autenticación de la aplicación cliente
+    'x-mac-address',        # Dirección MAC del dispositivo (identificador de red)
+    'x-device-fingerprint', # Fingerprint generado localmente en el dispositivo para identificación única
 ]
 
 #* Configurar Seguridad para API Server
