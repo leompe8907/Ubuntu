@@ -4,12 +4,27 @@
 Script avanzado de simulación de carga con múltiples usuarios concurrentes.
 Pruebas intercaladas que simulan diferentes escenarios de uso.
 
-Flujo completo usando solo las views especificadas:
-1. RequestUDIDManualView -> request-udid-manual/ (GET) - solicitar el udid
-2. ValidateAndAssociateUDIDView -> validate-and-associate-udid/ (POST) - asociar el udid
-3. ValidateStatusUDIDView -> validate/ (GET) - validar la asociacion
-4. AuthWaitWS (WebSocket) -> ws://localhost:8000/ws/auth/ - autenticación con UDID
-5. DisassociateUDIDView -> disassociate-udid/ (POST) - desasociar
+ORGANIZACIÓN DEL CÓDIGO:
+El código está organizado en clases para mejor mantenibilidad:
+
+1. FlujoCompleto: Ejecuta el flujo completo de la aplicación
+   - RequestUDIDManualView -> request-udid-manual/ (GET) - solicitar el udid
+   - ValidateAndAssociateUDIDView -> validate-and-associate-udid/ (POST) - asociar el udid (operator_id="123")
+   - AuthWaitWS (WebSocket) -> ws://localhost:8000/ws/auth/ - autenticación con UDID
+   - DisassociateUDIDView -> disassociate-udid/ (POST) - desasociar
+   - Cada paso tiene intervalos de tiempo configurables
+
+2. ValidarEstado: Ejecuta la validación de estado de un UDID
+   - ValidateStatusUDIDView -> validate/ (GET) - validar la asociacion
+
+USO:
+    # Ejecutar flujo completo
+    flujo = FlujoCompleto(usuario_id=1, intervalo_min=0.1, intervalo_max=0.5)
+    resultado = flujo.ejecutar()
+    
+    # Validar estado de un UDID
+    validar = ValidarEstado(usuario_id=1, udid="abc123")
+    resultado = validar.ejecutar()
 
 Ejecutar: python test_carga_avanzado.py
 """
@@ -97,6 +112,362 @@ subscribers_disponibles = []
 udids_generados = []  # Lista de UDIDs generados para pruebas de desasociación
 udids_lock = threading.Lock()
 
+
+# ============================================================================
+# CLASES PARA ORGANIZAR LOS FLUJOS DE PRUEBA
+# ============================================================================
+
+class FlujoCompleto:
+    """
+    Clase que ejecuta el flujo completo de la aplicación:
+    1. RequestUDIDManualView - Solicitar UDID
+    2. ValidateAndAssociateUDIDView - Asociar UDID (con operator_id="123")
+    3. WebSocket - Autenticación con UDID
+    4. DisassociateUDIDView - Desasociar UDID
+    
+    Cada paso tiene un intervalo de tiempo configurable.
+    """
+    
+    def __init__(self, usuario_id, intervalo_min=0.1, intervalo_max=0.5, delay_inicial=0):
+        """
+        Inicializar el flujo completo.
+        
+        Args:
+            usuario_id: ID único del usuario simulado
+            intervalo_min: Tiempo mínimo entre pasos (segundos)
+            intervalo_max: Tiempo máximo entre pasos (segundos)
+            delay_inicial: Delay inicial antes de comenzar (segundos)
+        """
+        self.usuario_id = usuario_id
+        self.intervalo_min = intervalo_min
+        self.intervalo_max = intervalo_max
+        self.delay_inicial = delay_inicial
+        self.headers = self._generar_headers()
+        self.stats = {
+            'usuario_id': usuario_id,
+            'tipo': 'flujo_completo',
+            'udid_generado': False,
+            'asociacion_exitosa': False,
+            'websocket_exitoso': False,
+            'desasociacion_exitosa': False,
+            'rate_limited': False,
+            'errores': [],
+            'tiempo_total': 0,
+            'udid': None,
+            'subscriber_code': None,
+            'sn': None,
+        }
+    
+    def _generar_headers(self):
+        """Generar headers para el usuario simulado"""
+        device_id = f"device-{self.usuario_id}-android-tv"
+        return {
+            'Content-Type': 'application/json',
+            'User-Agent': f'SimulatedUser/{self.usuario_id}/1.0',
+            'x-device-id': device_id,
+            'x-os-version': f'TestOS/{random.randint(1, 5)}.{random.randint(0, 9)}',
+            'x-device-model': f'TestDevice-{random.randint(1000, 9999)}',
+            'x-build-id': f'BUILD-{random.randint(100000, 999999)}',
+        }
+    
+    def _esperar_intervalo(self):
+        """Esperar un intervalo aleatorio entre pasos"""
+        tiempo = random.uniform(self.intervalo_min, self.intervalo_max)
+        time.sleep(tiempo)
+        return tiempo
+    
+    def ejecutar(self):
+        """
+        Ejecutar el flujo completo.
+        Retorna un diccionario con las estadísticas de la ejecución.
+        """
+        start_time = time.time()
+        
+        # Delay inicial si está configurado
+        if self.delay_inicial > 0:
+            time.sleep(self.delay_inicial)
+        
+        try:
+            # PASO 1: Request UDID Manual
+            if not self._request_udid():
+                return self._finalizar_stats(start_time)
+            
+            # Intervalo entre pasos
+            self._esperar_intervalo()
+            
+            # PASO 2: Asociar UDID
+            if not self._asociar_udid():
+                return self._finalizar_stats(start_time)
+            
+            # Intervalo entre pasos
+            self._esperar_intervalo()
+            
+            # PASO 3: WebSocket - Autenticación con UDID
+            self._autenticar_websocket()
+            
+            # Intervalo entre pasos
+            self._esperar_intervalo()
+            
+            # PASO 4: Desasociar UDID
+            self._desasociar_udid()
+            
+        except Exception as e:
+            self.stats['errores'].append(str(e))
+            if self.stats['subscriber_code'] and self.stats['sn']:
+                liberar_subscriber(self.stats['subscriber_code'], self.stats['sn'])
+        
+        return self._finalizar_stats(start_time)
+    
+    def _request_udid(self):
+        """PASO 1: Solicitar UDID mediante RequestUDIDManualView"""
+        step_start = time.time()
+        try:
+            response = requests.get(
+                f'{API_BASE}/request-udid-manual/',
+                headers=self.headers,
+                timeout=10
+            )
+            step_time = time.time() - step_start
+            
+            with stats_lock:
+                stats['tiempos_request_udid'].append(step_time)
+            
+            if response.status_code == 201:
+                udid_data = response.json()
+                self.stats['udid'] = udid_data.get('udid')
+                self.stats['udid_generado'] = True
+                agregar_udid_generado(self.stats['udid'])
+                
+                with stats_lock:
+                    stats['requests_exitosos'] += 1
+                    stats['udids_generados'] += 1
+                return True
+            else:
+                with stats_lock:
+                    if response.status_code == 429:
+                        stats['requests_rate_limited'] += 1
+                        self.stats['rate_limited'] = True
+                    else:
+                        stats['requests_error'] += 1
+                return False
+        except Exception as e:
+            self.stats['errores'].append(f"Request UDID: {str(e)}")
+            with stats_lock:
+                stats['requests_error'] += 1
+            return False
+    
+    def _asociar_udid(self):
+        """PASO 2: Asociar UDID mediante ValidateAndAssociateUDIDView (operator_id="123")"""
+        subscriber_code, sn = obtener_subscriber_disponible()
+        if not subscriber_code or not sn:
+            return False
+        
+        self.stats['subscriber_code'] = subscriber_code
+        self.stats['sn'] = sn
+        
+        step_start = time.time()
+        try:
+            response = requests.post(
+                f'{API_BASE}/validate-and-associate-udid/',
+                json={
+                    'udid': self.stats['udid'],
+                    'subscriber_code': subscriber_code,
+                    'sn': sn,
+                    'operator_id': '123',  # Usar operator_id="123" como se solicitó
+                    'method': 'manual',
+                },
+                headers=self.headers,
+                timeout=10
+            )
+            step_time = time.time() - step_start
+            
+            with stats_lock:
+                stats['tiempos_associate'].append(step_time)
+            
+            if response.status_code == 200:
+                self.stats['asociacion_exitosa'] = True
+                with stats_lock:
+                    stats['asociaciones_exitosas'] += 1
+                return True
+            else:
+                liberar_subscriber(subscriber_code, sn)
+                self.stats['subscriber_code'] = None
+                self.stats['sn'] = None
+                return False
+        except Exception as e:
+            self.stats['errores'].append(f"Asociar UDID: {str(e)}")
+            liberar_subscriber(subscriber_code, sn)
+            self.stats['subscriber_code'] = None
+            self.stats['sn'] = None
+            return False
+    
+    def _autenticar_websocket(self):
+        """PASO 3: Autenticar mediante WebSocket"""
+        if not self.stats['udid'] or not self.stats['subscriber_code']:
+            return
+        
+        step_start = time.time()
+        try:
+            ws_exitoso, ws_tiempo, ws_resultado = conectar_websocket(
+                udid=self.stats['udid'],
+                app_type='android_tv',
+                app_version='1.0',
+                timeout=10
+            )
+            step_time = time.time() - step_start
+            
+            with stats_lock:
+                stats['tiempos_websocket'].append(step_time)
+            
+            if ws_exitoso:
+                self.stats['websocket_exitoso'] = True
+                with stats_lock:
+                    stats['autenticaciones_websocket_exitosas'] += 1
+        except Exception as e:
+            self.stats['errores'].append(f"WebSocket: {str(e)}")
+    
+    def _desasociar_udid(self):
+        """PASO 4: Desasociar UDID mediante DisassociateUDIDView"""
+        if not self.stats['udid'] or not self.stats['subscriber_code']:
+            return
+        
+        step_start = time.time()
+        try:
+            response = requests.post(
+                f'{API_BASE}/disassociate-udid/',
+                json={
+                    'udid': self.stats['udid'],
+                    'operator_id': '123',  # Usar operator_id="123" como se solicitó
+                    'reason': 'Test disassociation'
+                },
+                headers=self.headers,
+                timeout=10
+            )
+            step_time = time.time() - step_start
+            
+            with stats_lock:
+                stats['tiempos_disassociate'].append(step_time)
+            
+            if response.status_code == 200:
+                self.stats['desasociacion_exitosa'] = True
+                liberar_subscriber(self.stats['subscriber_code'], self.stats['sn'])
+                with stats_lock:
+                    stats['desasociaciones_exitosas'] += 1
+                    stats['usuarios_completos'] += 1
+        except Exception as e:
+            self.stats['errores'].append(f"Desasociar UDID: {str(e)}")
+            if self.stats['subscriber_code'] and self.stats['sn']:
+                liberar_subscriber(self.stats['subscriber_code'], self.stats['sn'])
+    
+    def _finalizar_stats(self, start_time):
+        """Finalizar estadísticas y retornar resultado"""
+        self.stats['tiempo_total'] = time.time() - start_time
+        with stats_lock:
+            stats['tiempos_respuesta'].append(self.stats['tiempo_total'])
+        return self.stats
+
+
+class ValidarEstado:
+    """
+    Clase que ejecuta la validación de estado de un UDID:
+    - ValidateStatusUDIDView - Validar estado del UDID
+    """
+    
+    def __init__(self, usuario_id, udid, delay_inicial=0):
+        """
+        Inicializar la validación de estado.
+        
+        Args:
+            usuario_id: ID único del usuario simulado
+            udid: UDID a validar
+            delay_inicial: Delay inicial antes de comenzar (segundos)
+        """
+        self.usuario_id = usuario_id
+        self.udid = udid
+        self.delay_inicial = delay_inicial
+        self.headers = self._generar_headers()
+        self.stats = {
+            'usuario_id': usuario_id,
+            'tipo': 'validar_estado',
+            'validacion_exitosa': False,
+            'rate_limited': False,
+            'errores': [],
+            'tiempo_total': 0,
+        }
+    
+    def _generar_headers(self):
+        """Generar headers para el usuario simulado"""
+        device_id = f"device-{self.usuario_id}-android-tv"
+        return {
+            'Content-Type': 'application/json',
+            'User-Agent': f'SimulatedUser/{self.usuario_id}/1.0',
+            'x-device-id': device_id,
+            'x-os-version': f'TestOS/{random.randint(1, 5)}.{random.randint(0, 9)}',
+            'x-device-model': f'TestDevice-{random.randint(1000, 9999)}',
+            'x-build-id': f'BUILD-{random.randint(100000, 999999)}',
+        }
+    
+    def ejecutar(self):
+        """
+        Ejecutar la validación de estado.
+        Retorna un diccionario con las estadísticas de la ejecución.
+        """
+        start_time = time.time()
+        
+        # Delay inicial si está configurado
+        if self.delay_inicial > 0:
+            time.sleep(self.delay_inicial)
+        
+        try:
+            self._validar_estado()
+        except Exception as e:
+            self.stats['errores'].append(str(e))
+        
+        return self._finalizar_stats(start_time)
+    
+    def _validar_estado(self):
+        """Validar estado del UDID mediante ValidateStatusUDIDView"""
+        step_start = time.time()
+        try:
+            response = requests.get(
+                f'{API_BASE}/validate/',
+                params={'udid': self.udid},
+                headers=self.headers,
+                timeout=10
+            )
+            step_time = time.time() - step_start
+            
+            with stats_lock:
+                stats['tiempos_validate'].append(step_time)
+            
+            if response.status_code == 200:
+                self.stats['validacion_exitosa'] = True
+                with stats_lock:
+                    stats['validaciones_exitosas'] += 1
+            else:
+                with stats_lock:
+                    if response.status_code == 429:
+                        stats['requests_rate_limited'] += 1
+                        self.stats['rate_limited'] = True
+                    else:
+                        stats['requests_error'] += 1
+        except Exception as e:
+            self.stats['errores'].append(f"Validar estado: {str(e)}")
+            with stats_lock:
+                stats['requests_error'] += 1
+    
+    def _finalizar_stats(self, start_time):
+        """Finalizar estadísticas y retornar resultado"""
+        self.stats['tiempo_total'] = time.time() - start_time
+        with stats_lock:
+            stats['tiempos_respuesta'].append(self.stats['tiempo_total'])
+        return self.stats
+
+
+# ============================================================================
+# FUNCIONES AUXILIARES
+# ============================================================================
+
 def conectar_websocket(udid, app_type='android_tv', app_version='1.0', timeout=10):
     """
     Conectar al WebSocket y autenticar con UDID.
@@ -150,7 +521,7 @@ def conectar_websocket(udid, app_type='android_tv', app_version='1.0', timeout=1
                     # Esperar evento udid.validated
                     # En un escenario real, esperaríamos el evento
                     # Para el test, esperamos un tiempo corto
-                    time.sleep(0.5)
+                    time.sleep(90)
                     continue
                 elif tipo == "error":
                     resultado["error"] = data.get("error") or data.get("detail")
@@ -187,7 +558,7 @@ def obtener_metricas_sistema():
         memoria = psutil.virtual_memory()
         return {
             'cpu': cpu_percent,
-            'memoria_mb': memoria.used / 1024 / 1024,  # MB
+            'memoria_mb': memoria.used / 10000 / 10000,  # MB
             'memoria_percent': memoria.percent,
         }
     except Exception:
@@ -291,6 +662,20 @@ def obtener_udid_para_desasociar():
             except:
                 continue
         return None, None, None
+
+def obtener_udid_para_validar():
+    """Obtener un UDID existente para validar su estado"""
+    global udids_generados
+    with udids_lock:
+        # Buscar cualquier UDID generado
+        for udid in reversed(udids_generados):  # Tomar los más recientes primero
+            try:
+                req = UDIDAuthRequest.objects.get(udid=udid)
+                # Retornar cualquier UDID que exista (pendiente, validado, usado)
+                return udid
+            except:
+                continue
+        return None
 
 def print_section(title):
     """Imprimir una sección"""
@@ -648,19 +1033,46 @@ def simular_usuario(usuario_id, delay_inicial=0):
     """
     Simula un usuario con comportamiento aleatorio intercalado.
     Diferentes tipos de usuarios para probar diferentes escenarios.
+    
+    Ahora usa las nuevas clases FlujoCompleto y ValidarEstado.
     """
     # Distribución de tipos de usuarios:
-    # 40% - Usuario completo (todo el flujo)
-    # 30% - Solo UDID (no asocia)
-    # 30% - Reasociación (desasocia y reasocia)
+    # 50% - Flujo completo (RequestUDID, Associate, WebSocket, Disassociate)
+    # 30% - Solo UDID (no asocia) - usa función antigua para compatibilidad
+    # 20% - Validar estado de UDID existente
     rand = random.random()
     
-    if rand < 0.4:
-        return simular_usuario_completo(usuario_id, delay_inicial)
-    elif rand < 0.7:
+    if rand < 0.5:
+        # Usar la nueva clase FlujoCompleto
+        flujo = FlujoCompleto(
+            usuario_id=usuario_id,
+            intervalo_min=0.1,
+            intervalo_max=0.5,
+            delay_inicial=delay_inicial
+        )
+        return flujo.ejecutar()
+    elif rand < 0.8:
+        # Mantener función antigua para compatibilidad
         return simular_usuario_solo_udid(usuario_id, delay_inicial)
     else:
-        return simular_usuario_reasociacion(usuario_id, delay_inicial)
+        # Validar estado de un UDID existente
+        udid_existente = obtener_udid_para_validar()
+        if udid_existente:
+            validar = ValidarEstado(
+                usuario_id=usuario_id,
+                udid=udid_existente,
+                delay_inicial=delay_inicial
+            )
+            return validar.ejecutar()
+        else:
+            # Si no hay UDIDs, hacer flujo completo
+            flujo = FlujoCompleto(
+                usuario_id=usuario_id,
+                intervalo_min=0.1,
+                intervalo_max=0.5,
+                delay_inicial=delay_inicial
+            )
+            return flujo.ejecutar()
 
 def ejecutar_simulacion(num_usuarios, usuarios_simultaneos=10):
     """Ejecuta la simulación con múltiples usuarios"""

@@ -288,12 +288,12 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 # SQLite3
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': BASE_DIR / 'db.sqlite3',
-#     }
-# }
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
 
 # Docker Compose Postgres
 # DATABASES = {
@@ -309,19 +309,19 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # }
 
 # Xampp MariaDB
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'udid',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
-        'PORT': os.getenv("MYSQL_PORT", "3307"),
-        'OPTIONS': {
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
-    }
-}
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'udid',
+#         'USER': 'root',
+#         'PASSWORD': '',
+#         'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+#         'PORT': os.getenv("MYSQL_PORT", "3307"),
+#         'OPTIONS': {
+#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#         },
+#     }
+# }
 
 # Heroku Postgres
 # DATABASES = {
