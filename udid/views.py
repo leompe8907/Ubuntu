@@ -877,7 +877,7 @@ class ValidateStatusUDIDView(APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 class DisassociateUDIDView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
         """

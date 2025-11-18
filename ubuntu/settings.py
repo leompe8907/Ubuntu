@@ -161,15 +161,15 @@ if REDIS_SENTINEL:
                 # capacity: Número máximo de mensajes que se pueden almacenar en un canal antes de bloquear
                 # Si un canal alcanza este límite, los nuevos mensajes esperan hasta que haya espacio
                 # Aumentado a 2000 para manejar picos de tráfico (default: 100)
-                "capacity": 2000,
+                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
                 # expiry: Tiempo de expiración de mensajes en segundos
                 # Los mensajes no leídos se eliminan automáticamente después de este tiempo
                 # Previene acumulación infinita de mensajes en canales abandonados
-                "expiry": 10,
+                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
                 # group_expiry: Tiempo en segundos antes de que un grupo de WebSocket expire
                 # Los grupos permiten enviar mensajes a múltiples consumidores WebSocket simultáneamente
                 # 900 segundos = 15 minutos de persistencia del grupo
-                "group_expiry": 900,
+                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
             },
         }
     }
@@ -185,11 +185,11 @@ else:
                 # Con conexión directa, se especifica la URL completa del servidor Redis
                 "hosts": [host_cfg],
                 # capacity: Número máximo de mensajes por canal antes de bloquear (2000 mensajes)
-                "capacity": 2000,
+                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
                 # expiry: Tiempo de expiración de mensajes no leídos (10 segundos)
-                "expiry": 10,
+                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
                 # group_expiry: Tiempo de persistencia de grupos WebSocket (900 segundos = 15 minutos)
-                "group_expiry": 900,
+                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
             },
         }
     }
@@ -210,7 +210,7 @@ UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
 UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
 
 # Configuración para pruebas de carga (aumentar límites temporalmente)
-UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "15"))  # Default: 15 min, para pruebas: 60 min
+UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "5"))  # Default: 15 min, para pruebas: 60 min
 UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
 
 # Configuración del semáforo global de concurrencia
@@ -288,12 +288,15 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 # SQLite3
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': BASE_DIR / 'db.sqlite3',
+#         'OPTIONS': {
+#             'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
+#         },
+#     }
+# }
 
 # Docker Compose Postgres
 # DATABASES = {
@@ -309,19 +312,19 @@ DATABASES = {
 # }
 
 # Xampp MariaDB
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'udid',
-#         'USER': 'root',
-#         'PASSWORD': '',
-#         'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
-#         'PORT': os.getenv("MYSQL_PORT", "3307"),
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#         },
-#     }
-# }
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'udid',
+        'USER': 'root',
+        'PASSWORD': '',
+        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+        'PORT': os.getenv("MYSQL_PORT", "3307"),
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+    }
+}
 
 # Heroku Postgres
 # DATABASES = {
@@ -357,13 +360,23 @@ CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 
 # DjangoConfig.CORS_ORIGIN_WHITELIST
-CORS_ORIGIN_WHITELIST = [
-    'http://localhost:8000',
-    'http://127.0.0.1:8000',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'https://front-udid-eta.vercel.app',
-]
+# Usar la configuración de DjangoConfig que viene de CORS_ALLOWED_ORIGINS en .env
+# Si CORS_ORIGIN_WHITELIST está en .env, se usa esa, sino se usa DjangoConfig.CORS_ORIGIN_WHITELIST
+_cors_whitelist_env = os.getenv("CORS_ORIGIN_WHITELIST")
+if _cors_whitelist_env:
+    CORS_ORIGIN_WHITELIST = [origin.strip() for origin in _cors_whitelist_env.split(",") if origin.strip()]
+elif DjangoConfig.CORS_ORIGIN_WHITELIST:
+    # Usar la configuración de DjangoConfig (viene de CORS_ALLOWED_ORIGINS en .env)
+    CORS_ORIGIN_WHITELIST = DjangoConfig.CORS_ORIGIN_WHITELIST
+else:
+    # Lista por defecto si no está configurado
+    CORS_ORIGIN_WHITELIST = [
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'https://front-udid-eta.vercel.app',
+    ]
 
 CORS_ALLOW_HEADERS = [
     'accept',               # Tipo de contenido que el cliente acepta recibir
@@ -401,10 +414,16 @@ X_FRAME_OPTIONS = 'DENY'
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Configuración específica para APIs móviles
-CSRF_TRUSTED_ORIGINS = [
-    'https://delancer-c121eb70d8e2.herokuapp.com',
-    'https://*.herokuapp.com',
-]
+# Si CSRF_TRUSTED_ORIGINS está en .env, se usa esa, sino se usa la lista por defecto
+_csrf_trusted_env = os.getenv("CSRF_TRUSTED_ORIGINS")
+if _csrf_trusted_env:
+    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_trusted_env.split(",") if origin.strip()]
+else:
+    # Lista por defecto si no está en .env
+    CSRF_TRUSTED_ORIGINS = [
+        'https://delancer-c121eb70d8e2.herokuapp.com',
+        'https://*.herokuapp.com',
+    ]
 
 
 # ============================================================================
@@ -446,7 +465,7 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 100,
+    'PAGE_SIZE': int(os.getenv("REST_FRAMEWORK_PAGE_SIZE", "100")),
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -455,10 +474,10 @@ REST_FRAMEWORK = {
 
 #* Configuración de JWT
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
-    'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': True,
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv("JWT_ACCESS_TOKEN_LIFETIME_MINUTES", "15"))),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv("JWT_REFRESH_TOKEN_LIFETIME_DAYS", "1"))),
+    'ROTATE_REFRESH_TOKENS': os.getenv("JWT_ROTATE_REFRESH_TOKENS", "True").lower() == "true",
+    'BLACKLIST_AFTER_ROTATION': os.getenv("JWT_BLACKLIST_AFTER_ROTATION", "True").lower() == "true",
 }
 
 # ============================================================================
@@ -539,13 +558,13 @@ if REDIS_URL:
                 'LOCATION': REDIS_URL,
                 'OPTIONS': {
                     'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-                    'SOCKET_CONNECT_TIMEOUT': 5,
-                    'SOCKET_TIMEOUT': 5,
+                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
+                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
                     'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
                 },
-                'KEY_PREFIX': 'udid_cache',
-                'TIMEOUT': 300,  # 5 minutos por defecto
+                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
+                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
             }
         }
     except ImportError:
@@ -555,12 +574,12 @@ if REDIS_URL:
                 'BACKEND': 'django.core.cache.backends.redis.RedisCache',
                 'LOCATION': REDIS_URL,
                 'OPTIONS': {
-                    'SOCKET_CONNECT_TIMEOUT': 5,
-                    'SOCKET_TIMEOUT': 5,
+                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
+                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
                 },
-                'KEY_PREFIX': 'udid_cache',
-                'TIMEOUT': 300,  # 5 minutos por defecto
+                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
+                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
             }
         }
 else:
@@ -571,7 +590,7 @@ else:
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
             'LOCATION': 'unique-snowflake',
-            'TIMEOUT': 300,
+            'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),
             'OPTIONS': {
                 'MAX_ENTRIES': 1000,
                 'CULL_FREQUENCY': 3,

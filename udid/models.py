@@ -390,7 +390,7 @@ class UDIDAuthRequest(models.Model):
         if not self.expires_at:
             # Tiempo de expiración configurable para pruebas de carga
             from django.conf import settings
-            expiration_minutes = getattr(settings, 'UDID_EXPIRATION_MINUTES', 15)
+            expiration_minutes = getattr(settings, 'UDID_EXPIRATION_MINUTES', 5)
             self.expires_at = timezone.now() + timedelta(minutes=expiration_minutes)
         if not self.udid:
             self.udid = str(uuid.uuid4())

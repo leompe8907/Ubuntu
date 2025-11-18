@@ -1,4 +1,5 @@
 import logging
+import time
 from django.db import transaction
 from .auth import CVClient
 from ..models import ListOfSmartcards
@@ -201,34 +202,88 @@ def sync_smartcards(session_id, limit=100):
         logger.error(f"Error inesperado durante la sincronización: {str(e)}")
         raise
 
-def CallListSmartcards(session_id, offset=0, limit=100):
+def CallListSmartcards(session_id, offset=0, limit=100, max_retries=3, retry_delay=5):
     """
     Llama a la función remota getListOfSmartcards del API Panaccess.
+    Implementa reintentos automáticos con backoff exponencial en caso de errores de conexión.
+    
+    Args:
+        session_id: ID de sesión de Panaccess
+        offset: Offset para la paginación
+        limit: Límite de registros por página
+        max_retries: Número máximo de reintentos (default: 3)
+        retry_delay: Tiempo inicial de espera entre reintentos en segundos (default: 5)
+    
+    Returns:
+        Dict con la respuesta de la API
+        
+    Raises:
+        Exception: Si todos los reintentos fallan
     """
     logger.info(f"Llamando a Panaccess API: offset={offset}, limit={limit}")
     client = CVClient()
     client.session_id = session_id
 
-    try:
-        response = client.call('getListOfSmartcards', {
-            'offset': offset,
-            'limit': limit,
-            'orderDir': 'ASC',
-            'orderBy': 'sn'
-        })
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Timeout más largo para operaciones que pueden tardar
+            timeout = 60 if attempt == 0 else 90  # Timeout más largo en reintentos
+            response = client.call('getListOfSmartcards', {
+                'offset': offset,
+                'limit': limit,
+                'orderDir': 'ASC',
+                'orderBy': 'sn'
+            }, timeout=timeout)
 
-        if response.get('success'):
-            return response.get('answer', {})
-        else:
-            # Intentar obtener el mensaje de error de diferentes campos posibles
-            error_msg = (
-                response.get('errorMessage') or 
-                response.get('error') or 
-                response.get('message') or
-                f"Error desconocido. Respuesta completa: {response}"
-            )
-            raise Exception(error_msg)
+            if response.get('success'):
+                return response.get('answer', {})
+            else:
+                # Intentar obtener el mensaje de error de diferentes campos posibles
+                error_msg = (
+                    response.get('errorMessage') or 
+                    response.get('error') or 
+                    response.get('message') or
+                    f"Error desconocido. Respuesta completa: {response}"
+                )
+                
+                # Si es un error de timeout o conexión, intentar reintentar
+                error_str = str(error_msg).lower()
+                if 'timeout' in error_str or 'connection' in error_str or 'connect' in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Backoff exponencial
+                        logger.warning(
+                            f"Error de conexión/timeout en intento {attempt + 1}/{max_retries}. "
+                            f"Reintentando en {wait_time} segundos... Error: {error_msg}"
+                        )
+                        time.sleep(wait_time)
+                        continue
+                
+                # Si no es un error de conexión o ya agotamos los reintentos, lanzar excepción
+                raise Exception(error_msg)
 
-    except Exception as e:
-        logger.error(f"Fallo al obtener smartcards: {str(e)}")
-        raise
+        except Exception as e:
+            last_exception = e
+            error_str = str(e).lower()
+            
+            # Verificar si es un error de conexión/timeout que podemos reintentar
+            if ('timeout' in error_str or 'connection' in error_str or 'connect' in error_str) and attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Backoff exponencial
+                logger.warning(
+                    f"Error de conexión/timeout en intento {attempt + 1}/{max_retries} "
+                    f"(offset={offset}). Reintentando en {wait_time} segundos... Error: {str(e)}"
+                )
+                time.sleep(wait_time)
+                continue
+            else:
+                # Si no es un error de conexión o ya agotamos los reintentos, lanzar excepción
+                logger.error(f"Fallo al obtener smartcards (offset={offset}): {str(e)}")
+                raise
+    
+    # Si llegamos aquí, todos los reintentos fallaron
+    logger.error(
+        f"Fallo al obtener smartcards después de {max_retries} intentos "
+        f"(offset={offset}): {str(last_exception)}"
+    )
+    raise Exception(f"Error después de {max_retries} intentos: {str(last_exception)}")
