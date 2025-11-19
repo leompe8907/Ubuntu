@@ -214,7 +214,7 @@ UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "5"))  # Defa
 UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
 
 # Configuración del semáforo global de concurrencia
-GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "500"))  # Máximo de slots simultáneos
+GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "1000"))  # Máximo de slots simultáneos
 
 # Límites de WebSocket reducidos para reducir carga del servidor
 UDID_WS_MAX_PER_TOKEN = int(os.getenv("UDID_WS_MAX_PER_TOKEN", "1"))  # Reducido de 3 a 1 conexiones por dispositivo/UDID
@@ -323,6 +323,9 @@ DATABASES = {
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
+        # Optimizaciones para mejor rendimiento con carga alta
+        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
+        'AUTOCOMMIT': True,
     }
 }
 

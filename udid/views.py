@@ -9,7 +9,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from django.db import transaction
 from django.utils import timezone
+from django.core.cache import cache
 from django.core.paginator import Paginator
+
 
 from asgiref.sync import async_to_sync
 
@@ -37,6 +39,27 @@ from .utils.log_buffer import log_audit_async
 from .utils.metrics import get_metrics, reset_metrics
 
 logger = logging.getLogger(__name__)
+
+def get_cached_app_credentials(app_type, app_version):
+    """
+    Devuelve AppCredentials desde cache de corto plazo para reducir
+    consultas a BD bajo alta concurrencia.
+    """
+    cache_key = f"appcred:{app_type}:{app_version}"
+    app_credentials = cache.get(cache_key)
+    if app_credentials is not None:
+        return app_credentials
+
+    app_credentials = AppCredentials.objects.filter(
+        app_type=app_type,
+        app_version=app_version,
+        is_active=True
+    ).first()
+
+    # Cache corto (10 segundos) para no romper rotación de claves
+    cache.set(cache_key, app_credentials, timeout=10)
+    return app_credentials
+
 
 class RequestUDIDManualView(APIView):
     permission_classes = [AllowAny]
@@ -548,26 +571,13 @@ class AuthenticateWithUDIDView(APIView):
                     "timestamp": timezone.now().isoformat()
                 }
 
-                # Obtener AppCredentials válidas
-                try:
-                    app_credentials = AppCredentials.objects.get(
-                        app_type=app_type,
-                        app_version=app_version,
-                        is_active=True
-                    )
-                    if not app_credentials.is_usable():
-                        raise AppCredentials.DoesNotExist()
-                except AppCredentials.DoesNotExist:
-                    app_credentials = AppCredentials.objects.filter(
-                        app_type=app_type,
-                        is_active=True,
-                        is_compromised=False
-                    ).order_by('-created_at').first()
-                    if not app_credentials:
-                        return Response({
-                            "error": f"No valid app credentials available for app_type='{app_type}'",
-                            "solution": "Contact administrator"
-                        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                # Obtener AppCredentials válidas (con cache corto en memoria/Redis)
+                app_credentials = get_cached_app_credentials(app_type, app_version)
+                if not app_credentials:
+                    return Response({
+                        "error": f"No valid app credentials available for app_type='{app_type}'",
+                        "solution": "Contact administrator"
+                    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
                 # Encriptar credenciales
                 try:
