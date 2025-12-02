@@ -178,7 +178,7 @@ class RequestUDIDManualView(APIView):
                 "udid": auth_request.udid,
                 "expires_at": auth_request.expires_at,
                 "status": auth_request.status,
-                "expires_in_minutes": 15,
+                "expires_in_minutes": 5,
                 "device_fingerprint": auth_request.device_fingerprint,
                 "rate_limit": {
                     "remaining": remaining - 1,
