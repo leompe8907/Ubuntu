@@ -227,16 +227,26 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         # 2) Aún no está listo → responder pending y suscribirse al grupo
         self.group_name = f"udid_{self.udid}"
         try:
-            # Intentar suscribirse al grupo con retry
+            # Intentar suscribirse al grupo con retry y exponential backoff
             max_retries = 3
+            base_delay = 0.5  # Delay base en segundos
             for attempt in range(max_retries):
                 try:
                     await self.channel_layer.group_add(self.group_name, self.channel_name)
                     break  # Éxito
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        # Reintentar después de un breve delay
-                        await asyncio.sleep(0.1 * (attempt + 1))
+                        # Exponential backoff: 0.5s, 1s, 2s
+                        # Esto evita saturar Redis/Channel Layer con reintentos inmediatos
+                        delay = base_delay * (2 ** attempt)
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(
+                            f"Error suscribiendo WebSocket al grupo {self.group_name} "
+                            f"(intento {attempt + 1}/{max_retries}): {e}. "
+                            f"Reintentando en {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
                         continue
                     else:
                         # Último intento falló
