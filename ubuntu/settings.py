@@ -14,17 +14,20 @@ import os
 import dj_database_url
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse
 
 from config import DjangoConfig
 
+# Validar configuración cargada desde DjangoConfig
 DjangoConfig.validate()
+
+
+# ============================================================================
+# PATHS Y CONFIGURACIÓN BASE
+# ============================================================================
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 #* SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = DjangoConfig.SECRET_KEY 
@@ -32,14 +35,18 @@ SECRET_KEY = DjangoConfig.SECRET_KEY
 #* SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = DjangoConfig.DEBUG
 
-#ALLOWED_HOSTS = DjangoConfig.ALLOWED_HOSTS
+#* Configuración de ALLOWED_HOSTS
 ALLOWED_HOSTS = DjangoConfig.ALLOWED_HOSTS
+
+#* Configuración de WS_ALLOWED_ORIGINS
 WS_ALLOWED_ORIGINS = DjangoConfig.WS_ALLOWED_ORIGINS
+
+#* Configuración de WS_ALLOWED_ORIGIN_REGEXES
 WS_ALLOWED_ORIGIN_REGEXES = DjangoConfig.WS_ALLOWED_ORIGIN_REGEXES
 
-# ALLOWED_HOSTS = []
-
-#* Application definition
+# ============================================================================
+# APLICACIONES INSTALADAS
+# ============================================================================
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -52,54 +59,200 @@ INSTALLED_APPS = [
     'rest_framework',
     'django_cron',
     'django_filters',
-    "channels",
+    'channels',  # Soporte WebSockets
     'udid',
 ]
 
-# Configuración de Channels
+# ============================================================================
+# CONFIGURACIÓN DE CHANNELS
+# ============================================================================
+# ASGI_APPLICATION: Ruta al módulo ASGI que maneja las conexiones WebSocket y HTTP asíncronas
+# Channels usa ASGI (Asynchronous Server Gateway Interface) en lugar de WSGI para soportar WebSockets
 ASGI_APPLICATION = 'ubuntu.asgi.application'
 
-REDIS_URL = os.getenv("REDIS_URL")
+# REDIS_URL: URL de conexión a Redis (usado como backend para Channel Layers y cache)
+# Por defecto, usar localhost:6379 si no está configurado (desarrollo local)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
-UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", "60"))  # Reducido de 600 a 60 segundos para mejor protección
+# REDIS_SENTINEL: Configuración de Redis Sentinel para alta disponibilidad y failover automático
+# Formato: "host1:puerto1,host2:puerto2,host3:puerto3" (múltiples instancias Sentinel)
+# Si está configurado, se usa Sentinel en lugar de conexión directa a Redis
+# None = no usar Sentinel (conexión directa)
+REDIS_SENTINEL = os.getenv("REDIS_SENTINEL", None)
 
-# Si querés habilitar un polling de respaldo (además del evento push)
-UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
-UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
+# REDIS_SENTINEL_MASTER: Nombre del master de Redis que Sentinel debe monitorear
+# Este es el nombre del servicio master configurado en la configuración de Sentinel
+REDIS_SENTINEL_MASTER = os.getenv("REDIS_SENTINEL_MASTER", "mymaster")
 
-# Channel layer con Redis
-if REDIS_URL:
-    import ssl
-    
-    # Crear contexto SSL que no verifique certificados
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    
+# Parsear REDIS_SENTINEL: Convierte el string de configuración en lista de tuplas (host, puerto)
+# Ejemplo: "192.168.1.1:26379,192.168.1.2:26379" -> [("192.168.1.1", 26379), ("192.168.1.2", 26379)]
+if REDIS_SENTINEL:
+    REDIS_SENTINEL = [
+        (h, int(p)) for h, p in (hp.split(":") for hp in REDIS_SENTINEL.split(","))
+    ]
+else:
+    REDIS_SENTINEL = None
+
+# REDIS_SOCKET_CONNECT_TIMEOUT: Tiempo máximo (segundos) para establecer conexión con Redis
+# Si Redis no responde en este tiempo, se considera fallo de conexión
+REDIS_SOCKET_CONNECT_TIMEOUT = int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5"))
+
+# REDIS_SOCKET_TIMEOUT: Tiempo máximo (segundos) para esperar respuesta de Redis en operaciones
+# Si Redis no responde en este tiempo, se considera timeout de operación
+REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+
+# REDIS_RETRY_ON_TIMEOUT: Si es True, reintenta automáticamente operaciones que fallan por timeout
+# Útil para manejar picos de carga temporal donde Redis puede tardar más en responder
+REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == "true"
+
+# REDIS_MAX_CONNECTIONS: Número máximo de conexiones simultáneas al pool de conexiones de Redis
+# Aumentado a 100 para mejor manejo de carga (50 para rate limiting + 50 para WebSockets)
+# Más conexiones = mejor rendimiento bajo carga, pero más recursos del servidor Redis
+REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
+
+
+# ============================================================================
+# CHANNEL LAYERS (comunicación WS y backend asíncrono)
+# ============================================================================
+
+# REDIS_CHANNEL_LAYER_URL: URL específica de Redis para Channel Layers (WebSockets y mensajería asíncrona)
+# Permite separar el Redis de WebSockets del Redis de cache/rate limiting si es necesario
+# Si no está configurado, se usa REDIS_URL por defecto
+REDIS_CHANNEL_LAYER_URL = os.getenv("REDIS_CHANNEL_LAYER_URL", REDIS_URL)
+
+# REDIS_RATE_LIMIT_URL: URL específica de Redis para rate limiting (control de frecuencia de peticiones)
+# Permite usar un Redis separado para rate limiting si necesitas escalar independientemente
+# Default: mismo que REDIS_URL (comparte Redis con Channel Layers)
+REDIS_RATE_LIMIT_URL = os.getenv("REDIS_RATE_LIMIT_URL", REDIS_URL)
+
+# host_cfg: Diccionario de configuración para la conexión a Redis en Channel Layers
+# Contiene la dirección y opcionalmente configuración SSL si se usa rediss:// (Redis con TLS)
+host_cfg = {"address": REDIS_CHANNEL_LAYER_URL}
+
+# Detectar si se usa Redis con TLS (rediss://) y habilitar SSL automáticamente
+# channels-redis detecta el esquema "rediss" y configura SSL automáticamente
+if urlparse(REDIS_CHANNEL_LAYER_URL).scheme == "rediss":
+    # Si usas TLS, channels-redis lo maneja automáticamente
+    host_cfg["ssl"] = True
+
+# Manejo de Sentinel o conexión directa
+# Si REDIS_SENTINEL está configurado, se usa configuración de alta disponibilidad
+if REDIS_SENTINEL:
+    # Configuración con Redis Sentinel: soporte real para alta disponibilidad y failover automático
+    # Sentinel monitorea múltiples instancias de Redis y cambia automáticamente si el master falla
     CHANNEL_LAYERS = {
         "default": {
+            # BACKEND: Backend de Channels que usa Redis como almacenamiento de mensajes
+            # channels_redis es el backend oficial que permite comunicación entre procesos/servidores
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
-                "hosts": [
-                    {
-                        "address": REDIS_URL,
-                        "ssl_cert_reqs": None,  # No requiere certificado
-                    }
-                ],
+                # hosts: Lista de configuraciones de hosts de Redis
+                # Con Sentinel, se especifican los sentinels y el nombre del master
+                "hosts": [{
+                    # sentinels: Lista de tuplas (host, puerto) de las instancias Sentinel
+                    # Sentinel se encarga de encontrar el master actual automáticamente
+                    "sentinels": REDIS_SENTINEL,
+                    # master_name: Nombre del servicio master que Sentinel debe monitorear
+                    # Debe coincidir con el nombre configurado en la configuración de Sentinel
+                    "master_name": REDIS_SENTINEL_MASTER,
+                    # db: Número de base de datos de Redis a usar (0-15, por defecto 0)
+                    "db": 0,
+                }],
+                # capacity: Número máximo de mensajes que se pueden almacenar en un canal antes de bloquear
+                # Si un canal alcanza este límite, los nuevos mensajes esperan hasta que haya espacio
+                # Aumentado a 2000 para manejar picos de tráfico (default: 100)
+                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
+                # expiry: Tiempo de expiración de mensajes en segundos
+                # Los mensajes no leídos se eliminan automáticamente después de este tiempo
+                # Previene acumulación infinita de mensajes en canales abandonados
+                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
+                # group_expiry: Tiempo en segundos antes de que un grupo de WebSocket expire
+                # Los grupos permiten enviar mensajes a múltiples consumidores WebSocket simultáneamente
+                # 900 segundos = 15 minutos de persistencia del grupo
+                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
             },
         }
     }
 else:
+    # Configuración normal de Redis directo: conexión simple sin alta disponibilidad
+    # Usado en desarrollo o cuando no necesitas failover automático
     CHANNEL_LAYERS = {
-        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}
+        "default": {
+            # BACKEND: Backend de Channels que usa Redis como almacenamiento de mensajes
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                # hosts: Lista de configuraciones de hosts de Redis
+                # Con conexión directa, se especifica la URL completa del servidor Redis
+                "hosts": [host_cfg],
+                # capacity: Número máximo de mensajes por canal antes de bloquear (2000 mensajes)
+                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
+                # expiry: Tiempo de expiración de mensajes no leídos (10 segundos)
+                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
+                # group_expiry: Tiempo de persistencia de grupos WebSocket (900 segundos = 15 minutos)
+                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
+            },
+        }
     }
 
+
+# ============================================================================
+# PARÁMETROS DE UDID / CARGA / CONCURRENCIA
+# ============================================================================
+
+# Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
+UDID_WAIT_TIMEOUT_AUTOMATIC = int(os.getenv("UDID_WAIT_TIMEOUT_AUTOMATIC", "180"))  # Validación automática: 90s
+UDID_WAIT_TIMEOUT_MANUAL = int(os.getenv("UDID_WAIT_TIMEOUT_MANUAL", "180"))  # Validación manual: 180s
+
+# Compatibilidad hacia atrás
+UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", str(UDID_WAIT_TIMEOUT_AUTOMATIC)))
+# Si querés habilitar un polling de respaldo (además del evento push)
+UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
+UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
+
+# Configuración para pruebas de carga (aumentar límites temporalmente)
+UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "5"))  # Default: 15 min, para pruebas: 60 min
+UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
+
+# Configuración del semáforo global de concurrencia
+GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "1000"))  # Máximo de slots simultáneos
+
+# Límites de WebSocket reducidos para reducir carga del servidor
+UDID_WS_MAX_PER_TOKEN = int(os.getenv("UDID_WS_MAX_PER_TOKEN", "1"))  # Reducido de 3 a 1 conexiones por dispositivo/UDID
+
+# Circuit breaker para Redis
+# Aumentado threshold a 10 para ser menos sensible durante picos de carga
+REDIS_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("REDIS_CIRCUIT_BREAKER_THRESHOLD", "10"))  # Fallos consecutivos
+REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "30"))  # Segundos (reducido para recuperación más rápida)
+
+
+# ============================================================================
+# FASE 2: Backpressure y Degradación
+# ============================================================================
+
+# Configuración de la cola de requests
+REQUEST_QUEUE_MAX_SIZE = int(os.getenv("REQUEST_QUEUE_MAX_SIZE", "1000"))
+REQUEST_QUEUE_MAX_WAIT_TIME = int(os.getenv("REQUEST_QUEUE_MAX_WAIT_TIME", "10"))  # Segundos
+
+# Configuración de degradación elegante
+DEGRADATION_BASELINE_LOAD = int(os.getenv("DEGRADATION_BASELINE_LOAD", "100"))  # Carga base (concurrentes)
+DEGRADATION_MEDIUM_THRESHOLD = float(os.getenv("DEGRADATION_MEDIUM_THRESHOLD", "1.5"))  # 1.5x carga base
+DEGRADATION_HIGH_THRESHOLD = float(os.getenv("DEGRADATION_HIGH_THRESHOLD", "2.0"))  # 2.0x carga base
+DEGRADATION_CRITICAL_THRESHOLD = float(os.getenv("DEGRADATION_CRITICAL_THRESHOLD", "3.0"))  # 3.0x carga base
+
+
+
+
+# ============================================================================
+# MIDDLEWARE
+# ============================================================================
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
-    "udid.middleware.SystemLoadTrackingMiddleware",  # Rastreo de carga para rate limiting adaptativo
+    "udid.middleware.SystemLoadTrackingMiddleware",
+    "udid.middleware.GlobalConcurrencyMiddleware",
+    "udid.middleware.BackpressureMiddleware",
+    "udid.middleware.APIKeyAuthMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -129,30 +282,54 @@ TEMPLATES = [
 WSGI_APPLICATION = 'ubuntu.wsgi.application'
 
 
-# Database
+# ============================================================================
+# BASE DE DATOS
+# ============================================================================
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+# SQLite3
 # DATABASES = {
 #     'default': {
 #         'ENGINE': 'django.db.backends.sqlite3',
 #         'NAME': BASE_DIR / 'db.sqlite3',
+#         'OPTIONS': {
+#             'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
+#         },
 #     }
 # }
 
+# Docker Compose Postgres
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.getenv("POSTGRES_DB", "udid"),
+#         "USER": os.getenv("POSTGRES_USER", "dev"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
+#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
+#         "CONN_MAX_AGE": 60,
+#     }
+# }
+
+# Xampp MariaDB
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'udid',
         'USER': 'root',
         'PASSWORD': '',
-        'HOST': "127.0.0.1",
-        'PORT': "3307",
+        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+        'PORT': os.getenv("MYSQL_PORT", "3307"),
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
+        # Optimizaciones para mejor rendimiento con carga alta
+        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
+        'AUTOCOMMIT': True,
     }
 }
 
+# Heroku Postgres
 # DATABASES = {
 #     'default': dj_database_url.config()
 # }
@@ -177,19 +354,93 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
+# ============================================================================
+# CORS Y SEGURIDAD
+# ============================================================================
+
+#* CORS settings
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = True
+
+# DjangoConfig.CORS_ORIGIN_WHITELIST
+# Usar la configuración de DjangoConfig que viene de CORS_ALLOWED_ORIGINS en .env
+# Si CORS_ORIGIN_WHITELIST está en .env, se usa esa, sino se usa DjangoConfig.CORS_ORIGIN_WHITELIST
+_cors_whitelist_env = os.getenv("CORS_ORIGIN_WHITELIST")
+if _cors_whitelist_env:
+    CORS_ORIGIN_WHITELIST = [origin.strip() for origin in _cors_whitelist_env.split(",") if origin.strip()]
+elif DjangoConfig.CORS_ORIGIN_WHITELIST:
+    # Usar la configuración de DjangoConfig (viene de CORS_ALLOWED_ORIGINS en .env)
+    CORS_ORIGIN_WHITELIST = DjangoConfig.CORS_ORIGIN_WHITELIST
+else:
+    # Lista por defecto si no está configurado
+    CORS_ORIGIN_WHITELIST = [
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'https://front-udid-eta.vercel.app',
+    ]
+
+CORS_ALLOW_HEADERS = [
+    'accept',               # Tipo de contenido que el cliente acepta recibir
+    'accept-encoding',      # Codificaciones de contenido que el cliente acepta (gzip, deflate, etc.)
+    'authorization',        # Token de autenticación (Bearer token, JWT, etc.)
+    'content-type',         # Tipo de contenido del cuerpo de la petición (application/json, etc.)
+    'dnt',                  # Do Not Track: indica la preferencia del usuario sobre el rastreo
+    'origin',               # Origen de la petición (protocolo, dominio y puerto)
+    'user-agent',           # Información del navegador/cliente que realiza la petición
+    'x-csrftoken',          # Token CSRF para protección contra ataques Cross-Site Request Forgery
+    'x-requested-with',     # Indica que la petición fue realizada mediante XMLHttpRequest (AJAX)
+    'content-encoding',     # Codificación del contenido del cuerpo de la petición
+    'x-udid',               # Header personalizado para UDID (Unique Device Identifier)
+    'x-app-version',        # Versión de la aplicación móvil o cliente
+    'x-device-id',          # Identificador único del dispositivo
+    'x-app-type',           # Tipo de aplicación (iOS, Android, Web, etc.)
+    'x-os-version',         # Versión del sistema operativo del dispositivo
+    'x-device-model',       # Modelo del dispositivo (iPhone 12, Samsung Galaxy S21, etc.)
+    'x-build-id',           # Build fingerprint (Android) - identificador único de la compilación
+    'x-tv-serial',          # Número de serie del dispositivo Smart TV
+    'x-tv-model',           # Modelo específico del Smart TV
+    'x-firmware-version',   # Versión de firmware del dispositivo (especialmente para Smart TVs)
+    'x-api-key',            # API key para autenticación de la aplicación cliente
+    'x-mac-address',        # Dirección MAC del dispositivo (identificador de red)
+    'x-device-fingerprint', # Fingerprint generado localmente en el dispositivo para identificación única
+]
+
+#* Configurar Seguridad para API Server
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = False  # Para APIs móviles
+CSRF_USE_SESSIONS = False
+X_FRAME_OPTIONS = 'DENY'
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Configuración específica para APIs móviles
+# Si CSRF_TRUSTED_ORIGINS está en .env, se usa esa, sino se usa la lista por defecto
+_csrf_trusted_env = os.getenv("CSRF_TRUSTED_ORIGINS")
+if _csrf_trusted_env:
+    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_trusted_env.split(",") if origin.strip()]
+else:
+    # Lista por defecto si no está en .env
+    CSRF_TRUSTED_ORIGINS = [
+        'https://delancer-c121eb70d8e2.herokuapp.com',
+        'https://*.herokuapp.com',
+    ]
+
+
+# ============================================================================
+# STATIC FILES / LOCALIZACIÓN
+# ============================================================================
+
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
 
 LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
-
 USE_I18N = True
-
 USE_L10N = True
-
 USE_TZ = False
-
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
@@ -202,61 +453,11 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-#* CORS settings
-CORS_ALLOW_ALL_ORIGINS = False
 
-CORS_ALLOW_CREDENTIALS = True
+# ============================================================================
+# REST FRAMEWORK / JWT
+# ============================================================================
 
-# DjangoConfig.CORS_ORIGIN_WHITELIST
-CORS_ORIGIN_WHITELIST = [
-    'http://localhost:8000',
-    'http://127.0.0.1:8000',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'https://front-udid-eta.vercel.app',
-]
-
-CORS_ALLOW_HEADERS = [
-    'accept',
-    'accept-encoding',
-    'authorization',
-    'content-type',
-    'dnt',
-    'origin',
-    'user-agent',
-    'x-csrftoken',
-    'x-requested-with',
-    'content-encoding',
-    'x-udid',  # Header personalizado para UDID
-    'x-app-version',
-    'x-device-id',
-    'x-app-type',
-    # Headers mejorados para device fingerprint (móviles y Smart TVs)
-    'x-os-version',        # Versión del sistema operativo
-    'x-device-model',      # Modelo del dispositivo
-    'x-build-id',          # Build fingerprint (Android)
-    'x-tv-serial',         # Serial number (Smart TVs)
-    'x-tv-model',          # Modelo específico (Smart TVs)
-    'x-firmware-version',  # Versión de firmware (Smart TVs)
-]
-
-#* Configurar Seguridad para API Server
-SECURE_BROWSER_XSS_FILTER = True
-SECURE_CONTENT_TYPE_NOSNIFF = True
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SECURE = True
-X_FRAME_OPTIONS = 'DENY'
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-
-# Configuración específica para APIs móviles
-CSRF_TRUSTED_ORIGINS = [
-    'https://delancer-c121eb70d8e2.herokuapp.com',
-    'https://*.herokuapp.com',
-]
-
-# Deshabilitar CSRF para APIs (ya que usas JWT)
-CSRF_COOKIE_SECURE = False  # Para APIs móviles
-CSRF_USE_SESSIONS = False
 
 #* Configurar Django Rest Framework
 REST_FRAMEWORK = {
@@ -267,7 +468,7 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 100,
+    'PAGE_SIZE': int(os.getenv("REST_FRAMEWORK_PAGE_SIZE", "100")),
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -276,11 +477,15 @@ REST_FRAMEWORK = {
 
 #* Configuración de JWT
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
-    'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': True,
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv("JWT_ACCESS_TOKEN_LIFETIME_MINUTES", "15"))),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv("JWT_REFRESH_TOKEN_LIFETIME_DAYS", "1"))),
+    'ROTATE_REFRESH_TOKENS': os.getenv("JWT_ROTATE_REFRESH_TOKENS", "True").lower() == "true",
+    'BLACKLIST_AFTER_ROTATION': os.getenv("JWT_BLACKLIST_AFTER_ROTATION", "True").lower() == "true",
 }
+
+# ============================================================================
+# LOGGING
+# ============================================================================
 
 #* Configuracion de LOGGING
 LOGGING = {
@@ -330,30 +535,56 @@ LOGGING = {
 import logging.config
 logging.config.dictConfig(LOGGING)
 
+# ============================================================================
+# CRON JOBS
+# ============================================================================
 # * Configuración de tareas periódicas con django-cron
 CRON_CLASSES = [
     "udid.cron.MergeSyncCronJob",
 ]
 
+# ============================================================================
+# CACHE: Redis distribuido (opcional)
+# ============================================================================
+
 #* Configuración de cache para Django
 # Migrado a Redis distribuido para rate limiting entre múltiples instancias
 if REDIS_URL:
     # Usar Redis como cache backend (distribuido)
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-            'LOCATION': REDIS_URL,
-            'OPTIONS': {
-                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-                'SOCKET_CONNECT_TIMEOUT': 5,
-                'SOCKET_TIMEOUT': 5,
-                'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
-                'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
-            },
-            'KEY_PREFIX': 'udid_cache',
-            'TIMEOUT': 300,  # 5 minutos por defecto
+    # Verificar si django-redis está instalado
+    try:
+        import django_redis
+        # Usar django-redis si está disponible (mejor para producción)
+        CACHES = {
+            'default': {
+                'BACKEND': 'django_redis.cache.RedisCache',
+                'LOCATION': REDIS_URL,
+                'OPTIONS': {
+                    'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
+                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
+                    'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+                    'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                },
+                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
+                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
+            }
         }
-    }
+    except ImportError:
+        # Fallback al backend nativo de Django (sin CLIENT_CLASS)
+        CACHES = {
+            'default': {
+                'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+                'LOCATION': REDIS_URL,
+                'OPTIONS': {
+                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
+                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
+                    'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                },
+                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
+                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
+            }
+        }
 else:
     # Fallback a cache local si Redis no está disponible (solo para desarrollo)
     # ⚠️ ADVERTENCIA: En producción con múltiples instancias, esto causará problemas
@@ -362,7 +593,7 @@ else:
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
             'LOCATION': 'unique-snowflake',
-            'TIMEOUT': 300,
+            'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),
             'OPTIONS': {
                 'MAX_ENTRIES': 1000,
                 'CULL_FREQUENCY': 3,

@@ -61,10 +61,15 @@ class CVClient:
         salt = PanaccessConfig.SALT
         return hashlib.md5((password + salt).encode()).hexdigest()
 
-    def call(self, func_name, parameters):
+    def call(self, func_name, parameters, timeout=60):
         """
         Llama a una función remota del API Panaccess con los parámetros indicados.
         Agrega automáticamente la sessionId si ya se ha hecho login.
+        
+        Args:
+            func_name: Nombre de la función a llamar
+            parameters: Diccionario con los parámetros
+            timeout: Timeout en segundos para la conexión (default: 60)
         """
         url = f"{self.base_url}?f={func_name}&requestMode=function"
 
@@ -75,13 +80,19 @@ class CVClient:
         param_string = urlencode(parameters)
 
         try:
-            response = requests.post(url, data=param_string, headers=headers)
+            response = requests.post(url, data=param_string, headers=headers, timeout=timeout)
             response.raise_for_status()  # lanza error si el status code es 4xx/5xx
             return response.json()
+        except requests.exceptions.Timeout as e:
+            return {"success": False, "error": f"Timeout error: {str(e)}"}
+        except requests.exceptions.ConnectionError as e:
+            return {"success": False, "error": f"Connection error: {str(e)}"}
         except requests.exceptions.HTTPError as e:
-            return {"success": False, "error": f"HTTP error: {str(e)}", "status_code": response.status_code}
-        except ValueError:
-            return {"success": False, "error": "Invalid JSON", "response": response.text}
+            status_code = response.status_code if 'response' in locals() else None
+            return {"success": False, "error": f"HTTP error: {str(e)}", "status_code": status_code}
+        except ValueError as ve:
+            response_text = response.text if 'response' in locals() else "No response available"
+            return {"success": False, "error": f"Invalid JSON: {str(ve)}", "response": response_text}
         except Exception as e:
             return {"success": False, "error": f"Unexpected error: {str(e)}"}
 

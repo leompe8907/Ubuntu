@@ -9,7 +9,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from django.db import transaction
 from django.utils import timezone
+from django.core.cache import cache
 from django.core.paginator import Paginator
+
 
 from asgiref.sync import async_to_sync
 
@@ -29,11 +31,36 @@ from .util import (
     generate_device_fingerprint, check_device_fingerprint_rate_limit, check_udid_rate_limit,
     check_combined_rate_limit, increment_rate_limit_counter,
     is_legitimate_reconnection, check_adaptive_rate_limit,
-    should_apply_retry_delay, reset_retry_info, get_retry_info
+    should_apply_retry_delay, reset_retry_info, get_retry_info,
+    get_client_token, check_token_bucket_lua
 )
-from .models import UDIDAuthRequest, AuthAuditLog, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
+from .models import UDIDAuthRequest, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
+from .utils.log_buffer import log_audit_async
+from .utils.metrics import get_metrics, reset_metrics
+from .cron import execute_sync_tasks
 
 logger = logging.getLogger(__name__)
+
+def get_cached_app_credentials(app_type, app_version):
+    """
+    Devuelve AppCredentials desde cache de corto plazo para reducir
+    consultas a BD bajo alta concurrencia.
+    """
+    cache_key = f"appcred:{app_type}:{app_version}"
+    app_credentials = cache.get(cache_key)
+    if app_credentials is not None:
+        return app_credentials
+
+    app_credentials = AppCredentials.objects.filter(
+        app_type=app_type,
+        app_version=app_version,
+        is_active=True
+    ).first()
+
+    # Cache corto (10 segundos) para no romper rotación de claves
+    cache.set(cache_key, app_credentials, timeout=10)
+    return app_credentials
+
 
 class RequestUDIDManualView(APIView):
     permission_classes = [AllowAny]
@@ -51,7 +78,37 @@ class RequestUDIDManualView(APIView):
         )
         
         try:
-            # CAPA 1: Rate limiting por Device Fingerprint (en lugar de IP)
+            # ========================================================================
+            # FAST-FAIL: Rate limiting ANTES de tocar la BD
+            # ========================================================================
+            
+            # 1. Rate limiting con token bucket (Redis, sin BD)
+            client_token = get_client_token(request)
+            if client_token:
+                is_allowed, remaining, retry_after = check_token_bucket_lua(
+                    identifier=client_token,
+                    capacity=3,  # 3 requests (más restrictivo para generación de UDID)
+                    refill_rate=1,  # 1 token por segundo
+                    window_seconds=60,
+                    tokens_requested=1
+                )
+                
+                if not is_allowed:
+                    logger.warning(
+                        f"RequestUDIDManualView: Token bucket rate limit excedido - "
+                        f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                        f"ip={client_ip}, retry_after={retry_after}s"
+                    )
+                    return Response({
+                        "error": "Rate limit exceeded",
+                        "message": "Too many requests. Please retry later.",
+                        "retry_after": retry_after,
+                        "remaining": remaining
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                        "Retry-After": str(retry_after)
+                    })
+            
+            # 2. Rate limiting por Device Fingerprint (Redis, sin BD)
             device_fingerprint = generate_device_fingerprint(request)
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
@@ -75,7 +132,11 @@ class RequestUDIDManualView(APIView):
                     "Retry-After": str(retry_after)
                 })
 
-            # Generar UDID único
+            # ========================================================================
+            # AHORA SÍ: Operaciones de BD
+            # ========================================================================
+            
+            # 3. Generar UDID único
             udid = self.generate_unique_udid()
             
             # Crear solicitud con device_fingerprint
@@ -93,8 +154,8 @@ class RequestUDIDManualView(APIView):
             # Incrementar contador
             increment_rate_limit_counter('device_fp', device_fingerprint)
             
-            # Log de auditoría
-            AuthAuditLog.objects.create(
+            # Log de auditoría (asíncrono)
+            log_audit_async(
                 action_type='udid_generated',
                 udid=udid,
                 client_ip=client_ip,
@@ -118,11 +179,11 @@ class RequestUDIDManualView(APIView):
                 "udid": auth_request.udid,
                 "expires_at": auth_request.expires_at,
                 "status": auth_request.status,
-                "expires_in_minutes": 15,
-                "device_fingerprint": auth_request.device_fingerprint,  # ✅ Agregado a la respuesta
+                "expires_in_minutes": 5,
+                "device_fingerprint": auth_request.device_fingerprint,
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 10 * 60  # Actualizado a 10 minutos
+                    "reset_in_seconds": 10 * 60
                 }
             }, status=status.HTTP_201_CREATED)
             
@@ -158,6 +219,37 @@ class ValidateAndAssociateUDIDView(APIView):
             f"ip={client_ip}, data_keys={list(request.data.keys()) if request.data else 'N/A'}"
         )
         
+        # ========================================================================
+        # FAST-FAIL: Rate limiting ANTES de tocar la BD
+        # ========================================================================
+        
+        # 1. Rate limiting con token bucket (Redis, sin BD) - lo más temprano posible
+        client_token = get_client_token(request)
+        if client_token:
+            is_allowed, remaining, retry_after = check_token_bucket_lua(
+                identifier=client_token,
+                capacity=5,  # 5 requests (más restrictivo para asociación)
+                refill_rate=1,  # 1 token por segundo
+                window_seconds=60,
+                tokens_requested=1
+            )
+            
+            if not is_allowed:
+                logger.warning(
+                    f"ValidateAndAssociateUDIDView: Token bucket rate limit excedido - "
+                    f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                    f"ip={client_ip}, retry_after={retry_after}s"
+                )
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after": retry_after,
+                    "remaining": remaining
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_after)
+                })
+        
+        # 2. Validación básica de datos (sin BD)
         serializer = UDIDAssociationSerializer(data=request.data)
         
         if not serializer.is_valid():
@@ -167,21 +259,12 @@ class ValidateAndAssociateUDIDView(APIView):
             )
             return Response({"errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         
+        # 3. Obtener UDID del request validado (el serializer ya consultó BD, pero sin lock)
         data = serializer.validated_data
-        subscriber   = data["subscriber"]
         udid_request = data["udid_request"]   # instancia ya validada por el serializer
-        sn           = data["sn"]
-        operator_id  = data["operator_id"]
-        method       = data["method"]
-        
-        # Obtener UDID del request
         udid = udid_request.udid if hasattr(udid_request, 'udid') else None
         
-        # Inicializar variables para rate limiting
-        remaining = None
-        retry_after = None
-        
-        # CAPA 3: Rate limiting por UDID
+        # 4. Rate limiting por UDID (Redis, sin BD)
         if udid:
             is_allowed, remaining, retry_after = check_udid_rate_limit(
                 udid,
@@ -203,8 +286,18 @@ class ValidateAndAssociateUDIDView(APIView):
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
                 })
+        
+        # Obtener datos del serializer
+        subscriber   = data["subscriber"]
+        sn           = data["sn"]
+        operator_id  = data["operator_id"]
+        method       = data["method"]
 
-        # Hacemos todo atómicamente y notificamos al WS SOLO tras el commit
+        # ========================================================================
+        # OPERACIONES DE BD CON LOCKS (al final del flujo)
+        # ========================================================================
+        
+        # 5. AHORA SÍ: select_for_update() - al final, después de todas las validaciones
         with transaction.atomic():
             # Bloqueo optimista de la fila del request
             udid_request = UDIDAuthRequest.objects.select_for_update().get(pk=udid_request.pk)
@@ -287,8 +380,8 @@ class ValidateAndAssociateUDIDView(APIView):
         subscriber.last_login = now
         subscriber.save(update_fields=["last_login"])
 
-        # Auditoría
-        AuthAuditLog.objects.create(
+        # Auditoría (asíncrono)
+        log_audit_async(
             action_type="udid_used",
             udid=auth_request.udid,
             subscriber_code=subscriber.subscriber_code,
@@ -328,7 +421,7 @@ class AuthenticateWithUDIDView(APIView):
             )
             return Response({"error": "UDID is required"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Validar app_type usando la función centralizada
+        # Validar app_type usando la función centralizada (validación rápida, sin BD)
         if not is_valid_app_type(app_type):
             logger.warning(
                 f"AuthenticateWithUDIDView: app_type inválido - "
@@ -340,10 +433,67 @@ class AuthenticateWithUDIDView(APIView):
                 "received": app_type
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Verificar si es reconexión legítima
+        # ========================================================================
+        # FAST-FAIL: Rate limiting ANTES de tocar la BD
+        # ========================================================================
+        
+        # 1. Rate limiting con token bucket (Redis, sin BD)
+        client_token = get_client_token(request)
+        if client_token:
+            is_allowed, remaining, retry_after = check_token_bucket_lua(
+                identifier=client_token,
+                capacity=10,  # 10 requests
+                refill_rate=1,  # 1 token por segundo
+                window_seconds=60,
+                tokens_requested=1
+            )
+            
+            if not is_allowed:
+                logger.warning(
+                    f"AuthenticateWithUDIDView: Token bucket rate limit excedido - "
+                    f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                    f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                    f"ip={client_ip}, retry_after={retry_after}s"
+                )
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after": retry_after,
+                    "remaining": remaining
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_after)
+                })
+
+        # 2. Rate limiting por UDID (Redis, sin BD)
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid,
+            max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
+            window_minutes=60
+        )
+        
+        if not is_allowed:
+            logger.warning(
+                f"AuthenticateWithUDIDView: Rate limit excedido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"ip={client_ip}, retry_after={retry_after}s"
+            )
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many authentication attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+
+        # ========================================================================
+        # AHORA SÍ: Operaciones que consultan la BD
+        # ========================================================================
+        
+        # 3. Verificar si es reconexión legítima (consulta BD, pero sin lock)
         is_reconnection = is_legitimate_reconnection(udid)
         
-        # Verificar si se debe aplicar delay de retry (exponential backoff con jitter)
+        # 4. Verificar si se debe aplicar delay de retry (exponential backoff con jitter)
         should_delay, retry_delay, attempt_number = should_apply_retry_delay(
             udid, action_type='reconnection'
         )
@@ -367,43 +517,31 @@ class AuthenticateWithUDIDView(APIView):
                 "X-Retry-After": str(retry_delay)
             })
 
-        # Rate limiting adaptativo (usa check_adaptive_rate_limit si es reconexión)
+        # 5. Rate limiting adaptativo para reconexiones (si aplica)
         if is_reconnection:
             is_allowed, remaining, retry_after, reason = check_adaptive_rate_limit(
                 'udid', udid, is_reconnection=True
             )
-        else:
-            is_allowed, remaining, retry_after = check_udid_rate_limit(
-                udid,
-                max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
-                window_minutes=60
-            )
-        
-        if not is_allowed:
-            # Si es reconexión y fue rechazada, calcular delay adicional
-            if is_reconnection:
+            
+            if not is_allowed:
                 retry_delay, _ = get_retry_info(udid, 'reconnection')
                 return Response({
                     "error": "Rate limit exceeded",
                     "message": "System is handling high reconnection volume. Please retry.",
                     "retry_after": retry_delay,
                     "is_reconnection": True,
-                    "reason": reason if is_reconnection else None
+                    "reason": reason
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_delay)
                 })
-            else:
-                return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many authentication attempts for this UDID. Please try again later.",
-                    "retry_after": retry_after,
-                    "remaining_requests": remaining
-                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
-                    "Retry-After": str(retry_after)
-                })
 
+        # ========================================================================
+        # OPERACIONES DE BD CON LOCKS (al final del flujo)
+        # ========================================================================
+        
         try:
             with transaction.atomic():
+                # 6. AHORA SÍ: select_for_update() - al final, después de todas las validaciones
                 try:
                     req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
                 except UDIDAuthRequest.DoesNotExist:
@@ -434,26 +572,13 @@ class AuthenticateWithUDIDView(APIView):
                     "timestamp": timezone.now().isoformat()
                 }
 
-                # Obtener AppCredentials válidas
-                try:
-                    app_credentials = AppCredentials.objects.get(
-                        app_type=app_type,
-                        app_version=app_version,
-                        is_active=True
-                    )
-                    if not app_credentials.is_usable():
-                        raise AppCredentials.DoesNotExist()
-                except AppCredentials.DoesNotExist:
-                    app_credentials = AppCredentials.objects.filter(
-                        app_type=app_type,
-                        is_active=True,
-                        is_compromised=False
-                    ).order_by('-created_at').first()
-                    if not app_credentials:
-                        return Response({
-                            "error": f"No valid app credentials available for app_type='{app_type}'",
-                            "solution": "Contact administrator"
-                        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                # Obtener AppCredentials válidas (con cache corto en memoria/Redis)
+                app_credentials = get_cached_app_credentials(app_type, app_version)
+                if not app_credentials:
+                    return Response({
+                        "error": f"No valid app credentials available for app_type='{app_type}'",
+                        "solution": "Contact administrator"
+                    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
                 # Encriptar credenciales
                 try:
@@ -473,8 +598,8 @@ class AuthenticateWithUDIDView(APIView):
                 req.mark_credentials_delivered(app_credentials)
                 req.mark_as_used()
 
-                # Log de auditoría
-                AuthAuditLog.objects.create(
+                # Log de auditoría (asíncrono)
+                log_audit_async(
                     action_type='udid_used',
                     udid=req.udid,
                     subscriber_code=req.subscriber_code,
@@ -581,7 +706,38 @@ class ValidateStatusUDIDView(APIView):
                 }
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # CAPA 3: Rate limiting por UDID (ajustado: más restrictivo)
+        # ========================================================================
+        # FAST-FAIL: Rate limiting ANTES de tocar la BD
+        # ========================================================================
+        
+        # 1. Rate limiting con token bucket (Redis, sin BD)
+        client_token = get_client_token(request)
+        if client_token:
+            is_allowed, remaining, retry_after = check_token_bucket_lua(
+                identifier=client_token,
+                capacity=20,  # 20 requests (más permisivo para validación de estado)
+                refill_rate=1,  # 1 token por segundo
+                window_seconds=60,
+                tokens_requested=1
+            )
+            
+            if not is_allowed:
+                logger.warning(
+                    f"ValidateStatusUDIDView: Token bucket rate limit excedido - "
+                    f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                    f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                    f"ip={client_ip}, retry_after={retry_after}s"
+                )
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after": retry_after,
+                    "remaining": remaining
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_after)
+                })
+        
+        # 2. Rate limiting por UDID (Redis, sin BD)
         is_allowed, remaining, retry_after = check_udid_rate_limit(
             udid,
             max_requests=20,  # Reducido de 30 a 20 validaciones por UDID cada 5 minutos
@@ -598,15 +754,19 @@ class ValidateStatusUDIDView(APIView):
                 "Retry-After": str(retry_after)
             })
 
+        # ========================================================================
+        # AHORA SÍ: Operaciones de BD (lectura sin lock)
+        # ========================================================================
+        
         try:
             req = UDIDAuthRequest.objects.get(udid=udid)
         except UDIDAuthRequest.DoesNotExist:
-            # ✅ Log del intento con UDID inválido
+            # ✅ Log del intento con UDID inválido (asíncrono)
             logger.warning(
                 f"ValidateStatusUDIDView: UDID no encontrado - "
                 f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., ip={client_ip}"
             )
-            AuthAuditLog.objects.create(
+            log_audit_async(
                 action_type='udid_validated',
                 udid=udid,
                 client_ip=client_ip,
@@ -624,8 +784,8 @@ class ValidateStatusUDIDView(APIView):
                 f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
                 f"subscriber_code={req.subscriber_code}, ip={client_ip}"
             )
-            # Log del intento con UDID revocado
-            AuthAuditLog.objects.create(
+            # Log del intento con UDID revocado (asíncrono)
+            log_audit_async(
                 action_type='udid_validated',
                 subscriber_code=req.subscriber_code,
                 udid=udid,
@@ -645,8 +805,8 @@ class ValidateStatusUDIDView(APIView):
                 req.status = 'expired'
                 req.save()
             
-            # Log del intento con UDID expirado
-            AuthAuditLog.objects.create(
+            # Log del intento con UDID expirado (asíncrono)
+            log_audit_async(
                 action_type='udid_validated',
                 subscriber_code=req.subscriber_code,
                 udid=udid,
@@ -698,8 +858,8 @@ class ValidateStatusUDIDView(APIView):
                     expiration_info['time_remaining'].total_seconds()
                 )
 
-        # ✅ Log de validación exitosa
-        AuthAuditLog.objects.create(
+        # ✅ Log de validación exitosa (asíncrono)
+        log_audit_async(
             action_type='udid_validated',
             subscriber_code=req.subscriber_code,
             udid=udid,
@@ -728,7 +888,7 @@ class ValidateStatusUDIDView(APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 class DisassociateUDIDView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
         """
@@ -737,12 +897,71 @@ class DisassociateUDIDView(APIView):
         udid = request.data.get('udid')
         operator_id = request.data.get('operator_id')
         reason = request.data.get('reason', 'Voluntary disassociation')
+        client_ip = get_client_ip(request)
 
         if not udid:
             return Response({"error": "UDID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ========================================================================
+        # FAST-FAIL: Rate limiting ANTES de tocar la BD
+        # ========================================================================
+        
+        # 1. Rate limiting con token bucket (Redis, sin BD)
+        client_token = get_client_token(request)
+        if client_token:
+            is_allowed, remaining, retry_after = check_token_bucket_lua(
+                identifier=client_token,
+                capacity=5,  # 5 requests (más restrictivo para desasociación)
+                refill_rate=1,  # 1 token por segundo
+                window_seconds=60,
+                tokens_requested=1
+            )
+            
+            if not is_allowed:
+                logger.warning(
+                    f"DisassociateUDIDView: Token bucket rate limit excedido - "
+                    f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                    f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                    f"ip={client_ip}, retry_after={retry_after}s"
+                )
+                return Response({
+                    "error": "Rate limit exceeded",
+                    "message": "Too many requests. Please retry later.",
+                    "retry_after": retry_after,
+                    "remaining": remaining
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                    "Retry-After": str(retry_after)
+                })
+        
+        # 2. Rate limiting por UDID (Redis, sin BD)
+        is_allowed, remaining, retry_after = check_udid_rate_limit(
+            udid,
+            max_requests=5,  # 5 desasociaciones por UDID cada hora
+            window_minutes=60
+        )
+        
+        if not is_allowed:
+            logger.warning(
+                f"DisassociateUDIDView: Rate limit excedido - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"ip={client_ip}, retry_after={retry_after}s"
+            )
+            return Response({
+                "error": "Rate limit exceeded",
+                "message": "Too many disassociation attempts for this UDID. Please try again later.",
+                "retry_after": retry_after,
+                "remaining_requests": remaining
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                "Retry-After": str(retry_after)
+            })
+
+        # ========================================================================
+        # OPERACIONES DE BD CON LOCKS (al final del flujo)
+        # ========================================================================
+        
         try:
             with transaction.atomic():
+                # 3. AHORA SÍ: select_for_update() - al final, después de todas las validaciones
                 try:
                     req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
                 except UDIDAuthRequest.DoesNotExist:
@@ -768,8 +987,8 @@ class DisassociateUDIDView(APIView):
                 req.revoked_reason = reason
                 req.save()
 
-                # Log de auditoría
-                AuthAuditLog.objects.create(
+                # Log de auditoría (asíncrono)
+                log_audit_async(
                     action_type='udid_revoked',
                     udid=req.udid,
                     subscriber_code=req.subscriber_code,
@@ -800,6 +1019,7 @@ class ListSubscribersWithUDIDView(APIView):
     permission_classes = [IsAuthenticated]
     """
     Devuelve una lista paginada de suscriptores con información de UDID si aplica.
+    Requiere autenticación JWT.
     """
     def get(self, request):
         try:
@@ -880,3 +1100,73 @@ class SubscriberInfoListView(ListAPIView):
     
     # 🔎 Búsqueda parcial (parámetro: ?search=juan)
     search_fields = ['subscriber_code', 'sn', 'login1']
+
+
+class MetricsDashboardView(APIView):
+    """
+    Vista del dashboard de métricas del sistema (solo JSON para pruebas).
+    Muestra métricas de latencia, errores, concurrencia, CPU, RAM, Redis y WebSockets.
+    """
+    permission_classes = [AllowAny]  # En producción, usar IsAuthenticated o IsAdminUser
+    
+    def get(self, request):
+        """
+        Retorna métricas del sistema en formato JSON.
+        Útil para pruebas y monitoreo durante desarrollo.
+        """
+        metrics = get_metrics()
+        return Response(metrics, status=status.HTTP_200_OK)
+    
+    def post(self, request):
+        """
+        Resetea las métricas del sistema.
+        """
+        reset_metrics()
+        return Response({
+            "message": "Metrics reset successfully",
+            "timestamp": timezone.now().isoformat()
+        }, status=status.HTTP_200_OK)
+
+class ManualSyncView(APIView):
+    """
+    Endpoint para ejecutar manualmente las tareas de sincronización.
+    Permite actualizar suscriptores y SN desde el frontend.
+    """
+    permission_classes = [IsAuthenticated]  # Requiere autenticación
+    
+    def post(self, request):
+        """
+        Ejecuta todas las tareas de sincronización manualmente.
+        
+        Returns:
+            Response con el resultado de la sincronización
+        """
+        logger.info(f"ManualSyncView: Sincronización manual solicitada por usuario {request.user.username if hasattr(request.user, 'username') else 'unknown'}")
+        
+        try:
+            # Ejecutar las tareas de sincronización
+            result = execute_sync_tasks()
+            
+            if result['success']:
+                return Response({
+                    'success': True,
+                    'message': result['message'],
+                    'tasks': result['tasks'],
+                    'session_id': result['session_id']
+                }, status=status.HTTP_200_OK)
+            else:
+                # Algunas tareas fallaron, pero devolvemos el resultado completo
+                return Response({
+                    'success': False,
+                    'message': result['message'],
+                    'tasks': result['tasks'],
+                    'session_id': result['session_id']
+                }, status=status.HTTP_207_MULTI_STATUS)  # 207 indica éxito parcial
+            
+        except Exception as e:
+            logger.error(f"ManualSyncView: Error inesperado: {str(e)}", exc_info=True)
+            return Response({
+                'success': False,
+                'message': f'Error al ejecutar sincronización: {str(e)}',
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
