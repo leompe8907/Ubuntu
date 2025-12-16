@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
@@ -12,6 +13,8 @@ from .util import (
     check_websocket_rate_limit,
     increment_websocket_connection,
     decrement_websocket_connection,
+    check_websocket_limits,
+    decrement_websocket_limits,
 )
 
 def _get_header(scope, key: str) -> str:
@@ -34,10 +37,16 @@ class AuthWaitWS(AsyncWebsocketConsumer):
       -> {"type":"ping"}  <- {"type":"pong"}
     """
 
-    # Configuraciones (podés sobreescribir en settings.py)
-    TIMEOUT_SECONDS = getattr(settings, "UDID_WAIT_TIMEOUT", 600)
-    ENABLE_POLLING = getattr(settings, "UDID_ENABLE_POLLING", False)
-    POLL_INTERVAL = getattr(settings, "UDID_POLL_INTERVAL", 2)
+    # Configuraciones
+    TIMEOUT_AUTOMATIC = getattr(settings, "UDID_WAIT_TIMEOUT_AUTOMATIC", 180)  # Validación automática
+    TIMEOUT_MANUAL = getattr(settings, "UDID_WAIT_TIMEOUT_MANUAL", 180)  # Validación manual
+    TIMEOUT_SECONDS = getattr(settings, "UDID_WAIT_TIMEOUT", TIMEOUT_AUTOMATIC)  # Default: automático
+    ENABLE_POLLING = getattr(settings, "UDID_ENABLE_POLLING", False) # Si querés habilitar un polling de respaldo (además del evento push)
+    POLL_INTERVAL = getattr(settings, "UDID_POLL_INTERVAL", 2) # Intervalo de polling
+    PING_INTERVAL = getattr(settings, "UDID_WS_PING_INTERVAL", 30)  # segundos
+    INACTIVITY_TIMEOUT = getattr(settings, "UDID_WS_INACTIVITY_TIMEOUT", 120)  # Tiempo de inactividad del WS: 120s
+    MAX_CONNECTIONS_PER_TOKEN = getattr(settings, "UDID_WS_MAX_PER_TOKEN", 3) # Límite de WebSocket por dispositivo/UDID
+    MAX_GLOBAL_CONNECTIONS = getattr(settings, "UDID_WS_MAX_GLOBAL", 1000) # Límite global del sistema
 
     async def connect(self):
         self.udid = None
@@ -46,29 +55,46 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         self.group_name = None
         self.done = False
         self.device_fingerprint = None
+        self.last_activity = time.time()
 
         # tareas async opcionales
         self.timeout_task = None
         self.poll_task = None
+        self.ping_task = None
+        self.inactivity_task = None
 
         # Rate limiting: verificar antes de aceptar conexión
         # Obtener device fingerprint del scope
         self.device_fingerprint = await sync_to_async(generate_device_fingerprint)(self.scope)
         
-        # Verificar rate limit (UDID aún no disponible, solo device fingerprint)
-        is_allowed, remaining, retry_after = await sync_to_async(check_websocket_rate_limit)(
+        # Verificar límites de WebSocket (token y global) usando Redis
+        is_allowed, reason, retry_after = await sync_to_async(check_websocket_limits)(
             udid=None,  # Aún no se conoce el UDID
+            device_fingerprint=self.device_fingerprint,
+            max_per_token=self.MAX_CONNECTIONS_PER_TOKEN,
+            max_global=self.MAX_GLOBAL_CONNECTIONS
+        )
+        
+        if not is_allowed:
+            # Rechazar conexión si excede el límite
+            await self.close(code=4001, reason=f"{reason}. Retry after {retry_after}s")
+            return
+        
+        # También mantener compatibilidad con el rate limit anterior
+        is_allowed_old, remaining, retry_after_old = await sync_to_async(check_websocket_rate_limit)(
+            udid=None,
             device_fingerprint=self.device_fingerprint,
             max_connections=5,
             window_minutes=5
         )
         
-        if not is_allowed:
-            # Rechazar conexión si excede el límite
-            await self.close(code=4001, reason=f"Too many connections. Retry after {retry_after}s")
+        if not is_allowed_old:
+            # Revertir incremento de límites nuevos
+            await sync_to_async(decrement_websocket_limits)(None, self.device_fingerprint)
+            await self.close(code=4001, reason=f"Too many connections. Retry after {retry_after_old}s")
             return
         
-        # Incrementar contador de conexiones activas
+        # Incrementar contador de conexiones activas (sistema anterior)
         await sync_to_async(increment_websocket_connection)(
             udid=None,
             device_fingerprint=self.device_fingerprint,
@@ -76,6 +102,12 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         )
         
         await self.accept()
+        
+        # Iniciar ping periódico
+        self.ping_task = asyncio.create_task(self._ping_loop())
+        
+        # Iniciar timeout de inactividad
+        self.inactivity_task = asyncio.create_task(self._inactivity_check())
 
     async def receive(self, text_data=None, bytes_data=None):
         if self.done:
@@ -87,9 +119,16 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         except Exception:
             return await self._send_err("bad_json", "El cuerpo debe ser JSON", close=True)
 
+        # Actualizar última actividad
+        self.last_activity = time.time()
+        
         # Heartbeat (mantener viva la conexión)
         if data.get("type") == "ping":
             return await self._send_json({"type": "pong"})
+        
+        # Manejar respuesta pong del cliente (actualizar actividad)
+        if data.get("type") == "pong":
+            return 
 
         # Mensaje esperado
         if data.get("type") != "auth_with_udid":
@@ -102,24 +141,43 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         if not self.udid:
             return await self._send_err("missing_udid", "UDID es requerido", close=True)
         
-        # Verificar rate limit con UDID (ahora que lo conocemos)
+        # Verificar límites con UDID (ahora que lo conocemos)
         if self.udid:
-            is_allowed, remaining, retry_after = await sync_to_async(check_websocket_rate_limit)(
+            # Verificar límites nuevos (token y global) con UDID
+            is_allowed_new, reason_new, retry_after_new = await sync_to_async(check_websocket_limits)(
+                udid=self.udid,
+                device_fingerprint=self.device_fingerprint,
+                max_per_token=self.MAX_CONNECTIONS_PER_TOKEN,
+                max_global=self.MAX_GLOBAL_CONNECTIONS
+            )
+            
+            if not is_allowed_new:
+                await self._send_err(
+                    "rate_limit_exceeded",
+                    f"{reason_new}. Retry after {retry_after_new}s",
+                    close=True
+                )
+                return
+            
+            # También verificar límites antiguos
+            is_allowed_old, remaining, retry_after_old = await sync_to_async(check_websocket_rate_limit)(
                 udid=self.udid,
                 device_fingerprint=self.device_fingerprint,
                 max_connections=5,
                 window_minutes=5
             )
             
-            if not is_allowed:
+            if not is_allowed_old:
+                # Revertir incremento de límites nuevos
+                await sync_to_async(decrement_websocket_limits)(self.udid, self.device_fingerprint)
                 await self._send_err(
                     "rate_limit_exceeded",
-                    f"Too many connections for this device. Retry after {retry_after}s",
+                    f"Too many connections for this device. Retry after {retry_after_old}s",
                     close=True
                 )
                 return
             
-            # Incrementar contador con UDID ahora que lo conocemos
+            # Incrementar contador con UDID ahora que lo conocemos (sistema anterior)
             await sync_to_async(increment_websocket_connection)(
                 udid=self.udid,
                 device_fingerprint=self.device_fingerprint,
@@ -156,24 +214,60 @@ class AuthWaitWS(AsyncWebsocketConsumer):
             await self._send_result(res, status="error")
             return await self.close()
 
+        # ✅ MEJORADO: Determinar timeout según método de validación
+        from .models import UDIDAuthRequest
+        try:
+            udid_request = await sync_to_async(UDIDAuthRequest.objects.get)(udid=self.udid)
+            # Usar timeout según método: manual = 180s, automatic = 60s
+            timeout_seconds = self.TIMEOUT_MANUAL if udid_request.method == 'manual' else self.TIMEOUT_AUTOMATIC
+        except Exception:
+            # Si no se puede obtener, usar default
+            timeout_seconds = self.TIMEOUT_SECONDS
+
         # 2) Aún no está listo → responder pending y suscribirse al grupo
         self.group_name = f"udid_{self.udid}"
         try:
-            await self.channel_layer.group_add(self.group_name, self.channel_name)
+            # Intentar suscribirse al grupo con retry y exponential backoff
+            max_retries = 3
+            base_delay = 0.5  # Delay base en segundos
+            for attempt in range(max_retries):
+                try:
+                    await self.channel_layer.group_add(self.group_name, self.channel_name)
+                    break  # Éxito
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 0.5s, 1s, 2s
+                        # Esto evita saturar Redis/Channel Layer con reintentos inmediatos
+                        delay = base_delay * (2 ** attempt)
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(
+                            f"Error suscribiendo WebSocket al grupo {self.group_name} "
+                            f"(intento {attempt + 1}/{max_retries}): {e}. "
+                            f"Reintentando en {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Último intento falló
+                        raise
         except Exception as e:
-            # p.ej., channel layer no disponible
-            await self._send_err("channel_layer_unavailable", str(e), close=True)
+            # p.ej., channel layer no disponible o Redis saturado
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error suscribiendo WebSocket al grupo {self.group_name}: {e}", exc_info=True)
+            await self._send_err("channel_layer_unavailable", f"Error de conexión: {str(e)}", close=True)
             return
 
         await self._send_json({
             "type": "pending",
             "status": res.get("status") or "not_validated",  # puede ser "validated" si es not_associated
             "detail": res.get("error") or "Esperando validación/asociación de UDID…",
-            "timeout": self.TIMEOUT_SECONDS,
+            "timeout": timeout_seconds,  # ✅ Usar timeout determinado
         })
 
-        # Timeout
-        self.timeout_task = asyncio.create_task(self._timeout())
+        # Timeout con el tiempo determinado
+        self.timeout_task = asyncio.create_task(self._timeout_with_seconds(timeout_seconds))
 
         # Polling opcional como respaldo (si el evento no llega)
         if self.ENABLE_POLLING:
@@ -234,9 +328,14 @@ class AuthWaitWS(AsyncWebsocketConsumer):
                 await self.close(code=1011)
 
     async def _timeout(self):
-        await asyncio.sleep(self.TIMEOUT_SECONDS)
+        """Timeout usando TIMEOUT_SECONDS (default)"""
+        await self._timeout_with_seconds(self.TIMEOUT_SECONDS)
+    
+    async def _timeout_with_seconds(self, timeout_seconds: int):
+        """✅ MEJORADO: Timeout con tiempo configurable"""
+        await asyncio.sleep(timeout_seconds)
         if not self.done:
-            await self._send_json({"type": "timeout", "detail": "No se recibió validación/asociación a tiempo."})
+            await self._send_json({"type": "timeout", "detail": f"No se recibió validación/asociación a tiempo (timeout: {timeout_seconds}s)."})
             await self._finish()
 
     async def _poll_every(self, seconds: int):
@@ -282,10 +381,49 @@ class AuthWaitWS(AsyncWebsocketConsumer):
         except Exception:
             pass
 
+    async def _ping_loop(self):
+        """Envía pings periódicos para mantener la conexión viva"""
+        try:
+            while not self.done:
+                await asyncio.sleep(self.PING_INTERVAL)
+                if not self.done:
+                    try:
+                        await self._send_json({"type": "ping"})
+                    except Exception:
+                        # Si falla el ping, la conexión probablemente se cerró
+                        break
+        except asyncio.CancelledError:
+            pass
+
+    async def _inactivity_check(self):
+        """Cierra conexiones inactivas después de un timeout"""
+        try:
+            while not self.done:
+                await asyncio.sleep(10)  # Verificar cada 10 segundos
+                if not self.done:
+                    inactivity_time = time.time() - self.last_activity
+                    if inactivity_time > self.INACTIVITY_TIMEOUT:
+                        await self._send_json({
+                            "type": "error",
+                            "code": "inactivity_timeout",
+                            "detail": f"Connection closed due to inactivity ({self.INACTIVITY_TIMEOUT}s)"
+                        })
+                        await self._finish()
+                        break
+        except asyncio.CancelledError:
+            pass
+
     async def _cleanup(self):
         self.done = True
 
-        # Decrementar contador de conexiones WebSocket
+        # Decrementar contador de conexiones WebSocket (sistema nuevo)
+        if self.device_fingerprint:
+            await sync_to_async(decrement_websocket_limits)(
+                udid=self.udid,
+                device_fingerprint=self.device_fingerprint
+            )
+        
+        # Decrementar contador de conexiones WebSocket (sistema anterior)
         if self.device_fingerprint:
             await sync_to_async(decrement_websocket_connection)(
                 udid=self.udid,
@@ -298,7 +436,8 @@ class AuthWaitWS(AsyncWebsocketConsumer):
             except Exception:
                 pass
 
-        for tname in ("timeout_task", "poll_task"):
+        # Cancelar todas las tareas
+        for tname in ("timeout_task", "poll_task", "ping_task", "inactivity_task"):
             task = getattr(self, tname, None)
             if task and not task.done():
                 task.cancel()

@@ -4,12 +4,21 @@ import time
 import random
 import math
 import logging
+import uuid
 from django.utils import timezone
 from datetime import timedelta
 from django.core.cache import cache
 
 # Logger específico para rate limiting
 logger = logging.getLogger('rate_limiting')
+
+# Importar utilidades de Redis HA
+try:
+    from .utils.redis_ha import get_redis_client_safe, is_redis_available
+    REDIS_HA_AVAILABLE = True
+except ImportError:
+    REDIS_HA_AVAILABLE = False
+    logger.warning("redis_ha module not available, using direct Redis connections")
 
 def get_client_ip(request):
     """Obtener la IP real del cliente desde request"""
@@ -86,6 +95,8 @@ def _build_device_fingerprint_string(headers_dict):
     Construye el string de fingerprint a partir de un diccionario de headers.
     Función centralizada para evitar duplicación de código.
     
+    ✅ MEJORADO: Incluye MAC address para mayor robustez
+    
     Args:
         headers_dict: Diccionario con todos los headers necesarios
         
@@ -93,32 +104,34 @@ def _build_device_fingerprint_string(headers_dict):
         str: String para hashear
     """
     app_type = headers_dict.get('app_type', '')
+    mac_address = headers_dict.get('mac_address', '')  # ✅ NUEVO: MAC address
     
     # Combinar factores según el tipo de app para mayor robustez
     if app_type in ['android_tv', 'samsung_tv', 'lg_tv', 'set_top_box']:
-        # Smart TV: usar serial, model, firmware (más difícil de falsificar)
+        # Smart TV: usar serial, model, firmware, MAC (más difícil de falsificar)
         fingerprint_string = (
             f"{app_type}|{headers_dict.get('tv_serial', '')}|"
             f"{headers_dict.get('tv_model', '')}|{headers_dict.get('firmware_version', '')}|"
-            f"{headers_dict.get('device_id', '')}|{headers_dict.get('app_version', '')}|"
-            f"{headers_dict.get('user_agent', '')}"
+            f"{headers_dict.get('device_id', '')}|{mac_address}|"  # ✅ Agregado MAC
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('user_agent', '')}"
         )
     elif app_type in ['android_mobile', 'ios_mobile', 'mobile_app']:
-        # Móvil: usar device_id, build_id, model, os_version (identificadores nativos)
+        # Móvil: usar device_id, build_id, model, os_version, MAC (identificadores nativos)
         fingerprint_string = (
             f"{app_type}|{headers_dict.get('device_id', '')}|"
             f"{headers_dict.get('build_id', '')}|{headers_dict.get('device_model', '')}|"
-            f"{headers_dict.get('os_version', '')}|{headers_dict.get('app_version', '')}|"
-            f"{headers_dict.get('user_agent', '')}"
+            f"{headers_dict.get('os_version', '')}|{mac_address}|"  # ✅ Agregado MAC
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('user_agent', '')}"
         )
     else:
-        # Fallback: usar headers básicos + app_type si está disponible
+        # Fallback: usar headers básicos + app_type + MAC si está disponible
         fingerprint_string = (
             f"{headers_dict.get('user_agent', '')}|"
             f"{headers_dict.get('accept_language', '')}|"
             f"{headers_dict.get('accept_encoding', '')}|"
             f"{headers_dict.get('accept', '')}|{app_type}|"
-            f"{headers_dict.get('app_version', '')}|{headers_dict.get('device_id', '')}"
+            f"{headers_dict.get('app_version', '')}|{headers_dict.get('device_id', '')}|"
+            f"{mac_address}"  # ✅ Agregado MAC
         )
     
     return fingerprint_string
@@ -130,6 +143,10 @@ def generate_device_fingerprint(request_or_scope):
     Mejorado para móviles y Smart TVs con headers específicos.
     Funciona tanto con objetos request (HTTP) como con scope dict (WebSocket).
     
+    ✅ MEJORADO: 
+    - Soporte para fingerprint local (si el dispositivo lo envía directamente)
+    - Incluye MAC address para mayor robustez
+    
     CAPA 1: Para primera solicitud sin UDID
     
     Args:
@@ -138,6 +155,17 @@ def generate_device_fingerprint(request_or_scope):
     Returns:
         str: Hash único del dispositivo (32 caracteres)
     """
+    # ✅ NUEVO: Si el dispositivo envía fingerprint directamente, usarlo (más estable)
+    direct_fingerprint = _get_header_value(request_or_scope, 'HTTP_X_DEVICE_FINGERPRINT')
+    if direct_fingerprint and len(direct_fingerprint) == 32:
+        # Validar que sea hexadecimal válido
+        try:
+            int(direct_fingerprint, 16)
+            return direct_fingerprint  # Usar fingerprint del dispositivo
+        except ValueError:
+            # Si no es válido, continuar con generación normal
+            pass
+    
     # Extraer headers desde request o scope
     headers_dict = {
         # Factores básicos (siempre disponibles)
@@ -158,6 +186,9 @@ def generate_device_fingerprint(request_or_scope):
         'tv_serial': _get_header_value(request_or_scope, 'HTTP_X_TV_SERIAL'),
         'tv_model': _get_header_value(request_or_scope, 'HTTP_X_TV_MODEL'),
         'firmware_version': _get_header_value(request_or_scope, 'HTTP_X_FIRMWARE_VERSION'),
+        
+        # ✅ NUEVO: MAC address para mayor robustez
+        'mac_address': _get_header_value(request_or_scope, 'HTTP_X_MAC_ADDRESS'),
     }
     
     # Construir string de fingerprint
@@ -449,6 +480,199 @@ def decrement_websocket_connection(udid, device_fingerprint):
                 cache.set(cache_key_udid, current - 1)
         except Exception:
             pass  # Ignorar errores en limpieza
+
+
+def check_websocket_limits(udid, device_fingerprint, max_per_token=5, max_global=1000):
+    """
+    Verifica límites de WebSocket por token y global usando Redis.
+    Implementa semáforo global y límite por token/UDID.
+    
+    Args:
+        udid: UDID único del dispositivo (puede ser None)
+        device_fingerprint: Fingerprint único del dispositivo
+        max_per_token: Máximo de conexiones por token/UDID (default: 5)
+        max_global: Máximo de conexiones globales (default: 1000)
+        
+    Returns:
+        tuple: (is_allowed: bool, reason: str, retry_after: int)
+    """
+    import redis
+    from django.conf import settings
+    
+    try:
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                # Si Redis no está disponible (circuit breaker abierto), permitir conexión (fail-open)
+                logger.warning("Redis not available (circuit breaker open), allowing connection")
+                return True, None, 0
+        else:
+            # Fallback a conexión directa
+            redis_url = getattr(settings, 'REDIS_URL', None)
+            if not redis_url:
+                logger.warning("Redis not configured for WebSocket limits, allowing connection")
+                return True, None, 0
+            import redis
+            redis_client = redis.from_url(redis_url)
+        
+        # Identificador del token (UDID o device_fingerprint)
+        token_identifier = udid or device_fingerprint
+        if not token_identifier:
+            # Si no hay identificador, permitir pero con límite más restrictivo
+            return True, None, 0
+        
+        # Límite por token/UDID
+        token_key = f"ws_connections:token:{token_identifier}"
+        token_count = redis_client.incr(token_key)
+        if token_count == 1:
+            redis_client.expire(token_key, 300)  # 5 minutos
+        
+        if token_count > max_per_token:
+            # Revertir incremento
+            redis_client.decr(token_key)
+            return False, "Too many connections for this token", 60
+        
+        # Semáforo global
+        global_key = "ws_connections:global"
+        global_count = redis_client.incr(global_key)
+        if global_count == 1:
+            redis_client.expire(global_key, 300)  # 5 minutos
+        
+        if global_count > max_global:
+            # Revertir ambos incrementos
+            redis_client.decr(global_key)
+            redis_client.decr(token_key)
+            return False, "Too many global WebSocket connections", 60
+        
+        return True, None, 0
+        
+    except Exception as e:
+        # Fail-open: si hay error con Redis, permitir conexión
+        logger.error(f"Error checking WebSocket limits: {e}", exc_info=True)
+        return True, None, 0
+
+
+def check_plan_rate_limit(tenant_id, plan, window='minute'):
+    """
+    Verifica rate limit basado en el plan del tenant.
+    
+    Args:
+        tenant_id: ID del tenant
+        plan: Instancia del modelo Plan
+        window: Ventana de tiempo ('minute', 'hour', 'day')
+        
+    Returns:
+        tuple: (is_allowed: bool, remaining: int, retry_after: int)
+    """
+    import redis
+    from django.conf import settings
+    
+    try:
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                # Si Redis no está disponible (circuit breaker abierto), permitir (fail-open)
+                logger.warning("Redis not available (circuit breaker open) for plan rate limiting, allowing request")
+                return True, 999999, 0
+        else:
+            # Fallback a conexión directa
+            redis_url = getattr(settings, 'REDIS_URL', None)
+            if not redis_url:
+                logger.warning("Redis not configured for plan rate limiting, allowing request")
+                return True, 999999, 0
+            redis_client = redis.from_url(redis_url)
+        
+        # Determinar límite y ventana según el plan
+        if window == 'minute':
+            max_requests = plan.max_requests_per_minute
+            window_seconds = 60
+        elif window == 'hour':
+            max_requests = plan.max_requests_per_hour
+            window_seconds = 3600
+        elif window == 'day':
+            max_requests = plan.max_requests_per_day
+            window_seconds = 86400
+        else:
+            # Default a minute
+            max_requests = plan.max_requests_per_minute
+            window_seconds = 60
+        
+        # Clave Redis para el rate limit del tenant
+        key = f"plan_rate_limit:{tenant_id}:{window}"
+        
+        # Incrementar contador
+        current = redis_client.incr(key)
+        
+        # Establecer TTL si es la primera vez
+        if current == 1:
+            redis_client.expire(key, window_seconds)
+        
+        # Verificar si excede el límite
+        if current > max_requests:
+            # Calcular retry_after basado en TTL restante
+            ttl = redis_client.ttl(key)
+            retry_after = max(1, ttl) if ttl > 0 else window_seconds
+            return False, 0, retry_after
+        
+        remaining = max(0, max_requests - current)
+        return True, remaining, 0
+        
+    except Exception as e:
+        # Fail-open: si hay error, permitir request
+        logger.error(f"Error checking plan rate limit: {e}", exc_info=True)
+        return True, 999999, 0
+
+
+def decrement_websocket_limits(udid, device_fingerprint):
+    """
+    Decrementa los contadores de límites de WebSocket (token y global).
+    Se llama cuando una conexión se cierra.
+    
+    Args:
+        udid: UDID único del dispositivo (puede ser None)
+        device_fingerprint: Fingerprint único del dispositivo
+    """
+    import redis
+    from django.conf import settings
+    
+    try:
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                # Si Redis no está disponible, no hacer nada (fail-open)
+                return
+        else:
+            # Fallback a conexión directa
+            redis_url = getattr(settings, 'REDIS_URL', None)
+            if not redis_url:
+                return
+            redis_client = redis.from_url(redis_url)
+        
+        # Identificador del token
+        token_identifier = udid or device_fingerprint
+        if token_identifier:
+            token_key = f"ws_connections:token:{token_identifier}"
+            try:
+                current = redis_client.get(token_key)
+                if current and int(current) > 0:
+                    redis_client.decr(token_key)
+            except Exception:
+                pass  # Ignorar errores en limpieza
+        
+        # Decrementar semáforo global
+        global_key = "ws_connections:global"
+        try:
+            current = redis_client.get(global_key)
+            if current and int(current) > 0:
+                redis_client.decr(global_key)
+        except Exception:
+            pass  # Ignorar errores en limpieza
+            
+    except Exception as e:
+        logger.error(f"Error decrementing WebSocket limits: {e}", exc_info=True)
 
 
 def check_login_rate_limit(username, device_fingerprint, max_attempts=5, window_minutes=15):
@@ -1034,3 +1258,350 @@ def reset_rate_limit_backoff(identifier_type, identifier):
     
     cache.delete(backoff_key)
     cache.delete(violation_count_key)
+
+
+# ============================================================================
+# SEMÁFORO GLOBAL DE CONCURRENCIA
+# ============================================================================
+
+def _get_dynamic_timeout():
+    """
+    Calcula timeout dinámico basado en latencia p95.
+    Retorna p95 × 1.5 para evitar liberar slots prematuramente.
+    
+    Si las métricas no están disponibles, usa un valor por defecto.
+    """
+    try:
+        # Intentar obtener métricas del sistema
+        # TODO: Reemplazar con métricas reales cuando se implemente el dashboard
+        from django.conf import settings
+        
+        # Por ahora, usar un valor por defecto basado en configuración
+        # Cuando se implemente el dashboard de métricas, usar:
+        # from udid.utils.metrics import _metrics
+        # metrics = _metrics.get_metrics()
+        # p95_ms = metrics.get('p95', 2000)  # Default 2 segundos
+        
+        # Valor por defecto: 30 segundos (se ajustará cuando tengamos métricas)
+        default_p95_ms = 2000  # 2 segundos
+        p95_ms = default_p95_ms
+        
+        # Convertir a segundos y multiplicar por 1.5
+        timeout = int((p95_ms / 1000) * 1.5)
+        # Mínimo 10 segundos, máximo 60 segundos
+        return max(10, min(60, timeout))
+    except Exception as e:
+        logger.warning(f"Error calculating dynamic timeout, using default: {e}")
+        return 30  # Valor por defecto seguro
+
+
+def _count_slots_scan(redis_client, pattern):
+    """
+    Cuenta slots usando SCAN en lugar de KEYS para evitar bloqueos.
+    SCAN es O(1) por iteración vs KEYS que es O(n).
+    
+    Args:
+        redis_client: Cliente Redis
+        pattern: Patrón de búsqueda (ej: "global_semaphore:slots:*")
+        
+    Returns:
+        int: Número de slots encontrados
+    """
+    count = 0
+    cursor = 0
+    
+    try:
+        while True:
+            cursor, keys = redis_client.scan(cursor, match=pattern, count=100)
+            count += len(keys)
+            if cursor == 0:
+                break
+    except Exception as e:
+        logger.error(f"Error counting slots with SCAN: {e}")
+        # Fallback: intentar con KEYS solo si SCAN falla (no recomendado en producción)
+        try:
+            keys = redis_client.keys(pattern)
+            count = len(keys)
+        except Exception as e2:
+            logger.error(f"Error with KEYS fallback: {e2}")
+            count = 0
+    
+    return count
+
+
+def acquire_global_semaphore(timeout=None, max_slots=None):
+    """
+    Adquiere un slot en el semáforo global usando Redis.
+    Retorna (acquired: bool, slot_id: str, retry_after: int)
+    
+    Args:
+        timeout: TTL del slot en segundos. Si es None, se calcula dinámicamente.
+        max_slots: Máximo número de slots simultáneos. Si es None, usa configuración.
+        
+    Returns:
+        tuple: (acquired: bool, slot_id: str or None, retry_after: int)
+    """
+    try:
+        import redis
+        from django.conf import settings
+        
+        # Obtener configuración
+        if max_slots is None:
+            max_slots = getattr(settings, 'GLOBAL_SEMAPHORE_SLOTS', 500)
+        
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                # Si Redis no está disponible (circuit breaker abierto), permitir (fail-open)
+                logger.warning("Redis not available (circuit breaker open), semaphore disabled")
+                return True, None, 0
+        else:
+            # Fallback a conexión directa
+            if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
+                logger.warning("REDIS_URL not configured, semaphore disabled")
+                return True, None, 0  # Permitir si Redis no está configurado
+            redis_client = redis.from_url(settings.REDIS_URL)
+        semaphore_key = "global_semaphore:slots"
+        slot_id = str(uuid.uuid4())
+        
+        # Calcular timeout dinámico si no se proporciona
+        if timeout is None:
+            timeout = _get_dynamic_timeout()
+        
+        # Contar slots ocupados usando SCAN (más eficiente que KEYS)
+        pattern = f"{semaphore_key}:*"
+        current_slots = _count_slots_scan(redis_client, pattern)
+        
+        if current_slots >= max_slots:
+            # Calcular retry_after basado en TTL promedio
+            # Estimar tiempo de espera basado en timeout dinámico
+            retry_after = max(1, timeout // 6)  # 1/6 del timeout como mínimo
+            logger.warning(
+                f"Global semaphore full: {current_slots}/{max_slots} slots, "
+                f"retry_after={retry_after}s"
+            )
+            return False, None, retry_after
+        
+        # Usar SET con NX y EX para operación atómica
+        acquired = redis_client.set(
+            f"{semaphore_key}:{slot_id}",
+            "1",
+            nx=True,
+            ex=timeout
+        )
+        
+        if not acquired:
+            # Si falla, recalcular slots (puede haber cambiado)
+            current_slots = _count_slots_scan(redis_client, pattern)
+            if current_slots >= max_slots:
+                retry_after = max(1, timeout // 6)
+                return False, None, retry_after
+            # Si no está lleno, reintentar (puede ser race condition)
+            acquired = redis_client.set(
+                f"{semaphore_key}:{slot_id}",
+                "1",
+                nx=True,
+                ex=timeout
+            )
+            if not acquired:
+                logger.warning(f"Failed to acquire semaphore slot after retry: {slot_id}")
+                return False, None, 1
+        
+        logger.debug(f"Acquired semaphore slot: {slot_id}, current_slots={current_slots + 1}/{max_slots}")
+        return True, slot_id, 0
+        
+    except Exception as e:
+        logger.error(f"Error acquiring global semaphore: {e}", exc_info=True)
+        # En caso de error, permitir el request (fail-open)
+        # Esto evita que un fallo de Redis bloquee todo el sistema
+        return True, None, 0
+
+
+def release_global_semaphore(slot_id):
+    """
+    Libera un slot del semáforo global.
+    
+    Args:
+        slot_id: ID del slot a liberar
+    """
+    if not slot_id:
+        return
+    
+    try:
+        import redis
+        from django.conf import settings
+        
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                # Si Redis no está disponible, no hacer nada (fail-open)
+                return
+        else:
+            # Fallback a conexión directa
+            if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
+                return  # Redis no configurado, no hacer nada
+            redis_client = redis.from_url(settings.REDIS_URL)
+        semaphore_key = "global_semaphore:slots"
+        
+        deleted = redis_client.delete(f"{semaphore_key}:{slot_id}")
+        if deleted:
+            logger.debug(f"Released semaphore slot: {slot_id}")
+        else:
+            logger.debug(f"Semaphore slot already released or expired: {slot_id}")
+            
+    except Exception as e:
+        logger.error(f"Error releasing global semaphore slot {slot_id}: {e}", exc_info=True)
+        # No lanzar excepción, solo loggear el error
+
+
+# ============================================================================
+# TOKEN BUCKET RATE LIMITING CON LUA
+# ============================================================================
+
+# Singleton para el script Lua (se registra una sola vez)
+_token_bucket_script = None
+
+def _get_token_bucket_script():
+    """
+    Obtiene el script Lua registrado (singleton).
+    Se registra una sola vez para reducir overhead.
+    
+    Returns:
+        Script registrado de Redis
+    """
+    global _token_bucket_script
+    
+    if _token_bucket_script is None:
+        import redis
+        from django.conf import settings
+        import os
+        
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                logger.error("Redis not available (circuit breaker open), cannot load token bucket script")
+                return None
+        else:
+            # Fallback a conexión directa
+            if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
+                logger.error("REDIS_URL not configured, cannot load token bucket script")
+                return None
+            redis_client = redis.from_url(settings.REDIS_URL)
+        
+        # Cargar script Lua una sola vez
+        script_path = os.path.join(
+            os.path.dirname(__file__),
+            'scripts',
+            'token_bucket.lua'
+        )
+        
+        try:
+            with open(script_path, 'r') as f:
+                lua_script = f.read()
+            
+            # Registrar script (persistente en redis_client)
+            _token_bucket_script = redis_client.register_script(lua_script)
+            logger.info("Token bucket Lua script loaded successfully")
+        except FileNotFoundError:
+            logger.error(f"Token bucket script not found at {script_path}")
+            return None
+        except Exception as e:
+            logger.error(f"Error loading token bucket script: {e}", exc_info=True)
+            return None
+    
+    return _token_bucket_script
+
+
+def check_token_bucket_lua(identifier, capacity=10, refill_rate=1, 
+                          window_seconds=60, tokens_requested=1):
+    """
+    Verifica rate limit usando token bucket atómico en Lua.
+    Retorna (is_allowed: bool, remaining: int, retry_after: int)
+    
+    El script se registra una sola vez (singleton) para mejorar rendimiento.
+    Las operaciones son atómicas, evitando race conditions.
+    
+    Args:
+        identifier: Identificador único (UDID, token, etc.)
+        capacity: Capacidad máxima del bucket (tokens)
+        refill_rate: Tasa de reposición de tokens por segundo
+        window_seconds: Ventana de tiempo en segundos
+        tokens_requested: Número de tokens solicitados (default: 1)
+        
+    Returns:
+        tuple: (is_allowed: bool, remaining: int, retry_after: int)
+    """
+    try:
+        import redis
+        from django.conf import settings
+        
+        if not identifier:
+            return False, 0, 0
+        
+        # Usar cliente Redis con HA si está disponible
+        if REDIS_HA_AVAILABLE:
+            redis_client = get_redis_client_safe()
+            if not redis_client:
+                logger.warning("Redis not available (circuit breaker open), allowing request (fail-open)")
+                return True, capacity, 0
+        else:
+            # Fallback a conexión directa
+            if not hasattr(settings, 'REDIS_URL') or not settings.REDIS_URL:
+                logger.warning("REDIS_URL not configured, allowing request (fail-open)")
+                return True, capacity, 0
+            redis_client = redis.from_url(settings.REDIS_URL)
+        key = f"token_bucket:{identifier}"
+        
+        # Obtener script registrado (singleton)
+        script = _get_token_bucket_script()
+        if script is None:
+            logger.warning("Token bucket script not available, allowing request (fail-open)")
+            return True, capacity, 0
+        
+        # Ejecutar script atómicamente
+        result = script(
+            keys=[key],
+            args=[capacity, refill_rate, tokens_requested, int(time.time()), window_seconds],
+            client=redis_client
+        )
+        
+        # Resultado: [allowed, remaining] o [denied, remaining, retry_after]
+        if result[0] == 1:
+            # Permitido
+            return True, int(result[1]), 0
+        else:
+            # Denegado
+            remaining = int(result[1]) if len(result) > 1 else 0
+            retry_after = int(result[2]) if len(result) > 2 else window_seconds
+            return False, remaining, retry_after
+            
+    except Exception as e:
+        logger.error(f"Error checking token bucket for {identifier}: {e}", exc_info=True)
+        # Fail-open: permitir request en caso de error
+        return True, capacity, 0
+
+
+def get_client_token(request):
+    """
+    Obtiene token del cliente desde header X-Client-Token o UDID.
+    
+    Args:
+        request: Request object de Django
+        
+    Returns:
+        str: Token del cliente o None
+    """
+    # Intentar obtener desde header X-Client-Token
+    token = request.META.get('HTTP_X_CLIENT_TOKEN')
+    
+    if not token:
+        # Fallback a UDID si está disponible
+        if hasattr(request, 'data') and request.data:
+            token = request.data.get('udid')
+        if not token and hasattr(request, 'query_params') and request.query_params:
+            token = request.query_params.get('udid')
+    
+    return token
