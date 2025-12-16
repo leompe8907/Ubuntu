@@ -2,7 +2,11 @@ from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 from .auth import RegisterUserView, LoginView
 from .automatico import RequestUDIDView, ValidateUDIDView, GetSubscriberInfoView, RevokeUDIDView, ListUDIDRequestsView
-from .views import RequestUDIDManualView, ValidateAndAssociateUDIDView, AuthenticateWithUDIDView, DisassociateUDIDView,ValidateStatusUDIDView,ListSubscribersWithUDIDView, MetricsDashboardView
+from .views import (
+    RequestUDIDManualView, ValidateAndAssociateUDIDView, AuthenticateWithUDIDView, 
+    DisassociateUDIDView, ValidateStatusUDIDView, ListSubscribersWithUDIDView, 
+    MetricsDashboardView, ManualSyncView
+)
 
 urlpatterns = [
     #* Automatic UDID management
@@ -33,4 +37,7 @@ urlpatterns = [
     
     #* Métricas del sistema (para pruebas y monitoreo)
     path('metrics/', MetricsDashboardView.as_view(), name='metrics-dashboard'),
+    
+    #* Sincronización manual
+    path('manual/', ManualSyncView.as_view(), name='manual-sync'),
 ]

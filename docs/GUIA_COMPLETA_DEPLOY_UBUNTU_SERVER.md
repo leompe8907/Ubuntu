@@ -1,0 +1,1854 @@
+# 🚀 Guía Completa de Despliegue - UDID Server en Ubuntu Server
+
+## 📋 Índice
+
+1. [Introducción y Requisitos](#1-introducción-y-requisitos)
+2. [Preparación del Servidor](#2-preparación-del-servidor)
+3. [Instalación de Dependencias del Sistema](#3-instalación-de-dependencias-del-sistema)
+4. [Instalación y Configuración de PostgreSQL](#4-instalación-y-configuración-de-postgresql)
+5. [Instalación y Configuración de Redis](#5-instalación-y-configuración-de-redis)
+6. [Configuración del Proyecto Python](#6-configuración-del-proyecto-python)
+7. [Configuración de Variables de Entorno](#7-configuración-de-variables-de-entorno)
+8. [Migraciones y Configuración Inicial](#8-migraciones-y-configuración-inicial)
+9. [Configuración de Nginx](#9-configuración-de-nginx)
+10. [Configuración de SSL/HTTPS](#10-configuración-de-sslhttps)
+11. [Configuración de Systemd](#11-configuración-de-systemd)
+12. [Configuración de Cron Jobs](#12-configuración-de-cron-jobs)
+13. [Verificación y Pruebas](#13-verificación-y-pruebas)
+14. [Mantenimiento y Monitoreo](#14-mantenimiento-y-monitoreo)
+15. [Solución de Problemas](#15-solución-de-problemas)
+16. [Recomendaciones de Recursos del Servidor](#16-recomendaciones-de-recursos-del-servidor)
+
+---
+
+## 1. Introducción y Requisitos
+
+### 🎯 ¿Qué es este proyecto?
+
+Este es un servidor Django/Channels que proporciona:
+- **API REST** para gestión de UDID (Unique Device Identifier)
+- **WebSockets** para comunicación en tiempo real
+- **Sincronización** con sistema externo Panaccess
+- **Autenticación JWT** para seguridad
+- **Rate limiting** y protección DDoS
+
+### 📦 Componentes del Sistema
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        INTERNET                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    NGINX (Puerto 443/80)                        │
+│              - SSL/TLS Termination                              │
+│              - Proxy Inverso                                    │
+│              - Balanceo de Carga                                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              DAPHNE (Puertos 8000-8003)                         │
+│         Servidor ASGI - HTTP + WebSockets                       │
+│              (Múltiples instancias)                             │
+└─────────────────────────────────────────────────────────────────┘
+                    │                   │
+                    ▼                   ▼
+┌───────────────────────┐   ┌───────────────────────┐
+│     POSTGRESQL        │   │        REDIS          │
+│   (Puerto 5432)       │   │    (Puerto 6379)      │
+│   Base de Datos       │   │   Cache + WebSockets  │
+└───────────────────────┘   └───────────────────────┘
+```
+
+### ✅ Requisitos Mínimos del Servidor
+
+| Componente  | Mínimo           | Recomendado            | Alto Rendimiento       |
+|-------------|------------------|------------------------|------------------------|
+| **CPU**     | 2 cores          | 4 cores                | 8+ cores               |
+| **RAM**     | 4 GB             | 8 GB                   | 16+ GB                 |
+| **Disco**   | 20 GB SSD        | 50 GB SSD              | 100+ GB NVMe           |
+| **Sistema** | Ubuntu 22.04 LTS | Ubuntu 22.04/24.04 LTS | Ubuntu 22.04/24.04 LTS |
+
+### 📊 Cálculo de Workers y Recursos
+
+**Fórmula para workers Daphne:**
+```
+Workers = (2 × CPU cores) + 1
+```
+
+| CPU Cores | Workers | RAM Recomendada | Conexiones Simultáneas |
+|-----------|---------|-----------------|------------------------|
+| 2         | 5       | 4 GB            | ~500                   |
+| 4         | 9       | 8 GB            | ~1,000                 |
+| 8         | 17      | 16 GB           | ~2,500                 |
+| 16        | 33      | 32 GB           | ~5,000+                |
+
+---
+
+## 2. Preparación del Servidor
+
+### 2.1 Acceder al Servidor
+
+Conectarse por SSH al servidor Ubuntu:
+
+```bash
+# Desde tu computadora local (Windows PowerShell, Terminal de Mac/Linux)
+ssh usuario@IP_DEL_SERVIDOR
+
+# Ejemplo:
+ssh admin@192.168.1.100
+```
+
+> 💡 **Nota:** Reemplaza `usuario` con tu nombre de usuario y `IP_DEL_SERVIDOR` con la IP real.
+
+### 2.2 Actualizar el Sistema
+
+**IMPORTANTE:** Siempre actualizar el sistema antes de instalar cualquier cosa.
+
+```bash
+# Actualizar lista de paquetes
+sudo apt update
+
+# Actualizar todos los paquetes instalados
+sudo apt upgrade -y
+
+# Reiniciar si se actualizó el kernel (opcional pero recomendado)
+sudo reboot
+```
+
+### 2.3 Configurar Zona Horaria
+
+```bash
+# Ver zona horaria actual
+timedatectl
+
+# Configurar zona horaria (ejemplo: América/Bogotá)
+sudo timedatectl set-timezone America/Bogota
+
+# Verificar el cambio
+date
+```
+
+### 2.4 Crear Usuario para la Aplicación
+
+Es una buena práctica crear un usuario específico para la aplicación:
+
+```bash
+# Crear usuario 'udid' para la aplicación
+sudo adduser udid
+
+# Agregar al grupo sudo (opcional, para administración)
+sudo usermod -aG sudo udid
+
+# Cambiar al usuario udid
+sudo su - udid
+```
+
+---
+
+## 3. Instalación de Dependencias del Sistema
+
+### 3.1 Instalar Paquetes Básicos
+
+```bash
+# Volver a root o usar sudo
+exit  # Si estás como usuario udid
+
+# Instalar paquetes esenciales
+sudo apt install -y \
+    build-essential \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    git \
+    curl \
+    wget \
+    vim \
+    nano \
+    htop \
+    unzip \
+    software-properties-common \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
+    lsb-release
+```
+
+### 3.2 Verificar Versión de Python
+
+```bash
+# Verificar versión de Python (debe ser 3.10 o superior)
+python3 --version
+
+# Debería mostrar algo como: Python 3.10.x o Python 3.12.x
+```
+
+### 3.3 Instalar Dependencias para PostgreSQL y Redis
+
+```bash
+# Dependencias para compilar psycopg2 (driver de PostgreSQL)
+sudo apt install -y \
+    libpq-dev \
+    postgresql-client
+
+# Dependencias para compilar otras librerías Python
+sudo apt install -y \
+    libffi-dev \
+    libssl-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    zlib1g-dev
+```
+
+---
+
+## 4. Instalación y Configuración de PostgreSQL
+
+### 4.1 Instalar PostgreSQL
+
+```bash
+# Instalar PostgreSQL
+sudo apt install -y postgresql postgresql-contrib
+
+# Verificar que está corriendo
+sudo systemctl status postgresql
+
+# Debería mostrar: active (running)
+```
+
+### 4.2 Configurar PostgreSQL
+
+```bash
+# Acceder a PostgreSQL como usuario postgres
+sudo -u postgres psql
+```
+
+Dentro de la consola de PostgreSQL, ejecutar los siguientes comandos:
+
+```sql
+-- Crear la base de datos
+CREATE DATABASE udid;
+
+-- Crear usuario para la aplicación (CAMBIAR 'tu_password_seguro' por una contraseña real)
+CREATE USER udid_user WITH PASSWORD 'tu_password_seguro';
+
+-- Configurar el usuario
+ALTER ROLE udid_user SET client_encoding TO 'utf8';
+ALTER ROLE udid_user SET default_transaction_isolation TO 'read committed';
+ALTER ROLE udid_user SET timezone TO 'UTC';
+
+-- Dar permisos al usuario sobre la base de datos
+GRANT ALL PRIVILEGES ON DATABASE udid TO udid_user;
+
+-- En PostgreSQL 15+, también necesitas esto:
+\c udid
+GRANT ALL ON SCHEMA public TO udid_user;
+
+-- Salir de PostgreSQL
+\q
+```
+
+### 4.3 Configurar Acceso a PostgreSQL
+
+Editar el archivo de configuración para permitir conexiones:
+
+```bash
+# Encontrar el archivo pg_hba.conf
+sudo find /etc/postgresql -name pg_hba.conf
+
+# Editar el archivo (ajustar la versión según tu instalación)
+sudo nano /etc/postgresql/16/main/pg_hba.conf
+```
+
+Buscar la sección de conexiones IPv4 y asegurarse de que existe esta línea:
+
+```
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            scram-sha-256
+```
+
+Guardar y salir: `Ctrl + X`, luego `Y`, luego `Enter`
+
+```bash
+# Reiniciar PostgreSQL para aplicar cambios
+sudo systemctl restart postgresql
+
+# Verificar que funciona
+sudo systemctl status postgresql
+```
+
+### 4.4 Probar la Conexión
+
+```bash
+# Probar conexión con el nuevo usuario
+psql -h localhost -U udid_user -d udid
+
+# Te pedirá la contraseña, ingrésala
+# Si conecta correctamente, verás el prompt: udid=>
+
+# Salir
+\q
+```
+
+---
+
+## 5. Instalación y Configuración de Redis
+
+### 5.1 Instalar Redis
+
+```bash
+# Instalar Redis
+sudo apt install -y redis-server
+
+# Verificar versión
+redis-server --version
+```
+
+### 5.2 Configurar Redis
+
+```bash
+# Editar configuración de Redis
+sudo nano /etc/redis/redis.conf
+```
+
+Buscar y modificar las siguientes líneas (usa `Ctrl + W` para buscar):
+
+```conf
+# Cambiar 'supervised no' a 'supervised systemd'
+supervised systemd
+
+# Configurar memoria máxima (ajustar según tu RAM disponible)
+# Para 8GB RAM, usar 2GB para Redis
+maxmemory 2gb
+
+# Política de evicción cuando se llena la memoria
+maxmemory-policy allkeys-lru
+
+# Deshabilitar persistencia para mejor rendimiento (opcional)
+# Si quieres que Redis guarde datos al disco, deja estas líneas como están
+save ""
+# save 900 1
+# save 300 10
+# save 60 10000
+
+# Bind solo a localhost por seguridad
+bind 127.0.0.1 ::1
+```
+
+Guardar y salir: `Ctrl + X`, luego `Y`, luego `Enter`
+
+### 5.3 Iniciar y Habilitar Redis
+
+```bash
+# Reiniciar Redis para aplicar cambios
+sudo systemctl restart redis-server
+
+# Habilitar inicio automático
+sudo systemctl enable redis-server
+
+# Verificar estado
+sudo systemctl status redis-server
+```
+
+### 5.4 Probar Redis
+
+```bash
+# Conectar a Redis
+redis-cli
+
+# Probar con ping (debe responder PONG)
+127.0.0.1:6379> ping
+PONG
+
+# Probar guardar y leer un valor
+127.0.0.1:6379> set test "hola"
+OK
+127.0.0.1:6379> get test
+"hola"
+127.0.0.1:6379> del test
+(integer) 1
+
+# Salir
+127.0.0.1:6379> quit
+```
+
+---
+
+## 6. Configuración del Proyecto Python
+
+### 6.1 Crear Directorio para la Aplicación
+
+```bash
+# Crear directorio para la aplicación
+sudo mkdir -p /opt/udid
+
+# Cambiar propietario al usuario udid
+sudo chown -R udid:udid /opt/udid
+
+# Cambiar al usuario udid
+sudo su - udid
+
+# Ir al directorio
+cd /opt/udid
+```
+
+### 6.2 Copiar el Código del Proyecto
+
+**Opción A: Usando Git (si el código está en un repositorio)**
+
+```bash
+# Clonar repositorio
+git clone https://tu-repositorio.git .
+
+# O si es privado
+git clone https://usuario:token@tu-repositorio.git .
+```
+
+**Opción B: Usando SCP (copiar desde tu computadora)**
+
+Desde tu computadora local (no en el servidor):
+
+```bash
+# Windows (PowerShell) o Mac/Linux Terminal
+scp -r "C:\Users\Leonard\Desktop\udid\ubuntu\*" udid@IP_DEL_SERVIDOR:/opt/udid/
+
+# O comprimir primero y luego descomprimir
+# En tu computadora:
+zip -r proyecto.zip ubuntu/
+
+# Copiar al servidor
+scp proyecto.zip udid@IP_DEL_SERVIDOR:/opt/udid/
+
+# En el servidor, descomprimir
+cd /opt/udid
+unzip proyecto.zip
+mv ubuntu/* .
+rm -rf ubuntu proyecto.zip
+```
+
+**Opción C: Usando SFTP (con FileZilla o WinSCP)**
+
+1. Descargar e instalar FileZilla o WinSCP
+2. Conectar al servidor con las credenciales SSH
+3. Navegar a `/opt/udid/` en el servidor
+4. Arrastrar los archivos del proyecto
+
+### 6.3 Crear y Activar Entorno Virtual
+
+```bash
+# Asegurarse de estar en el directorio del proyecto
+cd /opt/udid
+
+# Crear entorno virtual
+python3 -m venv venv
+
+# Activar entorno virtual
+source venv/bin/activate
+
+# Verificar que está activado (debe mostrar (venv) al inicio del prompt)
+# (venv) udid@servidor:/opt/udid$
+```
+
+### 6.4 Instalar Dependencias de Python
+
+```bash
+# Actualizar pip
+pip install --upgrade pip
+
+# Instalar dependencias del proyecto
+pip install -r requirements.txt
+
+# Si hay errores con psycopg2, intentar:
+pip install psycopg2-binary
+
+# Verificar instalación
+pip list
+```
+
+### 6.5 Verificar Estructura del Proyecto
+
+```bash
+# La estructura debe verse así:
+ls -la /opt/udid/
+
+# Debería mostrar:
+# - manage.py
+# - config.py
+# - requirements.txt
+# - ubuntu/  (directorio con settings.py, urls.py, etc.)
+# - udid/    (directorio con views.py, models.py, etc.)
+# - venv/    (entorno virtual)
+```
+
+---
+
+## 7. Configuración de Variables de Entorno
+
+### 7.1 Crear Archivo .env
+
+```bash
+# Crear archivo .env en el directorio del proyecto
+nano /opt/udid/.env
+```
+
+Copiar y pegar el siguiente contenido, **modificando los valores según tu configuración**:
+
+```env
+# ============================================================================
+# CONFIGURACIÓN DJANGO
+# ============================================================================
+
+# Clave secreta de Django (GENERAR UNA NUEVA Y ÚNICA)
+# Puedes generar una con: python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+SECRET_KEY=tu-clave-secreta-muy-larga-y-segura-aqui
+
+# Modo debug (SIEMPRE False en producción)
+DEBUG=False
+
+# Hosts permitidos (separados por coma)
+# Agregar la IP del servidor y el dominio si tienes uno
+ALLOWED_HOSTS=127.0.0.1,localhost,tu.dominio.com,IP_DEL_SERVIDOR
+
+# ============================================================================
+# BASE DE DATOS POSTGRESQL
+# ============================================================================
+
+# Configuración de PostgreSQL
+POSTGRES_DB=udid
+POSTGRES_USER=udid_user
+POSTGRES_PASSWORD=tu_password_seguro
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+
+# ============================================================================
+# REDIS
+# ============================================================================
+
+# URL de Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Configuración de Channel Layers (WebSockets)
+REDIS_CHANNEL_LAYER_URL=redis://localhost:6379/0
+
+# Configuración de Rate Limiting
+REDIS_RATE_LIMIT_URL=redis://localhost:6379/1
+
+# ============================================================================
+# PANACCESS (API Externa)
+# ============================================================================
+
+# URL de la API de Panaccess
+url_panaccess=https://tu-url-panaccess.com/api
+
+# Credenciales de Panaccess
+username=tu_usuario_panaccess
+password=tu_password_panaccess
+api_token=tu_api_token_panaccess
+salt=tu_salt_panaccess
+
+# Clave de encriptación (32 caracteres para AES-256)
+ENCRYPTION_KEY=tu_clave_encriptacion_32_chars_
+
+# ============================================================================
+# CORS Y SEGURIDAD
+# ============================================================================
+
+# Orígenes permitidos para CORS (separados por coma)
+CORS_ALLOWED_ORIGINS=https://tu-frontend.com,https://otro-origen.com
+
+# Orígenes WebSocket permitidos
+WS_ALLOWED_ORIGINS=https://tu-frontend.com,wss://tu-frontend.com
+
+# CSRF trusted origins
+CSRF_TRUSTED_ORIGINS=https://tu.dominio.com,https://IP_DEL_SERVIDOR
+
+# ============================================================================
+# CONFIGURACIÓN DEL SERVIDOR
+# ============================================================================
+
+# Host y puerto del servidor
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8000
+
+# ============================================================================
+# CONFIGURACIÓN DE UDID
+# ============================================================================
+
+# Tiempo de expiración de UDID (minutos)
+UDID_EXPIRATION_MINUTES=15
+
+# Máximo de intentos de validación
+UDID_MAX_ATTEMPTS=5
+
+# Timeout de WebSocket (segundos)
+UDID_WAIT_TIMEOUT_AUTOMATIC=180
+UDID_WAIT_TIMEOUT_MANUAL=180
+
+# ============================================================================
+# CONFIGURACIÓN DE JWT
+# ============================================================================
+
+# Tiempo de vida del access token (minutos)
+JWT_ACCESS_TOKEN_LIFETIME_MINUTES=15
+
+# Tiempo de vida del refresh token (días)
+JWT_REFRESH_TOKEN_LIFETIME_DAYS=1
+
+# ============================================================================
+# CONFIGURACIÓN DE CACHE
+# ============================================================================
+
+# Prefijo para claves de cache
+CACHE_KEY_PREFIX=udid_prod
+
+# Timeout de cache (segundos)
+CACHE_TIMEOUT=300
+```
+
+Guardar y salir: `Ctrl + X`, luego `Y`, luego `Enter`
+
+### 7.2 Generar SECRET_KEY
+
+```bash
+# Generar una clave secreta segura
+cd /opt/udid
+source venv/bin/activate
+python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+
+# Copiar el resultado y pegarlo en el archivo .env como SECRET_KEY
+```
+
+### 7.3 Proteger el Archivo .env
+
+```bash
+# Cambiar permisos para que solo el usuario udid pueda leerlo
+chmod 600 /opt/udid/.env
+
+# Verificar permisos
+ls -la /opt/udid/.env
+# Debe mostrar: -rw------- 1 udid udid
+```
+
+---
+
+## 8. Migraciones y Configuración Inicial
+
+### 8.1 Modificar settings.py para PostgreSQL
+
+Editar el archivo de configuración:
+
+```bash
+nano /opt/udid/ubuntu/settings.py
+```
+
+Buscar la sección `DATABASES` y modificarla (comentar MySQL y descomentar PostgreSQL):
+
+```python
+# ============================================================================
+# BASE DE DATOS
+# ============================================================================
+
+# PostgreSQL (PRODUCCIÓN)
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("POSTGRES_DB", "udid"),
+        "USER": os.getenv("POSTGRES_USER", "udid_user"),
+        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+        "HOST": os.getenv("POSTGRES_HOST", "localhost"),
+        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
+        "OPTIONS": {
+            "connect_timeout": 10,
+        },
+    }
+}
+
+# Comentar o eliminar la configuración de MySQL:
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         ...
+#     }
+# }
+```
+
+Guardar y salir.
+
+### 8.2 Ejecutar Migraciones
+
+```bash
+# Asegurarse de estar en el directorio correcto con el venv activado
+cd /opt/udid
+source venv/bin/activate
+
+# Verificar configuración
+python manage.py check
+
+# Crear migraciones (si hay cambios en modelos)
+python manage.py makemigrations
+
+# Aplicar migraciones a la base de datos
+python manage.py migrate
+
+# Debería mostrar varios "OK" o "Applying..."
+```
+
+### 8.3 Crear Superusuario para Admin
+
+```bash
+# Crear superusuario para acceder al panel de administración
+python manage.py createsuperuser
+
+# Te pedirá:
+# - Username: admin (o el que prefieras)
+# - Email: tu@email.com
+# - Password: (contraseña segura)
+```
+
+### 8.4 Recolectar Archivos Estáticos
+
+```bash
+# Recolectar archivos estáticos para producción
+python manage.py collectstatic --noinput
+
+# Debería crear el directorio 'staticfiles'
+ls -la staticfiles/
+```
+
+### 8.5 Verificar que Todo Funciona
+
+```bash
+# Probar el servidor de desarrollo (solo para verificar)
+python manage.py runserver 0.0.0.0:8000
+
+# Abrir en el navegador: http://IP_DEL_SERVIDOR:8000/admin/
+# Debería mostrar la página de login de Django Admin
+
+# Detener con Ctrl + C
+```
+
+---
+
+## 9. Configuración de Nginx
+
+### 9.1 Instalar Nginx
+
+```bash
+# Salir del usuario udid si es necesario
+exit
+
+# Instalar Nginx
+sudo apt install -y nginx
+
+# Verificar instalación
+nginx -v
+
+# Verificar estado
+sudo systemctl status nginx
+```
+
+### 9.2 Crear Configuración para UDID
+
+```bash
+# Crear archivo de configuración
+sudo nano /etc/nginx/sites-available/udid
+```
+
+Copiar y pegar la siguiente configuración:
+
+```nginx
+# ============================================================================
+# Configuración de Nginx para UDID Server
+# ============================================================================
+
+# Upstream para balanceo de carga entre múltiples instancias de Daphne
+upstream udid_backend {
+    # Usar ip_hash para que cada cliente siempre vaya al mismo servidor
+    # Importante para WebSockets
+    ip_hash;
+    
+    # Instancias de Daphne (ajustar según número de workers)
+    server 127.0.0.1:8000;
+    server 127.0.0.1:8001;
+    server 127.0.0.1:8002;
+    server 127.0.0.1:8003;
+    
+    # Mantener conexiones abiertas
+    keepalive 32;
+}
+
+# Redirigir HTTP a HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;  # Acepta cualquier nombre de servidor
+    
+    # Redirigir todo el tráfico a HTTPS
+    return 301 https://$host$request_uri;
+}
+
+# Servidor HTTPS principal
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name _;  # Acepta cualquier nombre de servidor
+    
+    # ========================================================================
+    # Configuración SSL (se configurará en la siguiente sección)
+    # ========================================================================
+    ssl_certificate /etc/nginx/ssl/udid.crt;
+    ssl_certificate_key /etc/nginx/ssl/udid.key;
+    
+    # Configuración SSL segura
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # ========================================================================
+    # Headers de seguridad
+    # ========================================================================
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    
+    # ========================================================================
+    # Logs
+    # ========================================================================
+    access_log /var/log/nginx/udid_access.log;
+    error_log /var/log/nginx/udid_error.log;
+    
+    # ========================================================================
+    # Configuración general
+    # ========================================================================
+    client_max_body_size 10M;
+    
+    # ========================================================================
+    # Archivos estáticos
+    # ========================================================================
+    location /static/ {
+        alias /opt/udid/staticfiles/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # ========================================================================
+    # WebSocket endpoint
+    # ========================================================================
+    location /ws/ {
+        proxy_pass http://udid_backend;
+        proxy_http_version 1.1;
+        
+        # Headers necesarios para WebSocket
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Headers de proxy
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        
+        # Timeouts para WebSocket (más largos que HTTP normal)
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        
+        # Desactivar buffering para WebSocket
+        proxy_buffering off;
+    }
+    
+    # ========================================================================
+    # API y Admin (HTTP normal)
+    # ========================================================================
+    location / {
+        proxy_pass http://udid_backend;
+        proxy_http_version 1.1;
+        
+        # Headers de proxy
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        
+        # Mantener conexiones
+        proxy_set_header Connection "";
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Buffering para mejor rendimiento
+        proxy_buffering on;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+    }
+    
+    # ========================================================================
+    # Health check endpoint
+    # ========================================================================
+    location /health {
+        access_log off;
+        return 200 "OK\n";
+        add_header Content-Type text/plain;
+    }
+}
+```
+
+Guardar y salir.
+
+### 9.3 Habilitar el Sitio
+
+```bash
+# Crear enlace simbólico para habilitar el sitio
+sudo ln -s /etc/nginx/sites-available/udid /etc/nginx/sites-enabled/
+
+# Deshabilitar el sitio por defecto
+sudo rm /etc/nginx/sites-enabled/default
+
+# Verificar configuración de Nginx
+sudo nginx -t
+
+# Debería mostrar: syntax is ok / test is successful
+```
+
+---
+
+## 10. Configuración de SSL/HTTPS
+
+### 10.1 Opción A: Certificado Autofirmado (Para IP sin dominio)
+
+> ⚠️ **Nota:** Los certificados autofirmados mostrarán una advertencia en el navegador. Es seguro para uso interno, pero para producción pública se recomienda un dominio con Let's Encrypt.
+
+```bash
+# Crear directorio para certificados
+sudo mkdir -p /etc/nginx/ssl
+
+# Generar certificado autofirmado (válido por 365 días)
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/udid.key \
+    -out /etc/nginx/ssl/udid.crt
+
+# Te pedirá información (puedes dejar valores por defecto presionando Enter):
+# Country Name: CO
+# State: Tu Estado
+# Locality: Tu Ciudad
+# Organization: Tu Organización
+# Common Name: IP_DEL_SERVIDOR o tu.dominio.com
+# Email: tu@email.com
+
+# Cambiar permisos
+sudo chmod 600 /etc/nginx/ssl/udid.key
+sudo chmod 644 /etc/nginx/ssl/udid.crt
+```
+
+### 10.2 Opción B: Let's Encrypt (Cuando tengas un dominio)
+
+> 📝 **Requisito:** Debes tener un dominio apuntando a la IP del servidor.
+
+```bash
+# Instalar Certbot
+sudo apt install -y certbot python3-certbot-nginx
+
+# Obtener certificado (reemplazar tu.dominio.com con tu dominio real)
+sudo certbot --nginx -d tu.dominio.com
+
+# Seguir las instrucciones interactivas
+# - Ingresar email
+# - Aceptar términos
+# - Elegir si redirigir HTTP a HTTPS (recomendado: Yes)
+
+# Verificar renovación automática
+sudo certbot renew --dry-run
+```
+
+Si usas Let's Encrypt, actualizar la configuración de Nginx:
+
+```bash
+sudo nano /etc/nginx/sites-available/udid
+```
+
+Cambiar las líneas de SSL:
+
+```nginx
+ssl_certificate /etc/letsencrypt/live/tu.dominio.com/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/tu.dominio.com/privkey.pem;
+```
+
+### 10.3 Reiniciar Nginx
+
+```bash
+# Verificar configuración
+sudo nginx -t
+
+# Reiniciar Nginx
+sudo systemctl restart nginx
+
+# Verificar estado
+sudo systemctl status nginx
+```
+
+---
+
+## 11. Configuración de Systemd
+
+### 11.1 Crear Servicio para Daphne
+
+Vamos a crear un servicio systemd que ejecute múltiples instancias de Daphne:
+
+```bash
+# Crear archivo de servicio para la instancia principal
+sudo nano /etc/systemd/system/udid@.service
+```
+
+Copiar el siguiente contenido:
+
+```ini
+[Unit]
+Description=UDID Daphne Server (Instance %i)
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=udid
+Group=udid
+WorkingDirectory=/opt/udid
+Environment="PATH=/opt/udid/venv/bin"
+EnvironmentFile=/opt/udid/.env
+
+# Comando para ejecutar Daphne
+# El puerto se calcula: 8000 + %i (instancia)
+ExecStart=/opt/udid/venv/bin/daphne \
+    -b 127.0.0.1 \
+    -p 800%i \
+    --access-log - \
+    --proxy-headers \
+    --http-timeout 60 \
+    --websocket-timeout 300 \
+    ubuntu.asgi:application
+
+# Reinicio automático
+Restart=always
+RestartSec=3
+
+# Limitar recursos (ajustar según necesidad)
+MemoryMax=1G
+CPUQuota=100%
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=udid-%i
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Guardar y salir.
+
+### 11.2 Crear Script de Control
+
+```bash
+# Crear script para manejar todas las instancias
+sudo nano /opt/udid/manage_services.sh
+```
+
+Copiar el siguiente contenido:
+
+```bash
+#!/bin/bash
+# Script para manejar múltiples instancias de Daphne
+
+# Número de instancias (ajustar según CPU cores)
+INSTANCES=4
+
+case "$1" in
+    start)
+        echo "Iniciando $INSTANCES instancias de UDID..."
+        for i in $(seq 0 $((INSTANCES-1))); do
+            sudo systemctl start udid@$i
+            echo "  Instancia $i iniciada (puerto 800$i)"
+        done
+        ;;
+    stop)
+        echo "Deteniendo instancias de UDID..."
+        for i in $(seq 0 $((INSTANCES-1))); do
+            sudo systemctl stop udid@$i
+            echo "  Instancia $i detenida"
+        done
+        ;;
+    restart)
+        echo "Reiniciando instancias de UDID..."
+        for i in $(seq 0 $((INSTANCES-1))); do
+            sudo systemctl restart udid@$i
+            echo "  Instancia $i reiniciada"
+        done
+        ;;
+    status)
+        echo "Estado de instancias de UDID:"
+        for i in $(seq 0 $((INSTANCES-1))); do
+            echo "--- Instancia $i (puerto 800$i) ---"
+            sudo systemctl status udid@$i --no-pager | head -5
+        done
+        ;;
+    enable)
+        echo "Habilitando inicio automático..."
+        for i in $(seq 0 $((INSTANCES-1))); do
+            sudo systemctl enable udid@$i
+            echo "  Instancia $i habilitada"
+        done
+        ;;
+    disable)
+        echo "Deshabilitando inicio automático..."
+        for i in $(seq 0 $((INSTANCES-1))); do
+            sudo systemctl disable udid@$i
+            echo "  Instancia $i deshabilitada"
+        done
+        ;;
+    *)
+        echo "Uso: $0 {start|stop|restart|status|enable|disable}"
+        exit 1
+        ;;
+esac
+```
+
+Guardar y hacer ejecutable:
+
+```bash
+sudo chmod +x /opt/udid/manage_services.sh
+sudo chown udid:udid /opt/udid/manage_services.sh
+```
+
+### 11.3 Iniciar y Habilitar Servicios
+
+```bash
+# Recargar systemd
+sudo systemctl daemon-reload
+
+# Iniciar todas las instancias
+sudo /opt/udid/manage_services.sh start
+
+# Habilitar inicio automático
+sudo /opt/udid/manage_services.sh enable
+
+# Verificar estado
+sudo /opt/udid/manage_services.sh status
+```
+
+### 11.4 Verificar que Todo Funciona
+
+```bash
+# Verificar puertos en uso
+sudo ss -tlnp | grep 800
+
+# Debería mostrar:
+# LISTEN  127.0.0.1:8000  daphne
+# LISTEN  127.0.0.1:8001  daphne
+# LISTEN  127.0.0.1:8002  daphne
+# LISTEN  127.0.0.1:8003  daphne
+
+# Verificar logs
+sudo journalctl -u udid@0 -f
+
+# Presionar Ctrl+C para salir
+```
+
+---
+
+## 12. Configuración de Cron Jobs
+
+### 12.1 Crear Script de Cron
+
+```bash
+# Crear script para ejecutar cron jobs de Django
+sudo nano /opt/udid/run_cron.sh
+```
+
+Copiar el siguiente contenido:
+
+```bash
+#!/bin/bash
+# Script para ejecutar cron jobs de Django
+
+# Configuración
+PROJECT_DIR="/opt/udid"
+VENV_DIR="$PROJECT_DIR/venv"
+LOG_FILE="/var/log/udid/cron.log"
+
+# Crear directorio de logs si no existe
+mkdir -p /var/log/udid
+
+# Activar entorno virtual y ejecutar cron
+cd $PROJECT_DIR
+source $VENV_DIR/bin/activate
+
+# Ejecutar django-cron
+echo "$(date) - Iniciando cron job" >> $LOG_FILE
+python manage.py runcrons >> $LOG_FILE 2>&1
+echo "$(date) - Cron job finalizado" >> $LOG_FILE
+```
+
+Guardar y hacer ejecutable:
+
+```bash
+sudo chmod +x /opt/udid/run_cron.sh
+sudo chown udid:udid /opt/udid/run_cron.sh
+
+# Crear directorio de logs
+sudo mkdir -p /var/log/udid
+sudo chown udid:udid /var/log/udid
+```
+
+### 12.2 Configurar Crontab
+
+```bash
+# Editar crontab del usuario udid
+sudo -u udid crontab -e
+
+# Si te pregunta qué editor usar, selecciona nano (opción 1)
+```
+
+Agregar las siguientes líneas al final:
+
+```cron
+# ============================================================================
+# Cron Jobs para UDID Server
+# ============================================================================
+
+# Sincronización con Panaccess cada 10 minutos
+*/10 * * * * /opt/udid/run_cron.sh
+
+# Limpiar sesiones expiradas de Django (diario a las 3 AM)
+0 3 * * * cd /opt/udid && /opt/udid/venv/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
+
+# Limpiar UDIDs expirados (cada hora)
+0 * * * * cd /opt/udid && /opt/udid/venv/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
+
+# Rotación de logs (semanal, domingos a las 4 AM)
+0 4 * * 0 /usr/sbin/logrotate /etc/logrotate.d/udid
+```
+
+Guardar y salir.
+
+### 12.3 Configurar Rotación de Logs
+
+```bash
+# Crear configuración de logrotate
+sudo nano /etc/logrotate.d/udid
+```
+
+Copiar el siguiente contenido:
+
+```
+/var/log/udid/*.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 udid udid
+}
+
+/opt/udid/server.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 udid udid
+    postrotate
+        /opt/udid/manage_services.sh restart > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+Guardar y salir.
+
+### 12.4 Verificar Cron Jobs
+
+```bash
+# Ver crontab del usuario udid
+sudo -u udid crontab -l
+
+# Ejecutar manualmente para probar
+sudo -u udid /opt/udid/run_cron.sh
+
+# Ver logs
+tail -f /var/log/udid/cron.log
+```
+
+---
+
+## 13. Verificación y Pruebas
+
+### 13.1 Lista de Verificación Pre-Lanzamiento
+
+Ejecutar estos comandos para verificar que todo está configurado correctamente:
+
+```bash
+# ====== 1. VERIFICAR SERVICIOS ======
+echo "=== Verificando PostgreSQL ==="
+sudo systemctl status postgresql | head -5
+
+echo "=== Verificando Redis ==="
+sudo systemctl status redis-server | head -5
+
+echo "=== Verificando Nginx ==="
+sudo systemctl status nginx | head -5
+
+echo "=== Verificando Daphne ==="
+sudo /opt/udid/manage_services.sh status
+
+# ====== 2. VERIFICAR CONEXIONES ======
+echo "=== Verificando conexión PostgreSQL ==="
+sudo -u udid psql -h localhost -U udid_user -d udid -c "SELECT version();"
+
+echo "=== Verificando conexión Redis ==="
+redis-cli ping
+
+# ====== 3. VERIFICAR PUERTOS ======
+echo "=== Puertos en uso ==="
+sudo ss -tlnp | grep -E '(80|443|8000|8001|8002|8003|5432|6379)'
+
+# ====== 4. VERIFICAR LOGS DE ERRORES ======
+echo "=== Últimos errores de Nginx ==="
+sudo tail -5 /var/log/nginx/udid_error.log
+
+echo "=== Últimos errores de Daphne ==="
+sudo journalctl -u udid@0 -n 10 --no-pager
+```
+
+### 13.2 Probar la API
+
+```bash
+# Desde el servidor mismo
+curl -k https://localhost/health
+
+# Debería responder: OK
+
+# Probar endpoint de admin
+curl -k https://localhost/admin/
+
+# Debería responder con HTML de la página de login
+```
+
+### 13.3 Probar desde Fuera del Servidor
+
+Desde tu computadora local:
+
+```bash
+# Reemplazar IP_DEL_SERVIDOR con la IP real
+curl -k https://IP_DEL_SERVIDOR/health
+
+# Probar la API
+curl -k https://IP_DEL_SERVIDOR/udid/metrics/
+```
+
+### 13.4 Probar WebSocket
+
+Puedes usar una herramienta online como [WebSocket King](https://websocketking.com/) o desde la terminal:
+
+```bash
+# Instalar websocat (herramienta de línea de comandos para WebSocket)
+sudo apt install -y websocat
+
+# Probar conexión WebSocket
+websocat -k wss://IP_DEL_SERVIDOR/ws/auth/
+```
+
+### 13.5 Abrir Firewall (si es necesario)
+
+```bash
+# Si usas UFW (firewall de Ubuntu)
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 22/tcp  # SSH
+sudo ufw enable
+sudo ufw status
+```
+
+---
+
+## 14. Mantenimiento y Monitoreo
+
+### 14.1 Comandos Útiles de Monitoreo
+
+```bash
+# Ver uso de recursos en tiempo real
+htop
+
+# Ver logs en tiempo real
+sudo journalctl -u udid@0 -f
+
+# Ver logs de Nginx
+sudo tail -f /var/log/nginx/udid_access.log
+sudo tail -f /var/log/nginx/udid_error.log
+
+# Ver conexiones activas
+sudo ss -tlnp
+
+# Ver uso de disco
+df -h
+
+# Ver uso de memoria
+free -h
+
+# Ver procesos de Python/Daphne
+ps aux | grep daphne
+```
+
+### 14.2 Script de Monitoreo Automático
+
+```bash
+# Crear script de monitoreo
+sudo nano /opt/udid/health_check.sh
+```
+
+Copiar el siguiente contenido:
+
+```bash
+#!/bin/bash
+# Script de monitoreo de salud del sistema
+
+LOG_FILE="/var/log/udid/health.log"
+ALERT_EMAIL="tu@email.com"  # Cambiar por tu email
+
+check_service() {
+    if systemctl is-active --quiet $1; then
+        echo "✅ $1: OK"
+        return 0
+    else
+        echo "❌ $1: FAILED"
+        return 1
+    fi
+}
+
+check_http() {
+    if curl -sk --connect-timeout 5 "$1" > /dev/null 2>&1; then
+        echo "✅ HTTP $1: OK"
+        return 0
+    else
+        echo "❌ HTTP $1: FAILED"
+        return 1
+    fi
+}
+
+echo "$(date) - Health Check Started" >> $LOG_FILE
+
+# Verificar servicios
+check_service postgresql >> $LOG_FILE
+check_service redis-server >> $LOG_FILE
+check_service nginx >> $LOG_FILE
+
+for i in 0 1 2 3; do
+    check_service udid@$i >> $LOG_FILE
+done
+
+# Verificar HTTP
+check_http "https://localhost/health" >> $LOG_FILE
+
+echo "$(date) - Health Check Completed" >> $LOG_FILE
+echo "---" >> $LOG_FILE
+```
+
+Guardar y hacer ejecutable:
+
+```bash
+sudo chmod +x /opt/udid/health_check.sh
+
+# Agregar al crontab para ejecutar cada 5 minutos
+sudo -u udid crontab -e
+
+# Agregar esta línea:
+*/5 * * * * /opt/udid/health_check.sh
+```
+
+### 14.3 Actualizar el Proyecto
+
+Cuando necesites actualizar el código:
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+
+# Detener servicios
+exit  # Volver a root
+sudo /opt/udid/manage_services.sh stop
+
+# Cambiar al usuario udid nuevamente
+sudo su - udid
+cd /opt/udid
+
+# Si usas Git
+git pull origin main
+
+# Si actualizas manualmente, copiar archivos nuevos
+
+# Activar entorno virtual
+source venv/bin/activate
+
+# Instalar nuevas dependencias (si las hay)
+pip install -r requirements.txt
+
+# Aplicar migraciones (si las hay)
+python manage.py migrate
+
+# Recolectar archivos estáticos
+python manage.py collectstatic --noinput
+
+# Salir y reiniciar servicios
+exit
+sudo /opt/udid/manage_services.sh start
+sudo systemctl restart nginx
+
+# Verificar estado
+sudo /opt/udid/manage_services.sh status
+```
+
+### 14.4 Backup de Base de Datos
+
+```bash
+# Crear script de backup
+sudo nano /opt/udid/backup_db.sh
+```
+
+```bash
+#!/bin/bash
+# Script de backup de PostgreSQL
+
+BACKUP_DIR="/var/backups/udid"
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/udid_$DATE.sql.gz"
+
+# Crear directorio si no existe
+mkdir -p $BACKUP_DIR
+
+# Crear backup
+PGPASSWORD="tu_password_seguro" pg_dump -h localhost -U udid_user udid | gzip > $BACKUP_FILE
+
+# Eliminar backups de más de 7 días
+find $BACKUP_DIR -name "udid_*.sql.gz" -mtime +7 -delete
+
+echo "Backup creado: $BACKUP_FILE"
+```
+
+```bash
+sudo chmod +x /opt/udid/backup_db.sh
+
+# Agregar al crontab (backup diario a las 2 AM)
+sudo crontab -e
+# Agregar: 0 2 * * * /opt/udid/backup_db.sh >> /var/log/udid/backup.log 2>&1
+```
+
+---
+
+## 15. Solución de Problemas
+
+### 15.1 Problemas Comunes y Soluciones
+
+#### Error: "Connection refused" al conectar a PostgreSQL
+
+```bash
+# Verificar que PostgreSQL está corriendo
+sudo systemctl status postgresql
+
+# Si no está corriendo
+sudo systemctl start postgresql
+
+# Verificar configuración de acceso
+sudo cat /etc/postgresql/*/main/pg_hba.conf | grep -v "^#" | grep -v "^$"
+```
+
+#### Error: "Connection refused" al conectar a Redis
+
+```bash
+# Verificar que Redis está corriendo
+sudo systemctl status redis-server
+
+# Si no está corriendo
+sudo systemctl start redis-server
+
+# Verificar que está escuchando
+redis-cli ping
+```
+
+#### Error 502 Bad Gateway en Nginx
+
+```bash
+# Verificar que Daphne está corriendo
+sudo /opt/udid/manage_services.sh status
+
+# Ver logs de Daphne
+sudo journalctl -u udid@0 -n 50
+
+# Verificar puertos
+sudo ss -tlnp | grep 800
+```
+
+#### Error de permisos en archivos
+
+```bash
+# Corregir permisos del proyecto
+sudo chown -R udid:udid /opt/udid
+sudo chmod -R 755 /opt/udid
+sudo chmod 600 /opt/udid/.env
+```
+
+#### Error "ModuleNotFoundError" en Python
+
+```bash
+# Asegurarse de que el entorno virtual está activado
+cd /opt/udid
+source venv/bin/activate
+
+# Reinstalar dependencias
+pip install -r requirements.txt
+```
+
+#### WebSocket no conecta
+
+```bash
+# Verificar configuración de Nginx para WebSocket
+sudo nginx -t
+
+# Ver logs de error de Nginx
+sudo tail -f /var/log/nginx/udid_error.log
+
+# Verificar que el upgrade header está presente
+curl -i -k https://localhost/ws/auth/ \
+    -H "Upgrade: websocket" \
+    -H "Connection: Upgrade"
+```
+
+### 15.2 Comandos de Diagnóstico
+
+```bash
+# Ver todos los procesos de Python
+ps aux | grep python
+
+# Ver conexiones de red
+sudo netstat -tlnp
+
+# Ver uso de memoria por proceso
+ps aux --sort=-%mem | head -20
+
+# Ver logs del sistema
+sudo journalctl -xe
+
+# Ver espacio en disco
+df -h
+
+# Ver inodes (archivos)
+df -i
+```
+
+### 15.3 Reinicio Completo del Sistema
+
+Si todo falla, reiniciar todos los servicios:
+
+```bash
+# Detener todos los servicios
+sudo /opt/udid/manage_services.sh stop
+sudo systemctl stop nginx
+sudo systemctl stop redis-server
+sudo systemctl stop postgresql
+
+# Esperar unos segundos
+sleep 5
+
+# Iniciar en orden
+sudo systemctl start postgresql
+sudo systemctl start redis-server
+sudo /opt/udid/manage_services.sh start
+sudo systemctl start nginx
+
+# Verificar estado
+sudo systemctl status postgresql
+sudo systemctl status redis-server
+sudo /opt/udid/manage_services.sh status
+sudo systemctl status nginx
+```
+
+---
+
+## 16. Recomendaciones de Recursos del Servidor
+
+### 16.1 Configuración Recomendada según Carga
+
+#### 🟢 Carga Baja (hasta 500 conexiones simultáneas)
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 2-4 cores |
+| **RAM** | 4-8 GB |
+| **Disco** | 40 GB SSD |
+| **Workers Daphne** | 4 |
+| **Redis Memory** | 1 GB |
+| **PostgreSQL Connections** | 50 |
+
+#### 🟡 Carga Media (500-2000 conexiones simultáneas)
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 4-8 cores |
+| **RAM** | 8-16 GB |
+| **Disco** | 80 GB SSD |
+| **Workers Daphne** | 8 |
+| **Redis Memory** | 2 GB |
+| **PostgreSQL Connections** | 100 |
+
+#### 🔴 Carga Alta (2000+ conexiones simultáneas)
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 8-16 cores |
+| **RAM** | 16-32 GB |
+| **Disco** | 150+ GB NVMe |
+| **Workers Daphne** | 16+ |
+| **Redis Memory** | 4+ GB |
+| **PostgreSQL Connections** | 200+ |
+
+### 16.2 Ajustes de Rendimiento
+
+#### Para PostgreSQL (alta carga):
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+```conf
+# Ajustes de memoria
+shared_buffers = 2GB              # 25% de la RAM total
+effective_cache_size = 6GB        # 75% de la RAM total
+work_mem = 256MB
+maintenance_work_mem = 512MB
+
+# Conexiones
+max_connections = 200
+
+# WAL
+wal_buffers = 64MB
+checkpoint_completion_target = 0.9
+```
+
+#### Para Redis (alta carga):
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+```conf
+maxmemory 4gb
+maxmemory-policy allkeys-lru
+tcp-keepalive 300
+timeout 0
+```
+
+#### Para Nginx (alta carga):
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+```nginx
+worker_processes auto;
+worker_connections 4096;
+multi_accept on;
+use epoll;
+```
+
+### 16.3 Monitoreo de Recursos
+
+Instalar herramientas de monitoreo:
+
+```bash
+# htop para monitoreo en tiempo real
+sudo apt install -y htop
+
+# iotop para monitoreo de disco
+sudo apt install -y iotop
+
+# Netdata para dashboard web de monitoreo (opcional)
+bash <(curl -Ss https://my-netdata.io/kickstart.sh)
+```
+
+---
+
+## 📝 Resumen de Comandos Importantes
+
+```bash
+# === GESTIÓN DE SERVICIOS ===
+sudo /opt/udid/manage_services.sh start     # Iniciar aplicación
+sudo /opt/udid/manage_services.sh stop      # Detener aplicación
+sudo /opt/udid/manage_services.sh restart   # Reiniciar aplicación
+sudo /opt/udid/manage_services.sh status    # Ver estado
+
+sudo systemctl restart nginx                # Reiniciar Nginx
+sudo systemctl restart postgresql           # Reiniciar PostgreSQL
+sudo systemctl restart redis-server         # Reiniciar Redis
+
+# === LOGS ===
+sudo journalctl -u udid@0 -f               # Ver logs de Daphne
+sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
+sudo tail -f /var/log/udid/cron.log        # Ver logs de cron
+
+# === DJANGO ===
+cd /opt/udid && source venv/bin/activate   # Activar entorno
+python manage.py migrate                    # Aplicar migraciones
+python manage.py collectstatic --noinput   # Recolectar estáticos
+python manage.py createsuperuser           # Crear admin
+python manage.py runcrons                   # Ejecutar cron manualmente
+
+# === VERIFICACIÓN ===
+curl -k https://localhost/health           # Verificar salud
+redis-cli ping                             # Verificar Redis
+sudo ss -tlnp | grep 800                   # Ver puertos Daphne
+```
+
+---
+
+## ✅ Lista de Verificación Final
+
+Antes de considerar el despliegue completo, verificar:
+
+- [ ] PostgreSQL instalado y configurado
+- [ ] Redis instalado y configurado
+- [ ] Proyecto copiado a `/opt/udid`
+- [ ] Entorno virtual creado y dependencias instaladas
+- [ ] Archivo `.env` configurado con todas las variables
+- [ ] Migraciones aplicadas
+- [ ] Archivos estáticos recolectados
+- [ ] Superusuario creado
+- [ ] Certificado SSL configurado
+- [ ] Nginx configurado y funcionando
+- [ ] Servicios systemd creados y habilitados
+- [ ] Cron jobs configurados
+- [ ] Firewall configurado
+- [ ] Pruebas de API exitosas
+- [ ] Pruebas de WebSocket exitosas
+
+---
+
+**¡Felicidades! 🎉** Si has llegado hasta aquí y todo funciona, tu servidor UDID está listo para producción.
+
+Para soporte adicional, revisar los logs y la documentación de cada componente:
+- [Django Documentation](https://docs.djangoproject.com/)
+- [Django Channels](https://channels.readthedocs.io/)
+- [Nginx Documentation](https://nginx.org/en/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
+- [Redis Documentation](https://redis.io/documentation)
+

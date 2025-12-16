@@ -37,6 +37,7 @@ from .util import (
 from .models import UDIDAuthRequest, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
 from .utils.log_buffer import log_audit_async
 from .utils.metrics import get_metrics, reset_metrics
+from .cron import execute_sync_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -1125,3 +1126,47 @@ class MetricsDashboardView(APIView):
             "message": "Metrics reset successfully",
             "timestamp": timezone.now().isoformat()
         }, status=status.HTTP_200_OK)
+
+class ManualSyncView(APIView):
+    """
+    Endpoint para ejecutar manualmente las tareas de sincronización.
+    Permite actualizar suscriptores y SN desde el frontend.
+    """
+    permission_classes = [IsAuthenticated]  # Requiere autenticación
+    
+    def post(self, request):
+        """
+        Ejecuta todas las tareas de sincronización manualmente.
+        
+        Returns:
+            Response con el resultado de la sincronización
+        """
+        logger.info(f"ManualSyncView: Sincronización manual solicitada por usuario {request.user.username if hasattr(request.user, 'username') else 'unknown'}")
+        
+        try:
+            # Ejecutar las tareas de sincronización
+            result = execute_sync_tasks()
+            
+            if result['success']:
+                return Response({
+                    'success': True,
+                    'message': result['message'],
+                    'tasks': result['tasks'],
+                    'session_id': result['session_id']
+                }, status=status.HTTP_200_OK)
+            else:
+                # Algunas tareas fallaron, pero devolvemos el resultado completo
+                return Response({
+                    'success': False,
+                    'message': result['message'],
+                    'tasks': result['tasks'],
+                    'session_id': result['session_id']
+                }, status=status.HTTP_207_MULTI_STATUS)  # 207 indica éxito parcial
+            
+        except Exception as e:
+            logger.error(f"ManualSyncView: Error inesperado: {str(e)}", exc_info=True)
+            return Response({
+                'success': False,
+                'message': f'Error al ejecutar sincronización: {str(e)}',
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
