@@ -98,7 +98,7 @@ Conectarse por SSH al servidor Ubuntu:
 ssh usuario@IP_DEL_SERVIDOR
 
 # Ejemplo:
-ssh admin@192.168.1.100
+ssh sw4@192.168.1.100
 ```
 
 > 💡 **Nota:** Reemplaza `usuario` con tu nombre de usuario y `IP_DEL_SERVIDOR` con la IP real.
@@ -116,6 +116,9 @@ sudo apt upgrade -y
 
 # Reiniciar si se actualizó el kernel (opcional pero recomendado)
 sudo reboot
+
+# Comando para apagar el servidor
+sudo shutdown now
 ```
 
 ### 2.3 Configurar Zona Horaria
@@ -124,8 +127,8 @@ sudo reboot
 # Ver zona horaria actual
 timedatectl
 
-# Configurar zona horaria (ejemplo: América/Bogotá)
-sudo timedatectl set-timezone America/Bogota
+# Configurar zona horaria (ejemplo: América/Buenos Aires)
+sudo timedatectl set-timezone America/Argentina/Buenos_Aires
 
 # Verificar el cambio
 date
@@ -641,7 +644,7 @@ ls -la /opt/udid/.env
 Editar el archivo de configuración:
 
 ```bash
-nano /opt/udid/ubuntu/settings.py
+nano /opt/udid/Ubuntu/ubuntu/settings.py
 ```
 
 Buscar la sección `DATABASES` y modificarla (comentar MySQL y descomentar PostgreSQL):
