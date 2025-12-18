@@ -16,6 +16,13 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
 
+# Importar parches ANTES de cargar Django para compatibilidad
+# Esto debe ejecutarse antes de que Django configure las apps
+try:
+    import udid.patches  # Parche para django-cron (index_together -> indexes)
+except ImportError:
+    pass  # Si no existe el archivo de parches, continuar
+
 from config import DjangoConfig
 
 # Validar configuración cargada desde DjangoConfig
@@ -540,7 +547,8 @@ logging.config.dictConfig(LOGGING)
 # ============================================================================
 # * Configuración de tareas periódicas con django-cron
 CRON_CLASSES = [
-    "udid.cron.MergeSyncCronJob",
+    "udid.cron.UpdateSubscribersCronJob",  # Actualiza información de suscriptores cada 5 minutos (rápido)
+    "udid.cron.MergeSyncCronJob",  # Valida y corrige toda la información una vez al día (completo)
 ]
 
 # ============================================================================
