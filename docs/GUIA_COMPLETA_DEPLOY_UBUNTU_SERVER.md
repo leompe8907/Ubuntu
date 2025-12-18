@@ -36,7 +36,7 @@ Este es un servidor Django/Channels que proporciona:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        INTERNET                                  │
+│                        INTERNET                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -233,7 +233,7 @@ Dentro de la consola de PostgreSQL, ejecutar los siguientes comandos:
 CREATE DATABASE udid;
 
 -- Crear usuario para la aplicación (CAMBIAR 'tu_password_seguro' por una contraseña real)
-CREATE USER udid_user WITH PASSWORD 'tu_password_seguro';
+CREATE USER udid_user WITH PASSWORD 'parana771';
 
 -- Configurar el usuario
 ALTER ROLE udid_user SET client_encoding TO 'utf8';
@@ -480,7 +480,7 @@ ls -la /opt/udid/
 # - requirements.txt
 # - ubuntu/  (directorio con settings.py, urls.py, etc.)
 # - udid/    (directorio con views.py, models.py, etc.)
-# - venv/    (entorno virtual)
+# - env/    (entorno virtual)
 ```
 
 ---
@@ -1023,13 +1023,13 @@ Requires=postgresql.service redis-server.service
 Type=simple
 User=udid
 Group=udid
-WorkingDirectory=/opt/udid
-Environment="PATH=/opt/udid/venv/bin"
-EnvironmentFile=/opt/udid/.env
+WorkingDirectory=/opt/udid/Ubuntu
+Environment="PATH=/opt/udid/Ubuntu/env/bin"
+EnvironmentFile=/opt/udid/Ubuntu/.env
 
 # Comando para ejecutar Daphne
 # El puerto se calcula: 8000 + %i (instancia)
-ExecStart=/opt/udid/venv/bin/daphne \
+ExecStart=/opt/udid/Ubuntu/env/bin/daphne \
     -b 127.0.0.1 \
     -p 800%i \
     --access-log - \

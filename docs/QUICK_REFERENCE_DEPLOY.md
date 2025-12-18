@@ -1,7 +1,5 @@
 # 📋 Referencia Rápida de Despliegue - UDID Server
 
-> Esta es una guía de referencia rápida. Para instrucciones detalladas, ver `GUIA_COMPLETA_DEPLOY_UBUNTU_SERVER.md`
-
 ---
 
 ## 🚀 Comandos de Instalación Rápida (Ubuntu 22.04/24.04)
@@ -108,15 +106,15 @@ for i in 0 1 2 3; do sudo systemctl enable udid@$i && sudo systemctl start udid@
 
 ## 🔧 Comandos de Gestión
 
-| Acción | Comando |
-|--------|---------|
-| **Iniciar app** | `sudo systemctl start udid@{0..3}` |
-| **Detener app** | `sudo systemctl stop udid@{0..3}` |
-| **Reiniciar app** | `sudo systemctl restart udid@{0..3}` |
-| **Ver estado** | `sudo systemctl status udid@0` |
-| **Ver logs** | `sudo journalctl -u udid@0 -f` |
-| **Reiniciar Nginx** | `sudo systemctl restart nginx` |
-| **Ver puertos** | `sudo ss -tlnp \| grep 800` |
+| Acción              | Comando                              |
+|---------------------|--------------------------------------|
+| **Iniciar app**     | `sudo systemctl start udid@{0..3}`   |
+| **Detener app**     | `sudo systemctl stop udid@{0..3}`    |
+| **Reiniciar app**   | `sudo systemctl restart udid@{0..3}` |
+| **Ver estado**      | `sudo systemctl status udid@0`       |
+| **Ver logs**        | `sudo journalctl -u udid@0 -f`       |
+| **Reiniciar Nginx** | `sudo systemctl restart nginx`       |
+| **Ver puertos**     | `sudo ss -tlnp \| grep 800`          |
 
 ---
 
@@ -164,23 +162,23 @@ psql -h localhost -U udid_user -d udid -c "SELECT 1;"
 
 ## 🆘 Solución Rápida de Problemas
 
-| Problema | Solución |
-|----------|----------|
-| **502 Bad Gateway** | `sudo systemctl restart udid@{0..3}` |
-| **PostgreSQL no conecta** | `sudo systemctl restart postgresql` |
-| **Redis no conecta** | `sudo systemctl restart redis-server` |
-| **Permisos** | `sudo chown -R udid:udid /opt/udid` |
-| **ModuleNotFound** | `source venv/bin/activate && pip install -r requirements.txt` |
+| Problema                  | Solución                                                      |
+|---------------------------|---------------------------------------------------------------|
+| **502 Bad Gateway**       | `sudo systemctl restart udid@{0..3}`                          |
+| **PostgreSQL no conecta** | `sudo systemctl restart postgresql`                           |
+| **Redis no conecta**      | `sudo systemctl restart redis-server`                         |
+| **Permisos**              | `sudo chown -R udid:udid /opt/udid`                           |
+| **ModuleNotFound**        | `source venv/bin/activate && pip install -r requirements.txt` |
 
 ---
 
 ## 📊 Recursos Recomendados
 
-| Carga | CPU | RAM | Workers |
-|-------|-----|-----|---------|
-| Baja (<500 conn) | 2-4 cores | 4-8 GB | 4 |
-| Media (500-2000) | 4-8 cores | 8-16 GB | 8 |
-| Alta (2000+) | 8-16 cores | 16-32 GB | 16+ |
+| Carga            | CPU       | RAM      | Workers |
+|------------------|-----      |-----     |---------|
+| Baja (<500 conn) | 2-4 cores | 4-8 GB   | 4       |
+| Media (500-2000) | 4-8 cores | 8-16 GB  | 8       |
+| Alta (2000+)     | 8-16 cores| 16-32 GB | 16+     |
 
 ---
 
@@ -222,4 +220,6 @@ python manage.py collectstatic --noinput
 sudo systemctl start udid@{0..3}
 sudo systemctl restart nginx
 ```
+
+
 
