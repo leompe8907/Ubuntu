@@ -200,6 +200,38 @@ ENCRYPTION_KEY=        # 32 caracteres para AES-256
 
 ---
 
+## ⏰ Tareas Cron (Sincronización Automática)
+
+### Configurar Crontab
+
+```bash
+# Editar crontab
+sudo -u udid crontab -e
+
+# Agregar esta línea (ejecutar cada 5 minutos):
+*/5 * * * * /opt/udid/run_cron.sh
+```
+
+### Tareas Automáticas del Sistema
+
+| Tarea | Frecuencia | Propósito |
+|-------|------------|-----------|
+| `UpdateSubscribersCronJob` | Cada 5 min | Sincronización rápida (suscriptores, credenciales) |
+| `MergeSyncCronJob` | Diaria a las 00:00 | Sincronización completa (smartcards, productos) |
+
+### Verificar Ejecución
+
+```bash
+# Ver logs de cron
+tail -f /var/log/udid/cron.log
+
+# Ver historial en Django
+cd /opt/udid && source venv/bin/activate
+python manage.py shell -c "from django_cron.models import CronJobLog; [print(f'{l.code} | {l.start_time} | OK:{l.is_success}') for l in CronJobLog.objects.order_by('-end_time')[:10]]"
+```
+
+---
+
 ## 🔄 Actualizar Proyecto
 
 ```bash

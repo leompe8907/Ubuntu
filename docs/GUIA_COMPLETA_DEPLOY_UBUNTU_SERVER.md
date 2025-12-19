@@ -644,7 +644,7 @@ ls -la /opt/udid/.env
 Editar el archivo de configuración:
 
 ```bash
-nano /opt/udid/Ubuntu/ubuntu/settings.py
+nano /opt/udid/ubuntu/settings.py
 ```
 
 Buscar la sección `DATABASES` y modificarla (comentar MySQL y descomentar PostgreSQL):
@@ -1026,18 +1026,18 @@ Requires=postgresql.service redis-server.service
 Type=simple
 User=udid
 Group=udid
-WorkingDirectory=/opt/udid/Ubuntu
-Environment="PATH=/opt/udid/Ubuntu/env/bin"
-EnvironmentFile=/opt/udid/Ubuntu/.env
+WorkingDirectory=/opt/udid
+Environment="PATH=/opt/udid/env/bin"
+EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Daphne
 # El puerto se calcula: 8000 + %i (instancia)
-ExecStart=/opt/udid/Ubuntu/env/bin/daphne \
+ExecStart=/opt/udid/env/bin/daphne \
     -b 127.0.0.1 \
     -p 800%i \
     --access-log - \
     --proxy-headers \
-    --http-timeout 60 \
+    -t 60 \
     --websocket-timeout 300 \
     ubuntu.asgi:application
 
@@ -1171,6 +1171,21 @@ sudo journalctl -u udid@0 -f
 
 ## 12. Configuración de Cron Jobs
 
+### 📋 Información sobre las Tareas Automáticas
+
+El proyecto tiene **2 tareas cron** configuradas en `django-cron` con diferentes propósitos:
+
+| Tarea | Frecuencia | Propósito | Duración |
+|-------|------------|-----------|----------|
+| **UpdateSubscribersCronJob** | Cada 5 minutos | Sincronización RÁPIDA de suscriptores, credenciales y asociaciones | Segundos/Minutos |
+| **MergeSyncCronJob** | Diaria a las 00:00 (medianoche) | Sincronización COMPLETA de smartcards, productos, paquetes | Puede tomar horas |
+
+**¿Cómo funciona?**
+- `django-cron` **define** las tareas y sus intervalos/horarios internamente
+- El **crontab del sistema** solo necesita llamar a `runcrons` frecuentemente
+- `django-cron` **decide** qué tareas ejecutar basándose en su última ejecución o el horario programado
+- `MergeSyncCronJob` se ejecuta automáticamente a las **00:00 (medianoche)** todos los días
+
 ### 12.1 Crear Script de Cron
 
 ```bash
@@ -1183,6 +1198,10 @@ Copiar el siguiente contenido:
 ```bash
 #!/bin/bash
 # Script para ejecutar cron jobs de Django
+# 
+# IMPORTANTE: Este script llama a 'runcrons' que verifica qué tareas ejecutar:
+# - UpdateSubscribersCronJob: cada 5 minutos (sincronización rápida)
+# - MergeSyncCronJob: diaria a las 00:00 (medianoche) - sincronización completa
 
 # Configuración
 PROJECT_DIR="/opt/udid"
@@ -1196,10 +1215,10 @@ mkdir -p /var/log/udid
 cd $PROJECT_DIR
 source $VENV_DIR/bin/activate
 
-# Ejecutar django-cron
-echo "$(date) - Iniciando cron job" >> $LOG_FILE
+# Ejecutar django-cron (decide internamente qué tareas ejecutar)
+echo "$(date) - Iniciando verificación de cron jobs" >> $LOG_FILE
 python manage.py runcrons >> $LOG_FILE 2>&1
-echo "$(date) - Cron job finalizado" >> $LOG_FILE
+echo "$(date) - Verificación de cron jobs finalizada" >> $LOG_FILE
 ```
 
 Guardar y hacer ejecutable:
@@ -1228,9 +1247,19 @@ Agregar las siguientes líneas al final:
 # ============================================================================
 # Cron Jobs para UDID Server
 # ============================================================================
+#
+# IMPORTANTE: django-cron maneja internamente las frecuencias/horarios de cada tarea:
+# - UpdateSubscribersCronJob: cada 5 minutos (sincronización rápida)
+# - MergeSyncCronJob: diaria a las 00:00 (medianoche) - sincronización completa de smartcards
+#
+# El crontab del sistema solo necesita llamar a 'runcrons' cada 5 minutos
+# para que django-cron pueda verificar y ejecutar las tareas que correspondan.
+# MergeSyncCronJob se ejecutará automáticamente cuando sea medianoche.
+# ============================================================================
 
-# Sincronización con Panaccess cada 10 minutos
-*/10 * * * * /opt/udid/run_cron.sh
+# Ejecutar verificación de crons cada 5 minutos
+# (django-cron decide internamente qué tareas ejecutar según su última ejecución)
+*/5 * * * * /opt/udid/run_cron.sh
 
 # Limpiar sesiones expiradas de Django (diario a las 3 AM)
 0 3 * * * cd /opt/udid && /opt/udid/venv/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
@@ -1289,9 +1318,78 @@ sudo -u udid crontab -l
 # Ejecutar manualmente para probar
 sudo -u udid /opt/udid/run_cron.sh
 
-# Ver logs
+# Ver logs en tiempo real
 tail -f /var/log/udid/cron.log
 ```
+
+### 12.5 Verificar que las Tareas se Ejecutan Correctamente
+
+#### Método 1: Revisar los logs
+
+```bash
+# Ver las últimas ejecuciones
+tail -50 /var/log/udid/cron.log
+
+# Buscar ejecuciones específicas
+grep "UPDATE_SUBSCRIBERS" /var/log/udid/cron.log | tail -10  # Tarea cada 5 min
+grep "MERGE_SYNC" /var/log/udid/cron.log | tail -5           # Tarea diaria
+```
+
+#### Método 2: Consultar la base de datos de django-cron
+
+```bash
+cd /opt/udid
+source venv/bin/activate
+python manage.py shell
+```
+
+Dentro del shell de Python:
+
+```python
+from django_cron.models import CronJobLog
+
+# Ver las últimas 10 ejecuciones de cualquier tarea
+logs = CronJobLog.objects.order_by('-end_time')[:10]
+for log in logs:
+    print(f"{log.code} | {log.start_time} | Éxito: {log.is_success}")
+
+# Ver solo las ejecuciones de UpdateSubscribersCronJob (cada 5 min)
+logs = CronJobLog.objects.filter(code='udid.update_subscribers_cron').order_by('-end_time')[:5]
+for log in logs:
+    print(f"{log.start_time} | Éxito: {log.is_success}")
+
+# Ver solo las ejecuciones de MergeSyncCronJob (diaria)
+logs = CronJobLog.objects.filter(code='udid.sync_smartcards_cron').order_by('-end_time')[:5]
+for log in logs:
+    print(f"{log.start_time} | Éxito: {log.is_success}")
+
+# Salir del shell
+exit()
+```
+
+#### Método 3: Verificar el servicio cron del sistema
+
+```bash
+# Verificar que el servicio cron está activo
+sudo systemctl status cron
+
+# Ver logs del sistema relacionados con cron
+grep CRON /var/log/syslog | tail -20
+```
+
+### 12.6 Diferencias entre las Tareas Cron
+
+| Característica | UpdateSubscribersCronJob | MergeSyncCronJob |
+|----------------|-------------------------|------------------|
+| **Frecuencia** | Cada 5 minutos | Diaria a las 00:00 (medianoche) |
+| **Código** | `udid.update_subscribers_cron` | `udid.sync_smartcards_cron` |
+| **Duración** | Segundos/Minutos | Puede tomar horas |
+| **Sincroniza Smartcards Completas** | ❌ No | ✅ Sí |
+| **Sincroniza Suscriptores** | ✅ Sí | ✅ Sí |
+| **Sincroniza Credenciales** | ✅ Sí | ✅ Sí |
+| **Actualiza SubscriberInfo** | ✅ Sí | ✅ Sí |
+| **Propósito** | Mantener datos actualizados rápidamente | Validación y corrección completa |
+| **Horario** | Cada 5 minutos (todo el día) | Medianoche (horario de bajo tráfico) |
 
 ---
 

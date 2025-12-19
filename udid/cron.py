@@ -409,9 +409,10 @@ class MergeSyncCronJob(CronJobBase):
        - Crea/actualiza smartcards basándose en la información de suscriptores
     
     FRECUENCIA:
-    - Se ejecuta una vez al día (cada 24 horas = 1440 minutos)
+    - Se ejecuta una vez al día a las 00:00 (medianoche)
     - Razón: Puede tomar varias horas con grandes volúmenes de datos (8-9 horas con 10,000 smartcards)
     - Es una tarea de validación y corrección completa
+    - Se ejecuta en horario de bajo tráfico para no afectar el rendimiento del sistema
     
     DIFERENCIA CON UpdateSubscribersCronJob:
     - Esta tarea sincroniza smartcards COMPLETAS desde Panaccess (productos, paquetes, etc.)
@@ -422,8 +423,8 @@ class MergeSyncCronJob(CronJobBase):
     Esta tarea asegura que toda la información esté correcta y sincronizada con Panaccess.
     Es la tarea de validación y corrección completa del sistema.
     """
-    RUN_EVERY_MINS = 1440  # 24 horas (1 vez al día)
-    schedule = Schedule(run_every_mins=RUN_EVERY_MINS)
+    # Programar para ejecutarse a las 00:00 (medianoche) todos los días
+    schedule = Schedule(run_at_times=['00:00'])
     code = 'udid.sync_smartcards_cron'
 
     def do(self):
