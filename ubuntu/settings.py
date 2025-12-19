@@ -16,13 +16,6 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
 
-# Importar parches ANTES de cargar Django para compatibilidad
-# Esto debe ejecutarse antes de que Django configure las apps
-try:
-    import udid.patches  # Parche para django-cron (index_together -> indexes)
-except ImportError:
-    pass  # Si no existe el archivo de parches, continuar
-
 from config import DjangoConfig
 
 # Validar configuración cargada desde DjangoConfig
@@ -306,38 +299,35 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # }
 
 # Docker Compose Postgres
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "udid"),
-        "USER": os.getenv("POSTGRES_USER", "udid_user"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
-        "OPTIONS": {
-            "connect_timeout": 10,
-        },
-    }
-}
-
-# Xampp MariaDB
 # DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'udid',
-#         'USER': 'root',
-#         'PASSWORD': '',
-#         'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
-#         'PORT': os.getenv("MYSQL_PORT", "3307"),
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#         },
-#         # Optimizaciones para mejor rendimiento con carga alta
-#         'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
-#         'AUTOCOMMIT': True,
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.getenv("POSTGRES_DB", "udid"),
+#         "USER": os.getenv("POSTGRES_USER", "dev"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
+#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
+#         "CONN_MAX_AGE": 60,
 #     }
 # }
+
+# Xampp MariaDB
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'udid',
+        'USER': 'root',
+        'PASSWORD': '',
+        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
+        'PORT': os.getenv("MYSQL_PORT", "3307"),
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
+        # Optimizaciones para mejor rendimiento con carga alta
+        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
+        'AUTOCOMMIT': True,
+    }
+}
 
 # Heroku Postgres
 # DATABASES = {
