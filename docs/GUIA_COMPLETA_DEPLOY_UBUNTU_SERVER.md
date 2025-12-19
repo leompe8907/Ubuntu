@@ -446,10 +446,10 @@ rm -rf ubuntu proyecto.zip
 cd /opt/udid
 
 # Crear entorno virtual
-python3 -m venv venv
+python3 -m venv env
 
 # Activar entorno virtual
-source venv/bin/activate
+source env/bin/activate
 
 # Verificar que está activado (debe mostrar (venv) al inicio del prompt)
 # (venv) udid@servidor:/opt/udid$
