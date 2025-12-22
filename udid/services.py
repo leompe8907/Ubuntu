@@ -5,7 +5,7 @@ from django.utils import timezone
 from .models import (UDIDAuthRequest,SubscriberInfo,AppCredentials,EncryptedCredentialsLog,)
 from .management.commands.keyGenerator import hybrid_encrypt_for_app
 from .util import compute_encrypted_hash, json_serialize_credentials
-from .utils.log_buffer import log_audit_async
+from .utils.server.log_buffer import log_audit_async
 
 FATAL_CODES = {
     "invalid_udid",

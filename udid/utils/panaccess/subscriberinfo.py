@@ -1,4 +1,4 @@
-from ..models import ListOfSubscriber, ListOfSmartcards, SubscriberLoginInfo, SubscriberInfo
+from ...models import ListOfSubscriber, ListOfSmartcards, SubscriberLoginInfo, SubscriberInfo
 from django.db import transaction
 import logging
 
@@ -31,8 +31,14 @@ def get_smartcard_data(subscriber_code):
 
         logger.info(f"[get_smartcard_data] {smartcards.count()} smartcards encontradas para {subscriber_code}")
 
-        return [
-            {
+        result = []
+        for sc in smartcards:
+            # Validar que tenga SN (campo requerido)
+            if not sc.sn:
+                logger.warning(f"[get_smartcard_data] Smartcard sin SN, se omite: {sc.id}")
+                continue
+            
+            result.append({
                 'sn': sc.sn,
                 'pin': sc.pin,
                 'first_name': sc.firstName,
@@ -42,16 +48,16 @@ def get_smartcard_data(subscriber_code):
                 'lastServiceListDownload': sc.lastServiceListDownload,
                 'lastActivationIP': sc.lastActivationIP,
                 'lastApiKeyId': sc.lastApiKeyId,
-                'products': sc.products,
-                'packages': sc.packages,
-                'packageNames': sc.packageNames,
+                'products': sc.products if sc.products else [],
+                'packages': sc.packages if sc.packages else [],
+                'packageNames': sc.packageNames if sc.packageNames else [],
                 'model': sc.model
-            }
-            for sc in smartcards
-        ]
+            })
+        
+        return result
 
     except Exception as e:
-        logger.error(f"[get_smartcard_data] Error inesperado para {subscriber_code}: {str(e)}")
+        logger.error(f"[get_smartcard_data] Error inesperado para {subscriber_code}: {str(e)}", exc_info=True)
         return []
 
 def get_login_data(subscriber_code):
@@ -213,7 +219,17 @@ def compare_and_update_subscriber_data(subscriber_code):
 
                 for field_name, new_value in smartcard_fields.items():
                     current_value = getattr(obj, field_name)
-                    if str(current_value) != str(new_value):
+                    # Comparar valores, manejando None y listas
+                    if isinstance(current_value, list) and isinstance(new_value, list):
+                        if current_value != new_value:
+                            setattr(obj, field_name, new_value)
+                            changed_fields.append(field_name)
+                    elif isinstance(current_value, dict) and isinstance(new_value, dict):
+                        # También manejar diccionarios si es necesario
+                        if current_value != new_value:
+                            setattr(obj, field_name, new_value)
+                            changed_fields.append(field_name)
+                    elif str(current_value) != str(new_value):
                         setattr(obj, field_name, new_value)
                         changed_fields.append(field_name)
 

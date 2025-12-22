@@ -1,10 +1,11 @@
 import logging
-import time
 import json
 from django.db import transaction
-from .auth import CVClient
-from ..models import ListOfSmartcards, ListOfSubscriber
-from ..serializers import ListOfSmartcardsSerializer
+from typing import Optional
+from .singleton import get_panaccess
+from .exceptions import PanaccessException, PanaccessAPIError
+from ...models import ListOfSmartcards, ListOfSubscriber
+from ...serializers import ListOfSmartcardsSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -27,23 +28,36 @@ def LastSmartcard():
         logger.warning("No se encontraron smartcards en la base de datos.")
         return None
 
-def fetch_all_smartcards(session_id, limit=100):
+def fetch_all_smartcards(session_id=None, limit=100):
     """
-    Descarga todos los registros de smartcards desde Panaccess.
+    Descarga todos los smartcards desde Panaccess y los almacena en la base de datos.
+    
+    Args:
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        limit: Cantidad máxima de registros por página
     """
-    logger.info("Descargando todos los registros de smartcards desde Panaccess...")
+    logger.info("Iniciando descarga completa de smartcards desde Panaccess...")
     offset = 0
     all_data = []
-
+    
     while True:
         result = CallListSmartcards(session_id, offset, limit)
-        rows = result.get("smartcardEntries", [])
-        if not rows:
+        smartcard_entries = result.get("smartcardEntries", [])
+        if not smartcard_entries:
             break
-        all_data.extend(rows)
-        logger.info(f"Offset {offset}: {len(rows)} registros obtenidos")
+        
+        for entry in smartcard_entries:
+            # Validar que entry tenga la estructura esperada
+            if not isinstance(entry, dict) or 'sn' not in entry:
+                logger.warning(f"Entrada con estructura inválida, se omite: {entry.get('sn', 'unknown')}")
+                continue
+            
+            all_data.append(entry)
+        
         offset += limit
-
+        logger.info(f"Procesados {len(all_data)} smartcards hasta ahora...")
+    
+    logger.info(f"Total de smartcards descargados: {len(all_data)}")
     return store_all_smartcards_in_chunks(all_data)
 
 def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
@@ -66,91 +80,98 @@ def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
         except Exception as e:
             logger.error(f"Error al insertar chunk desde {i} hasta {i+chunk_size}: {str(e)}")
 
-def download_smartcards_since_last(session_id, limit=100):
+def download_smartcards_since_last(session_id=None, limit=100):
     """
-    Descarga registros de smartcards desde Panaccess, a partir del último SN conocido.
-
+    Descarga smartcards nuevos desde el último registrado (modo incremental).
+    
     Args:
-        session_id (str): ID de sesión de Panaccess.
-        limit (int): Cantidad de registros por página.
-
-    Returns:
-        List[Dict]: Lista de smartcards nuevas (posteriores al último SN).
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        limit: Cantidad máxima de registros por página
     """
+    logger.info("Iniciando descarga incremental de smartcards desde Panaccess...")
     last = LastSmartcard()
     if not last:
         logger.warning("No hay smartcards registradas. Se recomienda usar descarga total.")
         return []
-
-    highest_sn = last.sn
-    logger.info(f"Buscando smartcards posteriores a SN: {highest_sn}")
     
+    highest_sn = last.sn
+    logger.info(f"Buscando smartcards posteriores al SN: {highest_sn}")
     offset = 0
     new_data = []
     found = False
-
+    
     while True:
         result = CallListSmartcards(session_id, offset, limit)
-        rows = result.get("smartcardEntries", [])
-        if not rows:
+        smartcard_entries = result.get("smartcardEntries", [])
+        if not smartcard_entries:
             break
-
-        for row in rows:
-            sn = row.get('sn')
+        
+        for entry in smartcard_entries:
+            if not isinstance(entry, dict) or 'sn' not in entry:
+                logger.warning(f"Entrada con estructura inválida, se omite: {entry.get('sn', 'unknown')}")
+                continue
+            
+            sn = entry.get('sn')
+            
             if sn == highest_sn:
                 found = True
-                logger.info(f"SN {highest_sn} encontrado. Fin de descarga.")
+                logger.info(f"SN {highest_sn} encontrado. Fin de descarga incremental.")
                 break
-            new_data.append(row)
-
+            
+            new_data.append(entry)
+        
         if found:
             break
-
         offset += limit
-
-    logger.info(f"Descarga incremental: {len(new_data)} registros nuevos encontrados.")
+        logger.info(f"Procesados {len(new_data)} smartcards nuevos hasta ahora...")
+    
+    logger.info(f"Total de smartcards nuevos descargados: {len(new_data)}")
     return store_all_smartcards_in_chunks(new_data)
 
-def compare_and_update_all_existing(session_id, limit=100):
+def compare_and_update_all_smartcards(session_id=None, limit=100):
     """
-    Compara todos los registros de Panaccess con la BD y actualiza solo los campos
-    que hayan cambiado. No crea nuevos registros.
-
+    Compara todos los smartcards de Panaccess con los de la base local y actualiza si hay diferencias.
+    
     Args:
-        session_id (str): ID de sesión activo.
-        limit (int): Tamaño del lote para la descarga paginada.
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        limit: Cantidad máxima de registros por página
     """
     logger.info("Comparando smartcards de Panaccess con la base de datos...")
-
-    # Obtener todos los registros existentes de la BD en memoria
     local_data = {
-        obj.sn: obj for obj in ListOfSmartcards.objects.all()
+        obj.sn: obj for obj in ListOfSmartcards.objects.all() if obj.sn
     }
-
     offset = 0
     total_updated = 0
-
+    
     while True:
         response = CallListSmartcards(session_id, offset, limit)
-        remote_cards = response.get("smartcardEntries", [])
-        if not remote_cards:
+        remote_list = response.get("smartcardEntries", [])
+        if not remote_list:
             break
-
-        for remote in remote_cards:
-            sn = remote.get("sn")
+        
+        for remote in remote_list:
+            if not isinstance(remote, dict) or 'sn' not in remote:
+                continue
+            
+            sn = remote.get('sn')
             if not sn or sn not in local_data:
-                continue  # Solo trabajamos con registros ya existentes
-
+                continue
+            
             local_obj = local_data[sn]
             changed_fields = []
-
+            
             for key, val in remote.items():
                 if hasattr(local_obj, key):
                     local_val = getattr(local_obj, key)
-                    if str(local_val) != str(val):
+                    # Comparar valores, manejando None y listas
+                    if isinstance(local_val, list) and isinstance(val, list):
+                        if local_val != val:
+                            setattr(local_obj, key, val)
+                            changed_fields.append(key)
+                    elif str(local_val) != str(val):
                         setattr(local_obj, key, val)
                         changed_fields.append(key)
-
+            
             if changed_fields:
                 try:
                     local_obj.save(update_fields=changed_fields)
@@ -158,136 +179,100 @@ def compare_and_update_all_existing(session_id, limit=100):
                     logger.debug(f"SN {sn} actualizado. Campos: {changed_fields}")
                 except Exception as e:
                     logger.error(f"Error actualizando SN {sn}: {str(e)}")
-
+        
         offset += limit
+        logger.info(f"Procesados {offset} registros, {total_updated} actualizados hasta ahora...")
+    
+    logger.info(f"Actualización completa. Total modificados: {total_updated}")
 
-    logger.info(f"Actualización completa. Total de smartcards modificadas: {total_updated}")
-
-def sync_smartcards(session_id, limit=100):
+def sync_smartcards(session_id=None, limit=100):
     """
-    Sincroniza automáticamente las smartcards:
-    - Si la base está vacía: descarga todos los registros.
-    - Si ya existen registros: descarga nuevos y actualiza cambios.
+    Ejecuta el proceso de sincronización de smartcards:
+    - Si la base está vacía, descarga todos los registros.
+    - Si no, descarga solo los nuevos desde el último sn.
+    
+    Args:
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        limit: Cantidad máxima de registros por página
+    
+    Returns:
+        Resultado de la sincronización
     """
-    logger.info("Sincronización iniciada en modo automático")
+    logger.info("Iniciando sincronización de smartcards")
 
     try:
-
         if DataBaseEmpty():
-            logger.info("Base de datos vacía: descargando todo")
+            logger.info("Base vacía: descarga completa")
             return fetch_all_smartcards(session_id, limit)
         else:
             last = LastSmartcard()
             highest_sn = last.sn if last else None
-            logger.info(f"Base existente: buscando nuevos desde SN {highest_sn} y actualizando cambios")
+            logger.info(f"Último SN: {highest_sn}")
             
-            #*1. Buscar nuevos registros
-            logger.info("Inicio de Descargando smartcards nuevas desde Panaccess...")
+            logger.info("Base existente: descarga incremental + actualización")
+            # 1. Nuevos registros
+            logger.info("Inicio de Descarga de smartcards nuevos desde el último registrado")
             new_result = download_smartcards_since_last(session_id, limit)
-            logger.info(f"Fin descarga de smartcards nuevas completada.")
+            logger.info(f"Fin de Descarga de smartcards nuevos completada.")
             
-            #*2. Actualizar registros existentes
-            logger.info("Inicio de Actualizan de smartcards existentes...")
-            compare_and_update_all_existing(session_id, limit)
-            logger.info("Fin de actualización de smartcards existentes.")
-            
+            # 2. Actualizar existentes
+            logger.info("Inicio de Actualización de smartcards existentes")
+            compare_and_update_all_smartcards(session_id, limit)
+            logger.info("Fin de Actualización de smartcards existentes completada.")
+
             return new_result
 
-    except ConnectionError as ce:
-        logger.error(f"Error de conexión: {str(ce)}")
+    except PanaccessException as e:
+        logger.error(f"Error de PanAccess durante sincronización: {str(e)}")
         raise
-    except ValueError as ve:
-        logger.error(f"Error de valor: {str(ve)}")
+    except (ConnectionError, ValueError) as e:
+        logger.error(f"Error específico durante sincronización: {str(e)}")
         raise
     except Exception as e:
-        logger.error(f"Error inesperado durante la sincronización: {str(e)}")
+        logger.error(f"Error inesperado: {str(e)}", exc_info=True)
         raise
 
-def CallListSmartcards(session_id, offset=0, limit=100, max_retries=3, retry_delay=5):
+def CallListSmartcards(session_id=None, offset=0, limit=100):
     """
-    Llama a la función remota getListOfSmartcards del API Panaccess.
-    Implementa reintentos automáticos con backoff exponencial en caso de errores de conexión.
+    Llama a la API de Panaccess para obtener la lista de smartcards.
     
     Args:
-        session_id: ID de sesión de Panaccess
-        offset: Offset para la paginación
-        limit: Límite de registros por página
-        max_retries: Número máximo de reintentos (default: 3)
-        retry_delay: Tiempo inicial de espera entre reintentos en segundos (default: 5)
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        offset: Índice de inicio para paginación
+        limit: Cantidad máxima de registros a obtener
     
     Returns:
-        Dict con la respuesta de la API
-        
-    Raises:
-        Exception: Si todos los reintentos fallan
+        Diccionario con la respuesta de PanAccess
     """
-    logger.info(f"Llamando a Panaccess API: offset={offset}, limit={limit}")
-    client = CVClient()
-    client.session_id = session_id
-
-    last_exception = None
+    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit}")
     
-    for attempt in range(max_retries):
-        try:
-            # Timeout más largo para operaciones que pueden tardar
-            timeout = 60 if attempt == 0 else 90  # Timeout más largo en reintentos
-            response = client.call('getListOfSmartcards', {
-                'offset': offset,
-                'limit': limit,
-                'orderDir': 'ASC',
-                'orderBy': 'sn'
-            }, timeout=timeout)
+    try:
+        # Usar el singleton de PanAccess
+        panaccess = get_panaccess()
+        
+        # Preparar parámetros
+        parameters = {
+            'offset': offset,
+            'limit': limit,
+            'orderDir': 'ASC',
+            'orderBy': 'sn'
+        }
+        
+        # Hacer la llamada usando el singleton
+        response = panaccess.call('getListOfSmartcards', parameters)
 
-            if response.get('success'):
-                return response.get('answer', {})
-            else:
-                # Intentar obtener el mensaje de error de diferentes campos posibles
-                error_msg = (
-                    response.get('errorMessage') or 
-                    response.get('error') or 
-                    response.get('message') or
-                    f"Error desconocido. Respuesta completa: {response}"
-                )
-                
-                # Si es un error de timeout o conexión, intentar reintentar
-                error_str = str(error_msg).lower()
-                if 'timeout' in error_str or 'connection' in error_str or 'connect' in error_str:
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (2 ** attempt)  # Backoff exponencial
-                        logger.warning(
-                            f"Error de conexión/timeout en intento {attempt + 1}/{max_retries}. "
-                            f"Reintentando en {wait_time} segundos... Error: {error_msg}"
-                        )
-                        time.sleep(wait_time)
-                        continue
-                
-                # Si no es un error de conexión o ya agotamos los reintentos, lanzar excepción
-                raise Exception(error_msg)
+        if response.get('success'):
+            return response.get('answer', {})
+        else:
+            error_message = response.get('errorMessage', 'Error desconocido al obtener smartcards')
+            logger.error(f"Error en respuesta de PanAccess: {error_message}")
+            raise PanaccessAPIError(error_message)
 
-        except Exception as e:
-            last_exception = e
-            error_str = str(e).lower()
-            
-            # Verificar si es un error de conexión/timeout que podemos reintentar
-            if ('timeout' in error_str or 'connection' in error_str or 'connect' in error_str) and attempt < max_retries - 1:
-                wait_time = retry_delay * (2 ** attempt)  # Backoff exponencial
-                logger.warning(
-                    f"Error de conexión/timeout en intento {attempt + 1}/{max_retries} "
-                    f"(offset={offset}). Reintentando en {wait_time} segundos... Error: {str(e)}"
-                )
-                time.sleep(wait_time)
-                continue
-            else:
-                # Si no es un error de conexión o ya agotamos los reintentos, lanzar excepción
-                logger.error(f"Fallo al obtener smartcards (offset={offset}): {str(e)}")
-                raise
-    
-    # Si llegamos aquí, todos los reintentos fallaron
-    logger.error(
-        f"Fallo al obtener smartcards después de {max_retries} intentos "
-        f"(offset={offset}): {str(last_exception)}"
-    )
-    raise Exception(f"Error después de {max_retries} intentos: {str(last_exception)}")
+    except PanaccessException:
+        raise
+    except Exception as e:
+        logger.error(f"Fallo en la llamada a getListOfSmartcards: {str(e)}", exc_info=True)
+        raise
 
 
 def extract_sns_from_smartcards_field(smartcards_data):

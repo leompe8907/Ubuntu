@@ -1038,7 +1038,7 @@ ExecStart=/opt/udid/env/bin/daphne \
     --access-log - \
     --proxy-headers \
     -t 60 \
-    --websocket-timeout 300 \
+    --websocket_timeout 300 \
     ubuntu.asgi:application
 
 # Reinicio automático
@@ -1175,10 +1175,10 @@ sudo journalctl -u udid@0 -f
 
 El proyecto tiene **2 tareas cron** configuradas en `django-cron` con diferentes propósitos:
 
-| Tarea | Frecuencia | Propósito | Duración |
-|-------|------------|-----------|----------|
-| **UpdateSubscribersCronJob** | Cada 5 minutos | Sincronización RÁPIDA de suscriptores, credenciales y asociaciones | Segundos/Minutos |
-| **MergeSyncCronJob** | Diaria a las 00:00 (medianoche) | Sincronización COMPLETA de smartcards, productos, paquetes | Puede tomar horas |
+| Tarea                        | Frecuencia                      | Propósito                                                          | Duración          |
+|------------------------------|---------------------------------|--------------------------------------------------------------------|-------------------|
+| **UpdateSubscribersCronJob** | Cada 5 minutos                  | Sincronización RÁPIDA de suscriptores, credenciales y asociaciones | Segundos/Minutos  |
+| **MergeSyncCronJob**         | Diaria a las 00:00 (medianoche) | Sincronización COMPLETA de smartcards, productos, paquetes         | Puede tomar horas |
 
 **¿Cómo funciona?**
 - `django-cron` **define** las tareas y sus intervalos/horarios internamente
@@ -1265,7 +1265,7 @@ Agregar las siguientes líneas al final:
 0 3 * * * cd /opt/udid && /opt/udid/venv/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
 
 # Limpiar UDIDs expirados (cada hora)
-0 * * * * cd /opt/udid && /opt/udid/venv/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
+0 * * * * cd /opt/udid && /opt/udid/env/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
 
 # Rotación de logs (semanal, domingos a las 4 AM)
 0 4 * * 0 /usr/sbin/logrotate /etc/logrotate.d/udid

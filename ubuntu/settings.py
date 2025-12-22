@@ -16,10 +16,12 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
 
-from config import DjangoConfig
+from config import DjangoConfig, CeleryConfig
 
 # Validar configuración cargada desde DjangoConfig
 DjangoConfig.validate()
+# Validar configuración de Celery (no es estricto, solo advertencias)
+CeleryConfig.validate()
 
 
 # ============================================================================
@@ -61,6 +63,7 @@ INSTALLED_APPS = [
     'django_filters',
     'channels',  # Soporte WebSockets
     'udid',
+    'udid.apps.UdidConfig',
 ]
 
 # ============================================================================
@@ -503,9 +506,10 @@ LOGGING = {
             'class': 'logging.FileHandler',
             'filename': BASE_DIR / 'server.log',
             'formatter': 'verbose',
+            'encoding': 'utf-8',  # Asegurar UTF-8 en archivos de log
         },
         'console': {
-            'class': 'logging.StreamHandler',
+            'class': 'udid.utils.server.logging_handlers.SafeConsoleHandler',
             'formatter': 'verbose',
         },
     },
@@ -536,13 +540,94 @@ import logging.config
 logging.config.dictConfig(LOGGING)
 
 # ============================================================================
-# CRON JOBS
+# CRON JOBS (django-cron - DEPRECADO, migrando a Celery)
 # ============================================================================
 # * Configuración de tareas periódicas con django-cron
+# NOTA: Se está migrando a Celery para mejor escalabilidad y control
 CRON_CLASSES = [
     "udid.cron.UpdateSubscribersCronJob",  # Actualiza información de suscriptores cada 5 minutos (rápido)
     "udid.cron.MergeSyncCronJob",  # Valida y corrige toda la información una vez al día (completo)
 ]
+
+# ============================================================================
+# CELERY CONFIGURATION
+# ============================================================================
+# * Configuración de Celery para tareas asíncronas y periódicas
+# Celery permite ejecutar tareas en background de forma escalable
+
+# Broker: Redis (ya configurado en el proyecto)
+CELERY_BROKER_URL = CeleryConfig.BROKER_URL
+
+# Backend de resultados: Redis (base de datos diferente para evitar conflictos)
+CELERY_RESULT_BACKEND = CeleryConfig.RESULT_BACKEND
+
+# Serialización
+CELERY_TASK_SERIALIZER = CeleryConfig.TASK_SERIALIZER
+CELERY_RESULT_SERIALIZER = CeleryConfig.RESULT_SERIALIZER
+CELERY_ACCEPT_CONTENT = CeleryConfig.ACCEPT_CONTENT
+
+# Timezone
+CELERY_TIMEZONE = CeleryConfig.TIMEZONE
+CELERY_ENABLE_UTC = CeleryConfig.ENABLE_UTC
+
+# Configuración de resultados
+CELERY_RESULT_EXPIRES = CeleryConfig.RESULT_EXPIRES
+CELERY_RESULT_PERSISTENT = CeleryConfig.RESULT_PERSISTENT
+
+# Configuración de tareas
+CELERY_TASK_TRACK_STARTED = CeleryConfig.TASK_TRACK_STARTED
+CELERY_TASK_TIME_LIMIT = CeleryConfig.TASK_TIME_LIMIT
+CELERY_TASK_SOFT_TIME_LIMIT = CeleryConfig.TASK_SOFT_TIME_LIMIT
+CELERY_TASK_ACKS_LATE = CeleryConfig.TASK_ACKS_LATE
+CELERY_TASK_REJECT_ON_WORKER_LOST = CeleryConfig.TASK_REJECT_ON_WORKER_LOST
+
+# Configuración de workers
+CELERY_WORKER_PREFETCH_MULTIPLIER = CeleryConfig.WORKER_PREFETCH_MULTIPLIER
+CELERY_WORKER_MAX_TASKS_PER_CHILD = CeleryConfig.WORKER_MAX_TASKS_PER_CHILD
+CELERY_WORKER_DISABLE_RATE_LIMITS = CeleryConfig.WORKER_DISABLE_RATE_LIMITS
+
+# Configuración de reintentos
+CELERY_TASK_DEFAULT_RETRY_DELAY = CeleryConfig.TASK_DEFAULT_RETRY_DELAY
+CELERY_TASK_MAX_RETRIES = CeleryConfig.TASK_MAX_RETRIES
+
+# Configuración de colas (routing)
+CELERY_TASK_DEFAULT_QUEUE = CeleryConfig.TASK_DEFAULT_QUEUE
+CELERY_TASK_DEFAULT_EXCHANGE = CeleryConfig.TASK_DEFAULT_EXCHANGE
+CELERY_TASK_DEFAULT_ROUTING_KEY = CeleryConfig.TASK_DEFAULT_ROUTING_KEY
+
+# Configuración de beat (tareas periódicas)
+CELERY_BEAT_SCHEDULE_FILENAME = CeleryConfig.BEAT_SCHEDULE_FILENAME
+
+# Configuración de monitoreo (Flower)
+CELERY_FLOWER_PORT = CeleryConfig.FLOWER_PORT
+CELERY_FLOWER_BASIC_AUTH = CeleryConfig.FLOWER_BASIC_AUTH
+
+# Configuración de rutas de tareas (task routing)
+# Permite enviar tareas a colas específicas según su nombre
+CELERY_TASK_ROUTES = {
+    # Tareas de sincronización rápida (cada 5 minutos)
+    'udid.tasks.update_subscribers_task': {'queue': 'fast'},
+    # Tareas de sincronización completa (diaria, puede tomar horas)
+    'udid.tasks.sync_smartcards_task': {'queue': 'slow'},
+    # Tareas por defecto
+    'udid.tasks.*': {'queue': 'default'},
+}
+
+# Configuración de prioridades de colas
+CELERY_TASK_QUEUES = {
+    'default': {
+        'exchange': 'default',
+        'routing_key': 'default',
+    },
+    'fast': {
+        'exchange': 'fast',
+        'routing_key': 'fast',
+    },
+    'slow': {
+        'exchange': 'slow',
+        'routing_key': 'slow',
+    },
+}
 
 # ============================================================================
 # CACHE: Redis distribuido (opcional)

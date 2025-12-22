@@ -1,9 +1,12 @@
 from django_cron import CronJobBase, Schedule
-from .utils.auth  import CVClient
-from .utils.smartcard import sync_smartcards, update_smartcards_from_subscribers
-from .utils.subscriber import sync_subscribers
-from .utils.login import sync_subscriber_logins
-from .utils.subscriberinfo import sync_merge_all_subscribers
+from .utils.panaccess import (
+    CVClient,
+    sync_smartcards,
+    update_smartcards_from_subscribers,
+    sync_subscribers,
+    sync_subscriber_logins,
+    sync_merge_all_subscribers,
+)
 import logging
 
 logger = logging.getLogger(__name__)

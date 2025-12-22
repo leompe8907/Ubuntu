@@ -1,8 +1,10 @@
 import logging
 from django.db import transaction
-from .auth import CVClient
-from ..models import ListOfSubscriber, SubscriberLoginInfo
-from ..serializers import SubscriberLoginInfoSerializer
+from typing import Optional
+from .singleton import get_panaccess
+from .exceptions import PanaccessException, PanaccessAPIError
+from ...models import ListOfSubscriber, SubscriberLoginInfo
+from ...serializers import SubscriberLoginInfoSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +40,12 @@ def get_all_subscriber_codes():
     logger.info(f"Total de códigos válidos obtenidos: {len(codes)}")
     return codes
 
-def fetch_all_logins_from_panaccess(session_id):
+def fetch_all_logins_from_panaccess(session_id=None):
     """
     Recorre todos los códigos de suscriptores y llama a CallSubscriberLoginInfo por cada uno.
 
     Args:
-        session_id (str): Sesión activa de Panaccess.
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
 
     Returns:
         list: Lista de diccionarios con la información de login para cada suscriptor.
@@ -93,12 +95,12 @@ def store_logins_to_db(login_data_list):
     logger.info(f"Total de registros guardados correctamente: {saved_count}")
     return saved_count
 
-def fetch_new_logins_from_panaccess(session_id):
+def fetch_new_logins_from_panaccess(session_id=None):
     """
     Obtiene logins solo para nuevos suscriptores que no están aún en la base de datos.
 
     Args:
-        session_id (str): ID de sesión activa de Panaccess.
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
 
     Returns:
         int: Número de registros guardados correctamente.
@@ -120,7 +122,7 @@ def fetch_new_logins_from_panaccess(session_id):
 
     logger.info(f"Nuevos códigos de suscriptores detectados: {len(new_codes)}")
 
-    # CORRECCIÓN: Filtrar códigos que ya existen en la BD
+    # Filtrar códigos que ya existen en la BD
     existing_codes = set(
         SubscriberLoginInfo.objects.values_list('subscriberCode', flat=True)
     )
@@ -138,18 +140,17 @@ def fetch_new_logins_from_panaccess(session_id):
     logger.info(f"Total de nuevos logins obtenidos correctamente: {len(results)}")
     return store_logins_to_db(results)
 
-def compare_and_update_all_existing(session_id):
+def compare_and_update_all_existing(session_id=None):
     """
     Compara todos los registros de login de Panaccess con la BD y actualiza solo los campos
     que hayan cambiado. No crea nuevos registros.
 
     Args:
-        session_id (str): ID de sesión activo de Panaccess.
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
     """
     logger.info("Comparando logins de suscriptores de Panaccess con la base de datos...")
 
     # Obtener todos los registros existentes de la BD en memoria
-    # Usar el campo correcto según tu modelo (subscriberCode)
     local_data = {
         obj.subscriberCode: obj for obj in SubscriberLoginInfo.objects.all()
         if obj.subscriberCode  # Solo los que tienen código válido
@@ -180,14 +181,17 @@ def compare_and_update_all_existing(session_id):
 
             # Comparar campo por campo
             for key, remote_value in remote_login.items():
-                # Mapear el campo si es necesario (API usa subscriberCode, modelo usa subscriberCode)
                 model_field = key
                 
                 if hasattr(local_obj, model_field):
                     local_value = getattr(local_obj, model_field)
                     
-                    # Comparar valores (convertir a string para evitar problemas de tipo)
-                    if str(local_value) != str(remote_value):
+                    # Comparar valores, manejando None y listas
+                    if isinstance(local_value, list) and isinstance(remote_value, list):
+                        if local_value != remote_value:
+                            setattr(local_obj, model_field, remote_value)
+                            changed_fields.append(model_field)
+                    elif str(local_value) != str(remote_value):
                         setattr(local_obj, model_field, remote_value)
                         changed_fields.append(model_field)
 
@@ -208,12 +212,15 @@ def compare_and_update_all_existing(session_id):
     logger.info(f"Actualización completa. Total procesados: {total_processed}, Total actualizados: {total_updated}")
     return total_updated
 
-def sync_subscriber_logins(session_id):
+def sync_subscriber_logins(session_id=None):
     """
     Sincroniza los logins de suscriptores desde Panaccess hacia la base de datos.
 
     - Si no hay registros en la base ⇒ trae todos.
     - Si ya hay registros           ⇒ trae solo los nuevos y actualiza existentes.
+    
+    Args:
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
     """
     logger.info("Iniciando sincronización de logins de suscriptores...")
 
@@ -238,8 +245,9 @@ def sync_subscriber_logins(session_id):
             
             return new_result
 
-        logger.info("Sincronización finalizada.")
-
+    except PanaccessException as e:
+        logger.error(f"Error de PanAccess durante sincronización: {str(e)}")
+        raise
     except ConnectionError as ce:
         logger.error(f"Error de conexión: {str(ce)}")
         raise
@@ -247,38 +255,46 @@ def sync_subscriber_logins(session_id):
         logger.error(f"Error de valor: {str(ve)}")
         raise
     except Exception as e:
-        logger.error(f"Error inesperado durante la sincronización: {str(e)}")
+        logger.error(f"Error inesperado durante la sincronización: {str(e)}", exc_info=True)
         raise
 
-def CallSubscriberLoginInfo(session_id, subscriber_code):
+def CallSubscriberLoginInfo(session_id=None, subscriber_code=None):
     """
     Llama a la API de Panaccess para obtener las credenciales de los suscriptores.
     
     Args:
-        session_id (str): The session ID.
-        subscriber_code (str): The subscriber code.
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        subscriber_code: Código del suscriptor
         
     Returns:
-        dict: The response.
+        dict: La respuesta con la información de login
     """
     
     logger.info(f"Llamando API Panaccess para obtener credenciales de {subscriber_code}")
-    client = CVClient()
-    client.session_id = session_id
-
+    
     try:
-        response = client.call('getSubscriberLoginInfo', {
+        # Usar el singleton de PanAccess
+        panaccess = get_panaccess()
+        
+        # Preparar parámetros
+        parameters = {
             'subscriberCode': subscriber_code
-        })
+        }
+        
+        # Hacer la llamada usando el singleton
+        response = panaccess.call('getSubscriberLoginInfo', parameters)
 
         if response.get('success'):
             result = response.get('answer', {})
             result['subscriberCode'] = subscriber_code
             return result
         else:
-            error_msg = response.get('errorMessage', 'Error desconocido al obtener suscriptores')
+            error_msg = response.get('errorMessage', 'Error desconocido al obtener credenciales')
             logger.error(f"Error en API para {subscriber_code}: {error_msg}")
             return None
+    except PanaccessException as e:
+        logger.error(f"Error de PanAccess al obtener credenciales de {subscriber_code}: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"Error al obtener credenciales de {subscriber_code}: {str(e)}")
+        logger.error(f"Error inesperado al obtener credenciales de {subscriber_code}: {str(e)}", exc_info=True)
         return None
