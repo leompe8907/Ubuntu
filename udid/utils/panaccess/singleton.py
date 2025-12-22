@@ -40,7 +40,7 @@ class PanaccessSingleton:
     ALERT_AFTER_ATTEMPTS = 3  # Enviar alerta después de X intentos
     
     # Configuración de validación periódica
-    VALIDATION_INTERVAL = 300  # Validar cada 5 minutos (300 segundos)
+    VALIDATION_INTERVAL = 6000  # Validar cada hora (6000 segundos = 1 hora)
     
     def __new__(cls):
         """

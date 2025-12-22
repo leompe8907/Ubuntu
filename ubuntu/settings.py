@@ -62,8 +62,7 @@ INSTALLED_APPS = [
     'django_cron',
     'django_filters',
     'channels',  # Soporte WebSockets
-    'udid',
-    'udid.apps.UdidConfig',
+    'udid.apps.UdidConfig',  # Usar AppConfig para inicialización de PanAccess
 ]
 
 # ============================================================================
@@ -604,28 +603,78 @@ CELERY_FLOWER_BASIC_AUTH = CeleryConfig.FLOWER_BASIC_AUTH
 
 # Configuración de rutas de tareas (task routing)
 # Permite enviar tareas a colas específicas según su nombre
-CELERY_TASK_ROUTES = {
-    # Tareas de sincronización rápida (cada 5 minutos)
-    'udid.tasks.update_subscribers_task': {'queue': 'fast'},
-    # Tareas de sincronización completa (diaria, puede tomar horas)
-    'udid.tasks.sync_smartcards_task': {'queue': 'slow'},
-    # Tareas por defecto
-    'udid.tasks.*': {'queue': 'default'},
-}
+# COMENTADO: Por ahora todas las tareas usan la cola por defecto
+# Se puede descomentar si se necesita usar múltiples colas en el futuro
+# CELERY_TASK_ROUTES = {
+#     # Tareas de sincronización rápida (cada 5 minutos)
+#     'udid.tasks.download_new_subscribers': {'queue': 'fast'},
+#     # Tareas de sincronización completa (diaria, puede tomar horas)
+#     'udid.tasks.validate_and_fix_all_data': {'queue': 'slow'},
+#     'udid.tasks.initial_sync_all_data': {'queue': 'slow'},
+#     # Tareas por defecto
+#     'udid.tasks.*': {'queue': 'default'},
+# }
 
 # Configuración de prioridades de colas
-CELERY_TASK_QUEUES = {
-    'default': {
-        'exchange': 'default',
-        'routing_key': 'default',
+# COMENTADO: Solo se necesita si se usan múltiples colas
+# CELERY_TASK_QUEUES = {
+#     'default': {
+#         'exchange': 'default',
+#         'routing_key': 'default',
+#     },
+#     'fast': {
+#         'exchange': 'fast',
+#         'routing_key': 'fast',
+#     },
+#     'slow': {
+#         'exchange': 'slow',
+#         'routing_key': 'slow',
+#     },
+# }
+
+# Configuración de Beat Schedule (tareas periódicas)
+# Define cuándo se ejecutan las tareas automáticamente
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    # ========================================================================
+    # TAREAS PERIÓDICAS AUTOMÁTICAS
+    # ========================================================================
+    
+    # 1. Descargar nuevos suscriptores cada 5 minutos
+    # Mantiene la base de datos actualizada con nuevos suscriptores y sus credenciales
+    # Frecuencia alta para detectar nuevos registros rápidamente
+    'download-new-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.download_new_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
     },
-    'fast': {
-        'exchange': 'fast',
-        'routing_key': 'fast',
+    
+    # 2. Actualizar todos los suscriptores cada 5 minutos
+    # Actualiza datos existentes de suscriptores, credenciales e información consolidada
+    # Frecuencia alta para mantener datos actualizados en tiempo casi real
+    'update-all-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.update_all_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
     },
-    'slow': {
-        'exchange': 'slow',
-        'routing_key': 'slow',
+    
+    # 3. Actualizar smartcards desde suscriptores cada 5 minutos
+    # Corrige inconsistencias entre ListOfSubscriber y ListOfSmartcards
+    # Frecuencia alta para mantener consistencia entre tablas
+    'update-smartcards-from-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.update_smartcards_from_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
+    },
+    
+    # 4. Validación y corrección completa diaria a las 2:00 AM
+    # Esta tarea sincroniza y valida todos los datos desde Panaccess
+    # Es la tarea más completa y exhaustiva, se ejecuta en horario de bajo tráfico
+    'validate-and-fix-all-data-daily': {
+        'task': 'udid.tasks.validate_and_fix_all_data',
+        'schedule': crontab(hour=2, minute=0),  # 2:00 AM todos los días
+        'options': {'expires': 3600},  # Expira después de 1 hora si no se ejecuta
     },
 }
 
