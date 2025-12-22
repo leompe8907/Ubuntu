@@ -59,7 +59,6 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
-    'django_cron',
     'django_filters',
     'channels',  # Soporte WebSockets
     'udid.apps.UdidConfig',  # Usar AppConfig para inicialización de PanAccess
@@ -539,16 +538,6 @@ import logging.config
 logging.config.dictConfig(LOGGING)
 
 # ============================================================================
-# CRON JOBS (django-cron - DEPRECADO, migrando a Celery)
-# ============================================================================
-# * Configuración de tareas periódicas con django-cron
-# NOTA: Se está migrando a Celery para mejor escalabilidad y control
-CRON_CLASSES = [
-    "udid.cron.UpdateSubscribersCronJob",  # Actualiza información de suscriptores cada 5 minutos (rápido)
-    "udid.cron.MergeSyncCronJob",  # Valida y corrige toda la información una vez al día (completo)
-]
-
-# ============================================================================
 # CELERY CONFIGURATION
 # ============================================================================
 # * Configuración de Celery para tareas asíncronas y periódicas
@@ -560,7 +549,7 @@ CELERY_BROKER_URL = CeleryConfig.BROKER_URL
 # Backend de resultados: Redis (base de datos diferente para evitar conflictos)
 CELERY_RESULT_BACKEND = CeleryConfig.RESULT_BACKEND
 
-# Serialización
+# Serialización (json es más seguro que pickle)
 CELERY_TASK_SERIALIZER = CeleryConfig.TASK_SERIALIZER
 CELERY_RESULT_SERIALIZER = CeleryConfig.RESULT_SERIALIZER
 CELERY_ACCEPT_CONTENT = CeleryConfig.ACCEPT_CONTENT
@@ -569,9 +558,15 @@ CELERY_ACCEPT_CONTENT = CeleryConfig.ACCEPT_CONTENT
 CELERY_TIMEZONE = CeleryConfig.TIMEZONE
 CELERY_ENABLE_UTC = CeleryConfig.ENABLE_UTC
 
+# Configuración de conexión al broker (reintentos automáticos)
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True  # Reconectar automáticamente al iniciar
+CELERY_BROKER_CONNECTION_RETRY = True  # Reintentar conexión si se pierde
+CELERY_BROKER_CONNECTION_MAX_RETRIES = 10  # Máximo de reintentos
+
 # Configuración de resultados
 CELERY_RESULT_EXPIRES = CeleryConfig.RESULT_EXPIRES
 CELERY_RESULT_PERSISTENT = CeleryConfig.RESULT_PERSISTENT
+CELERY_RESULT_EXTENDED = True  # Incluir más información en los resultados
 
 # Configuración de tareas
 CELERY_TASK_TRACK_STARTED = CeleryConfig.TASK_TRACK_STARTED
@@ -579,11 +574,18 @@ CELERY_TASK_TIME_LIMIT = CeleryConfig.TASK_TIME_LIMIT
 CELERY_TASK_SOFT_TIME_LIMIT = CeleryConfig.TASK_SOFT_TIME_LIMIT
 CELERY_TASK_ACKS_LATE = CeleryConfig.TASK_ACKS_LATE
 CELERY_TASK_REJECT_ON_WORKER_LOST = CeleryConfig.TASK_REJECT_ON_WORKER_LOST
+CELERY_TASK_IGNORE_RESULT = False  # Por defecto, guardar resultados (las tareas pueden sobrescribir esto)
+
+# Configuración para desarrollo (SIEMPRE False en producción)
+CELERY_TASK_ALWAYS_EAGER = False  # False = ejecutar en background, True = ejecutar sincrónicamente
+CELERY_TASK_EAGER_PROPAGATES = True  # Propagar excepciones en modo eager
 
 # Configuración de workers
 CELERY_WORKER_PREFETCH_MULTIPLIER = CeleryConfig.WORKER_PREFETCH_MULTIPLIER
 CELERY_WORKER_MAX_TASKS_PER_CHILD = CeleryConfig.WORKER_MAX_TASKS_PER_CHILD
 CELERY_WORKER_DISABLE_RATE_LIMITS = CeleryConfig.WORKER_DISABLE_RATE_LIMITS
+CELERY_WORKER_SEND_TASK_EVENTS = True  # Enviar eventos de tareas (necesario para Flower)
+CELERY_WORKER_DIRECT = False  # Usar AMQP direct (False para Redis)
 
 # Configuración de reintentos
 CELERY_TASK_DEFAULT_RETRY_DELAY = CeleryConfig.TASK_DEFAULT_RETRY_DELAY
@@ -595,42 +597,15 @@ CELERY_TASK_DEFAULT_EXCHANGE = CeleryConfig.TASK_DEFAULT_EXCHANGE
 CELERY_TASK_DEFAULT_ROUTING_KEY = CeleryConfig.TASK_DEFAULT_ROUTING_KEY
 
 # Configuración de beat (tareas periódicas)
-CELERY_BEAT_SCHEDULE_FILENAME = CeleryConfig.BEAT_SCHEDULE_FILENAME
+# Ruta completa para el archivo de schedule de Beat (se guarda en /var/run/udid/)
+CELERY_BEAT_SCHEDULE_FILENAME = os.path.join(
+    os.getenv("CELERY_BEAT_SCHEDULE_DIR", "/var/run/udid"),
+    CeleryConfig.BEAT_SCHEDULE_FILENAME
+)
 
 # Configuración de monitoreo (Flower)
 CELERY_FLOWER_PORT = CeleryConfig.FLOWER_PORT
 CELERY_FLOWER_BASIC_AUTH = CeleryConfig.FLOWER_BASIC_AUTH
-
-# Configuración de rutas de tareas (task routing)
-# Permite enviar tareas a colas específicas según su nombre
-# COMENTADO: Por ahora todas las tareas usan la cola por defecto
-# Se puede descomentar si se necesita usar múltiples colas en el futuro
-# CELERY_TASK_ROUTES = {
-#     # Tareas de sincronización rápida (cada 5 minutos)
-#     'udid.tasks.download_new_subscribers': {'queue': 'fast'},
-#     # Tareas de sincronización completa (diaria, puede tomar horas)
-#     'udid.tasks.validate_and_fix_all_data': {'queue': 'slow'},
-#     'udid.tasks.initial_sync_all_data': {'queue': 'slow'},
-#     # Tareas por defecto
-#     'udid.tasks.*': {'queue': 'default'},
-# }
-
-# Configuración de prioridades de colas
-# COMENTADO: Solo se necesita si se usan múltiples colas
-# CELERY_TASK_QUEUES = {
-#     'default': {
-#         'exchange': 'default',
-#         'routing_key': 'default',
-#     },
-#     'fast': {
-#         'exchange': 'fast',
-#         'routing_key': 'fast',
-#     },
-#     'slow': {
-#         'exchange': 'slow',
-#         'routing_key': 'slow',
-#     },
-# }
 
 # Configuración de Beat Schedule (tareas periódicas)
 # Define cuándo se ejecutan las tareas automáticamente
