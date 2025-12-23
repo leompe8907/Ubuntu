@@ -1705,11 +1705,11 @@ Type=simple
 User=udid
 Group=udid
 WorkingDirectory=/opt/udid
-Environment="PATH=/opt/udid/venv/bin"
+Environment="PATH=/opt/udid/env/bin"
 EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Celery Worker
-ExecStart=/opt/udid/venv/bin/celery -A ubuntu worker \
+ExecStart=/opt/udid/env/bin/celery -A ubuntu worker \
     --loglevel=info \
     --logfile=/var/log/udid/celery-worker.log \
     --pidfile=/var/run/udid/celery-worker.pid
@@ -1759,11 +1759,11 @@ Type=simple
 User=udid
 Group=udid
 WorkingDirectory=/opt/udid
-Environment="PATH=/opt/udid/venv/bin"
+Environment="PATH=/opt/udid/env/bin"
 EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Celery Beat
-ExecStart=/opt/udid/venv/bin/celery -A ubuntu beat \
+ExecStart=/opt/udid/env/bin/celery -A ubuntu beat \
     --loglevel=info \
     --logfile=/var/log/udid/celery-beat.log \
     --pidfile=/var/run/udid/celery-beat.pid \
@@ -1841,7 +1841,7 @@ Type=simple
 User=udid
 Group=udid
 WorkingDirectory=/opt/udid
-Environment="PATH=/opt/udid/venv/bin"
+Environment="PATH=/opt/udid/env/bin"
 EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Flower
@@ -1895,10 +1895,10 @@ Agregar las siguientes líneas:
 # ============================================================================
 
 # Limpiar sesiones expiradas de Django (diario a las 3 AM)
-0 3 * * * cd /opt/udid && /opt/udid/venv/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
+0 3 * * * cd /opt/udid && /opt/udid/env/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
 
 # Limpiar UDIDs expirados (cada hora)
-0 * * * * cd /opt/udid && /opt/udid/venv/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
+0 * * * * cd /opt/udid && /opt/udid/env/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
 
 # Rotación de logs (semanal, domingos a las 4 AM)
 0 4 * * 0 /usr/sbin/logrotate /etc/logrotate.d/udid
@@ -1988,7 +1988,7 @@ grep "validate_and_fix_all_data" /var/log/udid/celery-worker.log | tail -5
 
 ```bash
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 
 # Ver workers activos
 celery -A ubuntu inspect active
@@ -2004,7 +2004,7 @@ celery -A ubuntu inspect stats
 
 ```bash
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 
 # Ejecutar una tarea de prueba manualmente
 python manage.py shell

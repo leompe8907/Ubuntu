@@ -5,6 +5,7 @@ Este módulo proporciona una clase cliente para realizar llamadas a la API
 de Panaccess, manejando automáticamente la autenticación y el sessionId.
 """
 import logging
+import time
 import requests
 from urllib.parse import urlencode
 from typing import Dict, Any, Optional
@@ -30,6 +31,9 @@ class PanaccessClient:
     Proporciona métodos para realizar llamadas a las funciones de la API.
     """
     
+    # Tiempo de vida de sesión (4 horas, con margen de seguridad de 3.5 horas)
+    SESSION_TTL = 3.5 * 3600  # 3.5 horas en segundos
+    
     def __init__(self, base_url: str = None):
         """
         Inicializa el cliente de Panaccess.
@@ -40,6 +44,7 @@ class PanaccessClient:
         PanaccessConfig.validate()
         self.base_url = base_url or PanaccessConfig.PANACCESS
         self.session_id: Optional[str] = None
+        self._session_created_at: Optional[float] = None  # Timestamp de creación de sesión
     
     def authenticate(self) -> str:
         """
@@ -52,35 +57,47 @@ class PanaccessClient:
             PanaccessException: Si hay algún error en la autenticación
         """
         self.session_id = login()
+        self._session_created_at = time.time()  # Guardar timestamp de creación
         return self.session_id
     
     def _ensure_valid_session(self):
         """
-        Asegura que haya una sesión válida.
+        Asegura que haya una sesión válida usando cache basado en tiempo.
         
-        Si no hay sessionId o si el sessionId está caducado,
-        realiza un nuevo login automáticamente.
+        No usa logged_in() porque puede fallar por problemas de permisos
+        aunque la sesión sea válida. En su lugar, usa el tiempo transcurrido
+        desde la creación de la sesión (las sesiones duran 4 horas).
+        
+        Solo refresca si:
+        - No hay sessionId
+        - Han pasado más de 3.5 horas desde la creación
         """
         # Si no hay sessionId, autenticar
         if not self.session_id:
             self.authenticate()
             return
         
-        # Verificar si la sesión sigue siendo válida
-        try:
-            is_valid = logged_in(self.session_id)
-            if not is_valid:
-                # Sesión caducada, refrescar
-                self.authenticate()
-        except (PanaccessConnectionError, PanaccessTimeoutError, PanaccessAPIError):
-            # Si hay error al verificar, intentar refrescar la sesión
-            # (puede ser un problema temporal de red)
-            try:
-                self.authenticate()
-            except Exception:
-                # Si el refresh también falla, limpiar sessionId
-                self.session_id = None
-                raise
+        # Verificar si la sesión es "vieja" según el tiempo transcurrido
+        if self._session_created_at is None:
+            # Si no tenemos timestamp, asumir que es vieja y refrescar
+            logger.debug("🔄 No hay timestamp de sesión en cliente, refrescando...")
+            self.authenticate()
+            return
+        
+        # Calcular tiempo transcurrido desde la creación de la sesión
+        elapsed = time.time() - self._session_created_at
+        
+        if elapsed > self.SESSION_TTL:
+            # Sesión expirada (más de 3.5 horas), refrescar
+            logger.debug(
+                f"🔄 Sesión expirada en cliente ({elapsed/3600:.2f} horas), refrescando..."
+            )
+            self.authenticate()
+        else:
+            # Sesión aún válida según tiempo
+            logger.debug(
+                f"✅ Sesión válida en cliente (creada hace {elapsed/60:.1f} minutos)"
+            )
     
     def call(self, func_name: str, parameters: Dict[str, Any] = None, timeout: int = 60) -> Dict[str, Any]:
         """
@@ -166,10 +183,11 @@ class PanaccessClient:
                 logger.error(f"❌ [call] Llamada a '{func_name}' falló - Error: {error_message}")
                 logger.error(f"❌ [call] Campo 'answer' para '{func_name}': {answer}")
                 
-                # Si el error es de sesión, limpiar sessionId
+                # Si el error es de sesión, limpiar sessionId y timestamp
                 if "session" in error_message.lower() or "logged" in error_message.lower():
                     logger.warning(f"⚠️ [call] Error de sesión detectado para '{func_name}', limpiando sessionId")
                     self.session_id = None
+                    self._session_created_at = None
                     # Retornar el diccionario para compatibilidad, pero también lanzar excepción opcional
                     # El código existente puede manejar el diccionario con success=False
                     # Pero también podemos lanzar excepción si se prefiere manejo por excepciones

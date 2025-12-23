@@ -42,6 +42,9 @@ class PanaccessSingleton:
     # Configuración de validación periódica
     VALIDATION_INTERVAL = 6000  # Validar cada hora (6000 segundos = 1 hora)
     
+    # Configuración de tiempo de vida de sesión
+    SESSION_TTL = 3.5 * 3600  # 3.5 horas en segundos (casi 4 horas, margen de seguridad)
+    
     def __new__(cls):
         """
         Implementa el patrón Singleton con thread-safety.
@@ -67,6 +70,7 @@ class PanaccessSingleton:
         self._last_alert_sent = False
         self._validation_thread = None
         self._stop_validation = threading.Event()
+        self._session_created_at = None  # Timestamp de cuando se creó la sesión actual
         
         logger.info("✅ PanaccessSingleton inicializado")
     
@@ -88,9 +92,10 @@ class PanaccessSingleton:
                 logger.info(f"🔄 Intento de login #{attempt + 1}/{self.MAX_RETRY_ATTEMPTS}")
                 session_id = login()
                 
-                # Login exitoso, resetear contador
+                # Login exitoso, resetear contador y actualizar timestamp
                 self._retry_count = 0
                 self._last_alert_sent = False
+                self._session_created_at = time.time()  # Guardar timestamp de creación
                 logger.info("✅ Login exitoso")
                 return session_id
                 
@@ -167,7 +172,14 @@ class PanaccessSingleton:
         """
         Asegura que haya una sesión válida (thread-safe).
         
-        Si no hay sessionId o está caducado, lo refresca automáticamente.
+        Usa un cache basado en tiempo en lugar de verificar con cvLoggedIn,
+        ya que las sesiones de Panaccess duran 4 horas y la verificación
+        puede fallar por problemas de permisos.
+        
+        Solo refresca si:
+        - No hay sessionId
+        - Han pasado más de 3.5 horas desde la creación (margen de seguridad)
+        
         Solo un thread puede ejecutar el refresh a la vez.
         """
         with self._session_lock:
@@ -175,35 +187,42 @@ class PanaccessSingleton:
             if not self.client.session_id:
                 logger.info("🔑 No hay sesión, autenticando...")
                 self.client.session_id = self._authenticate_with_retry()
+                # _authenticate_with_retry ya actualiza _session_created_at
                 return
             
-            # Verificar si la sesión sigue siendo válida
-            try:
-                is_valid = logged_in(self.client.session_id)
-                if not is_valid:
-                    logger.info("🔄 Sesión caducada, refrescando...")
-                    self.client.session_id = self._authenticate_with_retry()
-                else:
-                    logger.debug("✅ Sesión válida")
-            except (PanaccessConnectionError, PanaccessTimeoutError) as e:
-                # Error al verificar, intentar refrescar
-                logger.warning(f"⚠️ Error al verificar sesión: {str(e)}. Intentando refrescar...")
-                try:
-                    self.client.session_id = self._authenticate_with_retry()
-                except Exception:
-                    # Si el refresh falla, limpiar y lanzar excepción
-                    self.client.session_id = None
-                    raise
+            # Verificar si la sesión es "vieja" según el tiempo transcurrido
+            if self._session_created_at is None:
+                # Si no tenemos timestamp, asumir que es vieja y refrescar
+                logger.info("🔄 No hay timestamp de sesión, refrescando...")
+                self.client.session_id = self._authenticate_with_retry()
+                # _authenticate_with_retry ya actualiza _session_created_at
+                return
+            
+            # Calcular tiempo transcurrido desde la creación de la sesión
+            elapsed = time.time() - self._session_created_at
+            
+            if elapsed > self.SESSION_TTL:
+                # Sesión expirada (más de 3.5 horas), refrescar
+                logger.info(
+                    f"🔄 Sesión expirada ({elapsed/3600:.2f} horas > {self.SESSION_TTL/3600:.2f} horas), "
+                    f"refrescando..."
+                )
+                self.client.session_id = self._authenticate_with_retry()
+                # _authenticate_with_retry ya actualiza _session_created_at
+            else:
+                # Sesión aún válida según tiempo
+                logger.debug(
+                    f"✅ Sesión válida (creada hace {elapsed/60:.1f} minutos, "
+                    f"expira en {(self.SESSION_TTL - elapsed)/60:.1f} minutos)"
+                )
     
     def call(self, func_name: str, parameters: dict = None, timeout: int = 60) -> dict:
         """
         Llama a una función de la API Panaccess (thread-safe).
         
-        Usa el sessionId que está siendo mantenido por la validación periódica.
-        Si por alguna razón no hay sesión, intenta obtenerla (fallback de seguridad).
-        
-        Nota: La validación periódica mantiene la sesión activa automáticamente,
-        por lo que normalmente no será necesario validar aquí.
+        Asegura que haya una sesión válida antes de cada llamada usando
+        el cache basado en tiempo (no verifica con cvLoggedIn que puede
+        fallar por permisos).
         
         Args:
             func_name: Nombre de la función a llamar
@@ -216,12 +235,10 @@ class PanaccessSingleton:
         Raises:
             PanaccessException: Si hay algún error
         """
-        # Fallback de seguridad: si no hay sesión, intentar obtenerla
-        # (normalmente la validación periódica ya la mantiene activa)
+        # Asegurar sesión válida antes de cada llamada (excepto login)
+        # Usa cache basado en tiempo en lugar de verificar con cvLoggedIn
         if func_name != 'login' and func_name != 'cvLoggedIn':
-            if not self.client.session_id:
-                logger.warning("⚠️ No hay sesión activa, obteniendo una...")
-                self.ensure_session()
+            self.ensure_session()
         
         # Usar el cliente para hacer la llamada
         # El cliente ya tiene el sessionId y lo agregará automáticamente
@@ -242,13 +259,15 @@ class PanaccessSingleton:
         """
         with self._session_lock:
             self.client.session_id = None
+            self._session_created_at = None  # Limpiar también el timestamp
             logger.info("🔄 Sesión reseteada manualmente")
     
     def _periodic_validation(self):
         """
         Thread en background que valida periódicamente si la sesión está activa.
         
-        Si la sesión está caducada, la refresca automáticamente.
+        Usa el cache basado en tiempo para verificar si la sesión necesita refrescarse.
+        Si la sesión está caducada (más de 3.5 horas), la refresca automáticamente.
         Este thread se ejecuta cada VALIDATION_INTERVAL segundos.
         """
         logger.info(f"🔄 Thread de validación periódica iniciado (intervalo: {self.VALIDATION_INTERVAL}s)")
@@ -261,7 +280,8 @@ class PanaccessSingleton:
                     break
                 
                 # Validar y refrescar si es necesario (thread-safe)
-                logger.debug("🔍 Validando sesión periódicamente...")
+                # ensure_session() usa el cache basado en tiempo
+                logger.debug("🔍 Validando sesión periódicamente (basado en tiempo)...")
                 self.ensure_session()
                 logger.debug("✅ Validación periódica completada")
                 
