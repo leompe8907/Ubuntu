@@ -216,7 +216,7 @@ class PanaccessSingleton:
                     f"expira en {(self.SESSION_TTL - elapsed)/60:.1f} minutos)"
                 )
     
-    def call(self, func_name: str, parameters: dict = None, timeout: int = 60) -> dict:
+    def call(self, func_name: str, parameters: dict = None, timeout: Optional[int] = 60) -> dict:
         """
         Llama a una función de la API Panaccess (thread-safe).
         
@@ -227,7 +227,7 @@ class PanaccessSingleton:
         Args:
             func_name: Nombre de la función a llamar
             parameters: Parámetros de la función
-            timeout: Timeout en segundos
+            timeout: Timeout en segundos (None = sin timeout, default: 60)
         
         Returns:
             Respuesta de la API

@@ -849,7 +849,7 @@ cd /opt/udid
 
 ```bash
 # Clonar repositorio
-git clone https://tu-repositorio.git .
+git clone https://github.com/leompe8907/Ubuntu .
 
 # O si es privado
 git clone https://usuario:token@tu-repositorio.git .
@@ -1159,7 +1159,7 @@ Guardar y salir.
 ```bash
 # Asegurarse de estar en el directorio correcto con el venv activado
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 
 # Verificar configuración
 python manage.py check
@@ -1675,7 +1675,7 @@ Celery ya está incluido en `requirements.txt`, pero verifiquemos que se instal�
 ```bash
 # Activar entorno virtual
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 
 # Verificar que Celery está instalado
 celery --version

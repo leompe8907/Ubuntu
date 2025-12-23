@@ -69,7 +69,7 @@ class CVClient:
         Args:
             func_name: Nombre de la función a llamar
             parameters: Diccionario con los parámetros
-            timeout: Timeout en segundos para la conexión (default: 60)
+            timeout: Timeout en segundos para la conexión (None = sin timeout, default: 60)
         """
         url = f"{self.base_url}?f={func_name}&requestMode=function"
 
@@ -80,7 +80,7 @@ class CVClient:
         param_string = urlencode(parameters)
 
         try:
-            response = requests.post(url, data=param_string, headers=headers, timeout=timeout)
+            response = requests.post(url, data=param_string, headers=headers, timeout=timeout)  # None = sin timeout
             response.raise_for_status()  # lanza error si el status code es 4xx/5xx
             return response.json()
         except requests.exceptions.Timeout as e:

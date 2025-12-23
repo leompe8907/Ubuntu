@@ -99,7 +99,7 @@ class PanaccessClient:
                 f"✅ Sesión válida en cliente (creada hace {elapsed/60:.1f} minutos)"
             )
     
-    def call(self, func_name: str, parameters: Dict[str, Any] = None, timeout: int = 60) -> Dict[str, Any]:
+    def call(self, func_name: str, parameters: Dict[str, Any] = None, timeout: Optional[int] = 60) -> Dict[str, Any]:
         """
         Llama a una función remota del API Panaccess.
         
@@ -109,7 +109,7 @@ class PanaccessClient:
         Args:
             func_name: Nombre de la función a llamar (ej: 'getListOfSmartcards')
             parameters: Diccionario con los parámetros de la función
-            timeout: Timeout en segundos para la conexión (default: 60)
+            timeout: Timeout en segundos para la conexión (None = sin timeout, default: 60)
         
         Returns:
             Diccionario con la respuesta de la API
@@ -143,17 +143,18 @@ class PanaccessClient:
         param_string = urlencode(parameters)
         
         # Log de la petición
+        timeout_msg = "sin límite" if timeout is None else f"{timeout}s"
         logger.info(f"📞 [call] Llamando función '{func_name}' - URL: {url}")
         logger.info(f"📞 [call] Parámetros: {log_parameters}")
         logger.debug(f"📞 [call] Headers: {headers}")
-        logger.debug(f"📞 [call] Timeout: {timeout}s")
+        logger.debug(f"📞 [call] Timeout: {timeout_msg}")
         
         try:
             response = requests.post(
                 url,
                 data=param_string,
                 headers=headers,
-                timeout=timeout
+                timeout=timeout  # None = sin timeout, esperará indefinidamente
             )
             
             # Log del status code
@@ -205,10 +206,11 @@ class PanaccessClient:
             return json_response
             
         except requests.exceptions.Timeout:
-            logger.error(f"⏱️ [call] Timeout al llamar a '{func_name}' ({timeout} segundos)")
+            timeout_msg = "sin límite" if timeout is None else f"{timeout} segundos"
+            logger.error(f"⏱️ [call] Timeout al llamar a '{func_name}' ({timeout_msg})")
             raise PanaccessTimeoutError(
                 f"Timeout al llamar a {func_name}. "
-                f"El servidor no respondió en {timeout} segundos."
+                f"El servidor no respondió en {timeout_msg}."
             )
         except requests.exceptions.ConnectionError as e:
             logger.error(f"🔌 [call] Error de conexión al llamar a '{func_name}': {str(e)}")

@@ -118,8 +118,9 @@ def initial_sync_all_data(self):
         logger.info("📥 [INITIAL_SYNC] Paso 2/4: Descargando todas las smartcards...")
         try:
             # Usar fetch_all_smartcards directamente para forzar descarga completa
+            # timeout=None para deshabilitar timeout (puede tardar horas con muchos registros)
             from .utils.panaccess.smartcard import fetch_all_smartcards
-            smartcards_result = fetch_all_smartcards(session_id=None, limit=100)
+            smartcards_result = fetch_all_smartcards(session_id=None, limit=100, timeout=None)
             result['steps']['smartcards'] = {
                 'success': True,
                 'message': 'Smartcards descargadas correctamente',

@@ -28,15 +28,16 @@ def LastSmartcard():
         logger.warning("No se encontraron smartcards en la base de datos.")
         return None
 
-def fetch_all_smartcards(session_id=None, limit=100):
+def fetch_all_smartcards(session_id=None, limit=100, timeout=None):
     """
     Descarga todos los smartcards desde Panaccess y los almacena en la base de datos.
     
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
+        timeout: Timeout en segundos (ignorado, siempre usa timeout=None para sin límite)
     """
-    logger.info("Iniciando descarga completa de smartcards desde Panaccess...")
+    logger.info("Iniciando descarga completa de smartcards desde Panaccess (sin timeout)...")
     offset = 0
     all_data = []
     
@@ -244,7 +245,7 @@ def CallListSmartcards(session_id=None, offset=0, limit=100):
     Returns:
         Diccionario con la respuesta de PanAccess
     """
-    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit}")
+    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit} (sin timeout)")
     
     try:
         # Usar el singleton de PanAccess
@@ -258,8 +259,9 @@ def CallListSmartcards(session_id=None, offset=0, limit=100):
             'orderBy': 'sn'
         }
         
-        # Hacer la llamada usando el singleton
-        response = panaccess.call('getListOfSmartcards', parameters)
+        # Hacer la llamada usando el singleton SIN timeout (None)
+        # Esto permite que la llamada espere indefinidamente hasta que Panaccess responda
+        response = panaccess.call('getListOfSmartcards', parameters, timeout=None)
 
         if response.get('success'):
             return response.get('answer', {})

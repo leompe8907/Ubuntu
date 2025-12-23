@@ -324,7 +324,7 @@ def CallListSubscribers(session_id=None, offset=0, limit=100):
     Returns:
         Diccionario con la respuesta de PanAccess
     """
-    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit}")
+    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit} (sin timeout)")
     
     try:
         # Usar el singleton de PanAccess
@@ -338,8 +338,9 @@ def CallListSubscribers(session_id=None, offset=0, limit=100):
             'orderBy': 'code'
         }
         
-        # Hacer la llamada usando el singleton
-        response = panaccess.call('getListOfSubscribers', parameters)
+        # Hacer la llamada usando el singleton SIN timeout (None)
+        # Esto permite que la llamada espere indefinidamente hasta que Panaccess responda
+        response = panaccess.call('getListOfSubscribers', parameters, timeout=None)
 
         if response.get('success'):
             return response.get('answer', {})

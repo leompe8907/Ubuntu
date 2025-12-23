@@ -228,14 +228,13 @@ def CallListSmartcards(session_id, offset=0, limit=100, max_retries=3, retry_del
     
     for attempt in range(max_retries):
         try:
-            # Timeout más largo para operaciones que pueden tardar
-            timeout = 60 if attempt == 0 else 90  # Timeout más largo en reintentos
+            # Sin timeout para permitir que la llamada dure lo que necesite
             response = client.call('getListOfSmartcards', {
                 'offset': offset,
                 'limit': limit,
                 'orderDir': 'ASC',
                 'orderBy': 'sn'
-            }, timeout=timeout)
+            }, timeout=None)
 
             if response.get('success'):
                 return response.get('answer', {})
