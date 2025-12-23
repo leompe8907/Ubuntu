@@ -1819,7 +1819,211 @@ sudo systemctl status celery-worker
 sudo systemctl status celery-beat
 ```
 
-### 12.6 (Opcional) Configurar Flower para Monitoreo
+### 12.6 Ejecutar Sincronización Inicial de Datos (IMPORTANTE)
+
+> ⚠️ **IMPORTANTE:** Antes de que las tareas periódicas comiencen a ejecutarse, es necesario ejecutar la tarea `initial_sync_all_data` para poblar la base de datos con todos los datos desde Panaccess. Esta tarea debe ejecutarse **UNA SOLA VEZ** cuando la base de datos está vacía o cuando necesitas una sincronización completa inicial.
+
+**¿Por qué es necesario?**
+- Las tareas periódicas (`download_new_subscribers`, `update_all_subscribers`, etc.) asumen que ya hay datos en la base de datos
+- `initial_sync_all_data` descarga TODOS los datos desde Panaccess (suscriptores, smartcards, credenciales)
+- Esta tarea puede tomar varias horas si hay muchos registros (ej: 10,000+ smartcards)
+- Una vez completada, las tareas periódicas mantendrán los datos actualizados
+
+**¿Cuándo ejecutarla?**
+- ✅ Primera vez que despliegas el sistema
+- ✅ Cuando la base de datos está vacía
+- ✅ Después de una migración completa de datos
+- ❌ NO ejecutarla periódicamente (solo cuando sea necesario)
+
+#### Método 1: Ejecutar desde el Shell de Django (Recomendado)
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+
+# Activar entorno virtual
+source env/bin/activate
+
+# Abrir shell de Django
+python manage.py shell
+```
+
+Dentro del shell de Python, ejecutar:
+
+```python
+from udid.tasks import initial_sync_all_data
+
+# Ejecutar la tarea de forma asíncrona (recomendado)
+# Esto la ejecuta en background usando Celery
+task = initial_sync_all_data.delay()
+
+# Ver el ID de la tarea
+print(f"Task ID: {task.id}")
+print(f"Estado: {task.state}")
+
+# IMPORTANTE: La tarea se ejecuta en background
+# Puedes salir del shell y la tarea continuará ejecutándose
+# Para verificar el progreso, usar Flower o los logs
+
+# Salir del shell
+exit()
+```
+
+#### Método 2: Ejecutar desde la Línea de Comandos
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+
+# Activar entorno virtual
+source env/bin/activate
+
+# Ejecutar la tarea directamente desde Python
+python -c "
+from udid.tasks import initial_sync_all_data
+task = initial_sync_all_data.delay()
+print(f'Task ID: {task.id}')
+print('Tarea iniciada. Verifica el progreso con:')
+print('  - Flower: http://IP_DEL_SERVIDOR:5555')
+print('  - Logs: tail -f /var/log/udid/celery-worker.log')
+"
+```
+
+#### Método 3: Ejecutar de Forma Síncrona (Solo para Pruebas)
+
+> ⚠️ **Nota:** Este método bloquea la terminal hasta que la tarea termine. Solo usar para pruebas o si necesitas ver el resultado inmediatamente.
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+
+# Activar entorno virtual
+source env/bin/activate
+
+# Ejecutar de forma síncrona (bloquea hasta completar)
+python manage.py shell -c "
+from udid.tasks import initial_sync_all_data
+result = initial_sync_all_data()
+print('Resultado:', result)
+"
+```
+
+#### Verificar el Progreso de la Tarea
+
+**Opción 1: Usar Flower (Recomendado)**
+
+```bash
+# Acceder a Flower en el navegador
+# http://IP_DEL_SERVIDOR:5555
+# Usuario/contraseña: admin/admin (o el configurado en .env)
+
+# Buscar la tarea por ID o nombre: initial_sync_all_data
+# Verás el estado: PENDING → STARTED → SUCCESS/FAILURE
+```
+
+**Opción 2: Ver Logs del Worker**
+
+```bash
+# Ver logs en tiempo real
+sudo tail -f /var/log/udid/celery-worker.log
+
+# O usando journalctl
+sudo journalctl -u celery-worker -f
+
+# Buscar mensajes específicos de la tarea
+grep "INITIAL_SYNC" /var/log/udid/celery-worker.log | tail -20
+```
+
+**Opción 3: Verificar desde la Línea de Comandos**
+
+```bash
+cd /opt/udid
+source env/bin/activate
+
+# Ver tareas activas
+celery -A ubuntu inspect active
+
+# Ver estadísticas
+celery -A ubuntu inspect stats
+```
+
+#### Verificar que la Sincronización se Completó
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+source env/bin/activate
+
+# Verificar que hay datos en la base de datos
+python manage.py shell
+```
+
+Dentro del shell:
+
+```python
+# Verificar suscriptores
+from udid.models import ListOfSubscriber
+print(f"Suscriptores: {ListOfSubscriber.objects.count()}")
+
+# Verificar smartcards
+from udid.models import ListOfSmartcards
+print(f"Smartcards: {ListOfSmartcards.objects.count()}")
+
+# Verificar credenciales
+from udid.models import SubscriberLoginInfo
+print(f"Credenciales: {SubscriberLoginInfo.objects.count()}")
+
+# Verificar tabla consolidada
+from udid.models import SubscriberInfo
+print(f"SubscriberInfo: {SubscriberInfo.objects.count()}")
+
+exit()
+```
+
+**Si los conteos son mayores a 0**, la sincronización inicial fue exitosa. Ahora las tareas periódicas pueden mantener los datos actualizados.
+
+#### Solución de Problemas
+
+**La tarea no inicia:**
+
+```bash
+# Verificar que Celery Worker está corriendo
+sudo systemctl status celery-worker
+
+# Si no está corriendo, iniciarlo
+sudo systemctl start celery-worker
+
+# Ver logs de errores
+sudo journalctl -u celery-worker -n 50
+```
+
+**La tarea falla con errores de autenticación:**
+
+```bash
+# Verificar que las credenciales de Panaccess están correctas en .env
+cat /opt/udid/.env | grep -E "(url_panaccess|username|password|api_token)"
+
+# Verificar que puedes conectarte a Panaccess
+# (revisar logs para ver el error específico)
+```
+
+**La tarea tarda mucho tiempo:**
+- Esto es normal si hay muchos registros (10,000+ smartcards pueden tomar 8-9 horas)
+- Verificar el progreso en Flower o en los logs
+- No interrumpir la tarea, dejar que complete
+
+**Verificar que la tarea se completó correctamente:**
+
+```bash
+# Buscar en los logs el mensaje de finalización
+grep "INITIAL_SYNC.*finalizada\|completada\|success" /var/log/udid/celery-worker.log | tail -5
+```
+
+### 12.7 (Opcional) Configurar Flower para Monitoreo
 
 Flower es una interfaz web para monitorear Celery:
 
@@ -1846,7 +2050,7 @@ EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Flower
 # Cambiar usuario:contraseña en basic_auth si lo configuraste en .env
-ExecStart=/opt/udid/venv/bin/celery -A ubuntu flower \
+ExecStart=/opt/udid/env/bin/celery -A ubuntu flower \
     --port=5555 \
     --basic_auth=${CELERY_FLOWER_BASIC_AUTH:-admin:admin} \
     --logfile=/var/log/udid/celery-flower.log
@@ -1876,7 +2080,7 @@ sudo systemctl enable celery-flower
 # Usuario/contraseña por defecto: admin/admin (cambiar en .env)
 ```
 
-### 12.7 Configurar Crontab para Tareas de Mantenimiento
+### 12.8 Configurar Crontab para Tareas de Mantenimiento
 
 Aunque Celery maneja las tareas principales, algunas tareas de mantenimiento se ejecutan con crontab:
 
@@ -1906,7 +2110,7 @@ Agregar las siguientes líneas:
 
 Guardar y salir.
 
-### 12.8 Configurar Rotación de Logs
+### 12.9 Configurar Rotación de Logs
 
 ```bash
 # Crear configuración de logrotate
@@ -1946,7 +2150,7 @@ Copiar el siguiente contenido:
 
 Guardar y salir.
 
-### 12.9 Verificar que Celery está Funcionando
+### 12.10 Verificar que Celery está Funcionando
 
 #### Método 1: Verificar servicios systemd
 
@@ -2031,7 +2235,7 @@ print(f"Estado: {result.state}")
 exit()
 ```
 
-### 12.10 Diferencias entre las Tareas de Celery
+### 12.11 Diferencias entre las Tareas de Celery
 
 | Tarea                                | Frecuencia     | Propósito                                  | Duración          |
 |--------------------------------------|----------------|----------------------------------------------------------------|
@@ -2040,7 +2244,7 @@ exit()
 | `update_smartcards_from_subscribers` | Cada 5 min     | Actualiza asociaciones de smartcards       | Segundos/Minutos  |
 | `validate_and_fix_all_data`          | Diaria 2:00 AM | Sincronización completa y validación       | Puede tomar horas |
 
-### 12.11 Comandos Útiles de Celery
+### 12.12 Comandos Útiles de Celery
 
 ```bash
 # Ver workers activos
