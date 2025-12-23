@@ -13,7 +13,7 @@
 9. [Configuración de Nginx](#9-configuración-de-nginx)
 10. [Configuración de SSL/HTTPS](#10-configuración-de-sslhttps)
 11. [Configuración de Systemd](#11-configuración-de-systemd)
-12. [Configuración de Cron Jobs](#12-configuración-de-cron-jobs)
+12. [Configuración de Celery (Tareas Automáticas)](#12-configuración-de-celery-tareas-automáticas)
 13. [Verificación y Pruebas](#13-verificación-y-pruebas)
 14. [Mantenimiento y Monitoreo](#14-mantenimiento-y-monitoreo)
 15. [Solución de Problemas](#15-solución-de-problemas)
@@ -89,14 +89,459 @@ Workers = (2 × CPU cores) + 1
 
 ## 2. Preparación del Servidor
 
-### 2.1 Acceder al Servidor
+### 2.1 Configurar SSH en el Servidor
 
-Conectarse por SSH al servidor Ubuntu:
+> **⚠️ IMPORTANTE:** Esta sección es para cuando tienes acceso físico o por consola al servidor (VPS, servidor dedicado, máquina virtual). Si estás usando un servicio en la nube (AWS, DigitalOcean, etc.), SSH generalmente ya viene configurado.
+
+#### ¿Necesitas configurar SSH?
+
+Si puedes conectarte físicamente al servidor o tienes acceso por consola (KVM, VNC, etc.), sigue estos pasos para habilitar SSH.
+
+#### Paso 1: Verificar si SSH está Instalado
 
 ```bash
-# Desde tu computadora local (Windows PowerShell, Terminal de Mac/Linux)
+# Verificar si el servicio SSH está instalado y corriendo
+sudo systemctl status ssh
+
+# O en algunas versiones de Ubuntu:
+sudo systemctl status sshd
+```
+
+**Si ves "active (running)"**: SSH ya está funcionando, puedes saltar al Paso 4.
+
+**Si ves "Unit ssh.service could not be found"**: Necesitas instalar SSH.
+
+#### Paso 2: Instalar OpenSSH Server
+
+```bash
+# Actualizar lista de paquetes
+sudo apt update
+
+# Instalar OpenSSH Server
+sudo apt install -y openssh-server
+
+# Verificar instalación
+sudo systemctl status ssh
+```
+
+#### Paso 3: Configurar SSH (Opcional pero Recomendado)
+
+```bash
+# Editar configuración de SSH
+sudo nano /etc/ssh/sshd_config
+```
+
+**Configuraciones recomendadas para producción:**
+
+```conf
+# Permitir autenticación por contraseña (cambiar a 'no' si solo usas claves SSH)
+PasswordAuthentication yes
+
+# Permitir autenticación por clave pública (recomendado)
+PubkeyAuthentication yes
+
+# Deshabilitar login como root directamente (más seguro)
+# Cambiar 'yes' a 'no' si quieres forzar login con usuario normal
+PermitRootLogin yes
+
+# Puerto SSH (por defecto 22, cambiar si quieres más seguridad)
+Port 22
+
+# Tiempo de inactividad antes de desconectar (segundos)
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Máximo de intentos de login
+MaxAuthTries 3
+
+# Deshabilitar protocolos antiguos e inseguros
+Protocol 2
+```
+
+**Guardar cambios:** `Ctrl + X`, luego `Y`, luego `Enter`
+
+#### Paso 4: Habilitar e Iniciar el Servicio SSH
+
+```bash
+# Habilitar SSH para que inicie automáticamente al arrancar
+sudo systemctl enable ssh
+
+# Iniciar el servicio SSH
+sudo systemctl start ssh
+
+# Verificar que está corriendo
+sudo systemctl status ssh
+```
+
+**Deberías ver:**
+```
+● ssh.service - OpenBSD Secure Shell server
+     Loaded: loaded (/lib/systemd/system/ssh.service; enabled; vendor preset: enabled)
+     Active: active (running) since ...
+```
+
+#### Paso 5: Configurar Firewall (UFW)
+
+Si tienes un firewall activo, necesitas permitir el tráfico SSH:
+
+```bash
+# Verificar si UFW está activo
+sudo ufw status
+
+# Si está inactivo, puedes activarlo (opcional)
+# sudo ufw enable
+
+# Permitir conexiones SSH (IMPORTANTE: hacer esto ANTES de activar el firewall)
+sudo ufw allow ssh
+# O específicamente el puerto 22:
+sudo ufw allow 22/tcp
+
+# Si cambiaste el puerto SSH (ejemplo: 2222), permitir ese puerto:
+# sudo ufw allow 2222/tcp
+
+# Verificar reglas
+sudo ufw status numbered
+```
+
+**⚠️ ADVERTENCIA CRÍTICA:**
+- **NUNCA** actives el firewall sin permitir SSH primero
+- Si bloqueas SSH sin tener acceso físico, perderás acceso al servidor
+- Si ya activaste el firewall y perdiste acceso, necesitarás acceso físico/consola
+
+#### Paso 6: Verificar que SSH Funciona
+
+**Desde el mismo servidor:**
+
+```bash
+# Verificar que el servicio está escuchando en el puerto 22
+sudo ss -tlnp | grep :22
+
+# Deberías ver algo como:
+# LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1234,fd=3))
+```
+
+**Obtener la IP del servidor:**
+
+```bash
+# Ver IP del servidor
+ip addr show
+# O más simple:
+hostname -I
+
+# Verificar conectividad
+ping -c 3 8.8.8.8
+```
+
+#### Paso 7: Probar Conexión SSH (Desde Otra Máquina)
+
+**Desde tu computadora local:**
+
+```bash
+# Intentar conectar
 ssh usuario@IP_DEL_SERVIDOR
 
+# Ejemplo:
+ssh root@192.168.1.100
+```
+
+**Si funciona correctamente:**
+- Te pedirá la contraseña del usuario
+- Después de ingresarla, deberías ver el prompt del servidor
+
+#### Solución de Problemas
+
+**SSH no inicia:**
+
+```bash
+# Ver logs de errores
+sudo journalctl -u ssh -n 50
+
+# Verificar configuración
+sudo sshd -t
+
+# Reiniciar servicio
+sudo systemctl restart ssh
+```
+
+**No puedes conectarte desde fuera:**
+
+1. **Verificar firewall:**
+   ```bash
+   sudo ufw status
+   sudo iptables -L -n  # Ver reglas de iptables
+   ```
+
+2. **Verificar que SSH está escuchando:**
+   ```bash
+   sudo ss -tlnp | grep :22
+   ```
+
+3. **Verificar red/router:**
+   - Si es servidor local: verificar que el router permite conexiones SSH
+   - Si es VPS: verificar reglas de firewall del proveedor (AWS Security Groups, etc.)
+
+4. **Verificar que el puerto está abierto:**
+   ```bash
+   # Desde otra máquina en la misma red
+   telnet IP_DEL_SERVIDOR 22
+   # O:
+   nc -zv IP_DEL_SERVIDOR 22
+   ```
+
+**Error "Connection refused":**
+- SSH no está corriendo o el puerto está bloqueado
+- Verificar: `sudo systemctl status ssh`
+
+**Error "Permission denied":**
+- Usuario o contraseña incorrectos
+- Verificar que el usuario existe: `getent passwd usuario`
+
+#### Seguridad Adicional (Opcional pero Recomendado)
+
+**Cambiar puerto SSH (más seguridad):**
+
+```bash
+# Editar configuración
+sudo nano /etc/ssh/sshd_config
+
+# Cambiar:
+Port 2222  # Usar un puerto diferente (ejemplo: 2222)
+
+# Reiniciar SSH
+sudo systemctl restart ssh
+
+# Permitir nuevo puerto en firewall
+sudo ufw allow 2222/tcp
+```
+
+**Deshabilitar login root (más seguro):**
+
+```bash
+# Crear usuario normal con sudo
+sudo adduser nuevo_usuario
+sudo usermod -aG sudo nuevo_usuario
+
+# Editar SSH
+sudo nano /etc/ssh/sshd_config
+# Cambiar: PermitRootLogin no
+
+# Reiniciar SSH
+sudo systemctl restart ssh
+```
+
+---
+
+### 2.2 Conectarse al Servidor por SSH
+
+#### ¿Qué es SSH?
+
+**SSH (Secure Shell)** es un protocolo que te permite conectarte de forma segura a un servidor remoto desde tu computadora local. Es la forma estándar de administrar servidores Linux/Ubuntu.
+
+#### Requisitos Previos
+
+Antes de conectarte, necesitas:
+- **IP del servidor** o **dominio** (ejemplo: `192.168.1.100` o `servidor.midominio.com`)
+- **Usuario** con permisos de administrador (normalmente `root` o un usuario con `sudo`)
+- **Contraseña** o **clave SSH** para autenticación
+- **Puerto SSH** (por defecto es `22`)
+
+#### Método 1: Conexión con Contraseña (Más Simple)
+
+**Desde Windows (PowerShell o CMD):**
+
+```powershell
+# Conectar al servidor
+ssh usuario@IP_DEL_SERVIDOR
+
+# Ejemplo con IP:
+ssh root@192.168.1.100
+
+# Ejemplo con dominio:
+ssh root@servidor.midominio.com
+
+# Si el puerto SSH no es el 22 (por defecto):
+ssh -p 2222 usuario@IP_DEL_SERVIDOR
+```
+
+**Desde Mac/Linux (Terminal):**
+
+```bash
+# Conectar al servidor
+ssh usuario@IP_DEL_SERVIDOR
+
+# Ejemplo:
+ssh root@192.168.1.100
+
+# Si el puerto SSH no es el 22:
+ssh -p 2222 usuario@IP_DEL_SERVIDOR
+```
+
+**Primera conexión:**
+- La primera vez que te conectes, verás un mensaje sobre la autenticidad del host
+- Escribe `yes` y presiona Enter
+- Ingresa tu contraseña cuando se solicite (no verás caracteres mientras escribes, es normal)
+
+#### Método 2: Conexión con Clave SSH (Más Seguro)
+
+**Ventajas:**
+- ✅ Más seguro (no necesitas contraseña cada vez)
+- ✅ Recomendado para producción
+- ✅ Puedes automatizar scripts
+
+**Paso 1: Generar clave SSH (si no tienes una)**
+
+**En Windows (PowerShell):**
+
+```powershell
+# Generar clave SSH
+ssh-keygen -t ed25519 -C "tu_email@ejemplo.com"
+
+# O si ed25519 no está disponible:
+ssh-keygen -t rsa -b 4096 -C "tu_email@ejemplo.com"
+
+# Presiona Enter para usar la ubicación por defecto
+# Ingresa una contraseña (opcional pero recomendado)
+```
+
+**En Mac/Linux:**
+
+```bash
+# Generar clave SSH
+ssh-keygen -t ed25519 -C "tu_email@ejemplo.com"
+
+# O si ed25519 no está disponible:
+ssh-keygen -t rsa -b 4096 -C "tu_email@ejemplo.com"
+```
+
+**Paso 2: Copiar la clave pública al servidor**
+
+**Opción A: Usando ssh-copy-id (Mac/Linux):**
+
+```bash
+# Copiar clave al servidor
+ssh-copy-id usuario@IP_DEL_SERVIDOR
+
+# Ejemplo:
+ssh-copy-id root@192.168.1.100
+```
+
+**Opción B: Manual (Windows/Mac/Linux):**
+
+```bash
+# 1. Ver tu clave pública
+cat ~/.ssh/id_ed25519.pub
+# O si usaste RSA:
+cat ~/.ssh/id_rsa.pub
+
+# 2. Copiar el contenido completo (desde "ssh-ed25519" hasta el final)
+
+# 3. Conectarte al servidor con contraseña
+ssh usuario@IP_DEL_SERVIDOR
+
+# 4. En el servidor, crear directorio .ssh si no existe
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# 5. Agregar tu clave pública
+nano ~/.ssh/authorized_keys
+# Pegar el contenido de tu clave pública aquí
+# Guardar: Ctrl + X, luego Y, luego Enter
+
+# 6. Ajustar permisos
+chmod 600 ~/.ssh/authorized_keys
+```
+
+**Paso 3: Conectarte con la clave**
+
+```bash
+# Ahora puedes conectarte sin contraseña
+ssh usuario@IP_DEL_SERVIDOR
+```
+
+#### Solución de Problemas Comunes
+
+**Error: "Connection refused" o "Connection timed out"**
+
+```bash
+# Verificar que el servidor esté encendido y accesible
+ping IP_DEL_SERVIDOR
+
+# Verificar que el puerto SSH esté abierto
+telnet IP_DEL_SERVIDOR 22
+# O usar:
+nc -zv IP_DEL_SERVIDOR 22
+```
+
+**Error: "Permission denied (publickey)"**
+
+```bash
+# Verificar permisos de la clave
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+
+# Verificar que la clave esté en el servidor
+ssh usuario@IP_DEL_SERVIDOR "cat ~/.ssh/authorized_keys"
+```
+
+**Error: "Host key verification failed"**
+
+```bash
+# Eliminar la entrada antigua del archivo known_hosts
+ssh-keygen -R IP_DEL_SERVIDOR
+```
+
+**No puedes conectarte desde Windows**
+
+- Asegúrate de tener **OpenSSH** instalado (Windows 10/11 lo incluye por defecto)
+- Si no funciona, instala **PuTTY** o **MobaXterm** como alternativa
+
+#### Verificar Conexión Exitosa
+
+Una vez conectado, deberías ver algo como:
+
+```bash
+Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-xx-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+Last login: Mon Dec 19 10:30:45 2024 from 192.168.1.50
+root@servidor:~#
+```
+
+**Comandos útiles para verificar:**
+
+```bash
+# Ver información del sistema
+uname -a
+
+# Ver versión de Ubuntu
+lsb_release -a
+
+# Ver uso de recursos
+free -h        # Memoria
+df -h          # Disco
+uptime         # Tiempo activo y carga
+```
+
+#### Desconectarse
+
+```bash
+# Para desconectarte del servidor
+exit
+
+# O simplemente presiona:
+Ctrl + D
+```
+
+---
+
+### 2.3 Actualizar el Sistema (Primer Paso Después de Conectar)
+
+Una vez conectado por SSH, lo primero que debes hacer es actualizar el sistema:
+
+```bash
 # Ejemplo:
 ssh sw4@192.168.1.100
 ```
@@ -1588,12 +2033,12 @@ exit()
 
 ### 12.10 Diferencias entre las Tareas de Celery
 
-| Tarea | Frecuencia | Propósito | Duración |
-|-------|------------|-----------|----------|
-| `download_new_subscribers` | Cada 5 min | Descarga solo suscriptores nuevos | Segundos/Minutos |
-| `update_all_subscribers` | Cada 5 min | Actualiza datos de suscriptores existentes | Segundos/Minutos |
-| `update_smartcards_from_subscribers` | Cada 5 min | Actualiza asociaciones de smartcards | Segundos/Minutos |
-| `validate_and_fix_all_data` | Diaria 2:00 AM | Sincronización completa y validación | Puede tomar horas |
+| Tarea                                | Frecuencia     | Propósito                                  | Duración          |
+|--------------------------------------|----------------|----------------------------------------------------------------|
+| `download_new_subscribers`           | Cada 5 min     | Descarga solo suscriptores nuevos          | Segundos/Minutos  |
+| `update_all_subscribers`             | Cada 5 min     | Actualiza datos de suscriptores existentes | Segundos/Minutos  |
+| `update_smartcards_from_subscribers` | Cada 5 min     | Actualiza asociaciones de smartcards       | Segundos/Minutos  |
+| `validate_and_fix_all_data`          | Diaria 2:00 AM | Sincronización completa y validación       | Puede tomar horas |
 
 ### 12.11 Comandos Útiles de Celery
 
