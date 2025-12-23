@@ -10,10 +10,10 @@ from .util import (
     release_global_semaphore,
     check_plan_rate_limit
 )
-from .utils.metrics import record_request_latency, record_error, get_metrics
+from .utils.server.metrics import record_request_latency, record_error, get_metrics
 from .models import APIKey
-from .utils.request_queue import get_request_queue
-from .utils.degradation import get_degradation_manager, should_degrade
+from .utils.server.request_queue import get_request_queue
+from .utils.server.degradation import get_degradation_manager, should_degrade
 import uuid
 
 

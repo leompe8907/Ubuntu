@@ -5,7 +5,7 @@ Uso: python manage.py check_redis
 from django.core.management.base import BaseCommand
 from django.conf import settings
 from django.core.cache import cache
-from udid.utils.redis_ha import (
+from udid.utils.server.redis_ha import (
     get_redis_client_safe,
     is_redis_available,
     get_circuit_breaker_state

@@ -16,10 +16,12 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
 
-from config import DjangoConfig
+from config import DjangoConfig, CeleryConfig
 
 # Validar configuración cargada desde DjangoConfig
 DjangoConfig.validate()
+# Validar configuración de Celery (no es estricto, solo advertencias)
+CeleryConfig.validate()
 
 
 # ============================================================================
@@ -57,10 +59,9 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'corsheaders',
     'rest_framework',
-    'django_cron',
     'django_filters',
     'channels',  # Soporte WebSockets
-    'udid',
+    'udid.apps.UdidConfig',  # Usar AppConfig para inicialización de PanAccess
 ]
 
 # ============================================================================
@@ -503,9 +504,10 @@ LOGGING = {
             'class': 'logging.FileHandler',
             'filename': BASE_DIR / 'server.log',
             'formatter': 'verbose',
+            'encoding': 'utf-8',  # Asegurar UTF-8 en archivos de log
         },
         'console': {
-            'class': 'logging.StreamHandler',
+            'class': 'udid.utils.server.logging_handlers.SafeConsoleHandler',
             'formatter': 'verbose',
         },
     },
@@ -536,13 +538,120 @@ import logging.config
 logging.config.dictConfig(LOGGING)
 
 # ============================================================================
-# CRON JOBS
+# CELERY CONFIGURATION
 # ============================================================================
-# * Configuración de tareas periódicas con django-cron
-CRON_CLASSES = [
-    "udid.cron.UpdateSubscribersCronJob",  # Actualiza información de suscriptores cada 5 minutos (rápido)
-    "udid.cron.MergeSyncCronJob",  # Valida y corrige toda la información una vez al día (completo)
-]
+# * Configuración de Celery para tareas asíncronas y periódicas
+# Celery permite ejecutar tareas en background de forma escalable
+
+# Broker: Redis (ya configurado en el proyecto)
+CELERY_BROKER_URL = CeleryConfig.BROKER_URL
+
+# Backend de resultados: Redis (base de datos diferente para evitar conflictos)
+CELERY_RESULT_BACKEND = CeleryConfig.RESULT_BACKEND
+
+# Serialización (json es más seguro que pickle)
+CELERY_TASK_SERIALIZER = CeleryConfig.TASK_SERIALIZER
+CELERY_RESULT_SERIALIZER = CeleryConfig.RESULT_SERIALIZER
+CELERY_ACCEPT_CONTENT = CeleryConfig.ACCEPT_CONTENT
+
+# Timezone
+CELERY_TIMEZONE = CeleryConfig.TIMEZONE
+CELERY_ENABLE_UTC = CeleryConfig.ENABLE_UTC
+
+# Configuración de conexión al broker (reintentos automáticos)
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True  # Reconectar automáticamente al iniciar
+CELERY_BROKER_CONNECTION_RETRY = True  # Reintentar conexión si se pierde
+CELERY_BROKER_CONNECTION_MAX_RETRIES = 10  # Máximo de reintentos
+
+# Configuración de resultados
+CELERY_RESULT_EXPIRES = CeleryConfig.RESULT_EXPIRES
+CELERY_RESULT_PERSISTENT = CeleryConfig.RESULT_PERSISTENT
+CELERY_RESULT_EXTENDED = True  # Incluir más información en los resultados
+
+# Configuración de tareas
+CELERY_TASK_TRACK_STARTED = CeleryConfig.TASK_TRACK_STARTED
+CELERY_TASK_TIME_LIMIT = CeleryConfig.TASK_TIME_LIMIT
+CELERY_TASK_SOFT_TIME_LIMIT = CeleryConfig.TASK_SOFT_TIME_LIMIT
+CELERY_TASK_ACKS_LATE = CeleryConfig.TASK_ACKS_LATE
+CELERY_TASK_REJECT_ON_WORKER_LOST = CeleryConfig.TASK_REJECT_ON_WORKER_LOST
+CELERY_TASK_IGNORE_RESULT = False  # Por defecto, guardar resultados (las tareas pueden sobrescribir esto)
+
+# Configuración para desarrollo (SIEMPRE False en producción)
+CELERY_TASK_ALWAYS_EAGER = False  # False = ejecutar en background, True = ejecutar sincrónicamente
+CELERY_TASK_EAGER_PROPAGATES = True  # Propagar excepciones en modo eager
+
+# Configuración de workers
+CELERY_WORKER_PREFETCH_MULTIPLIER = CeleryConfig.WORKER_PREFETCH_MULTIPLIER
+CELERY_WORKER_MAX_TASKS_PER_CHILD = CeleryConfig.WORKER_MAX_TASKS_PER_CHILD
+CELERY_WORKER_DISABLE_RATE_LIMITS = CeleryConfig.WORKER_DISABLE_RATE_LIMITS
+CELERY_WORKER_SEND_TASK_EVENTS = True  # Enviar eventos de tareas (necesario para Flower)
+CELERY_WORKER_DIRECT = False  # Usar AMQP direct (False para Redis)
+
+# Configuración de reintentos
+CELERY_TASK_DEFAULT_RETRY_DELAY = CeleryConfig.TASK_DEFAULT_RETRY_DELAY
+CELERY_TASK_MAX_RETRIES = CeleryConfig.TASK_MAX_RETRIES
+
+# Configuración de colas (routing)
+CELERY_TASK_DEFAULT_QUEUE = CeleryConfig.TASK_DEFAULT_QUEUE
+CELERY_TASK_DEFAULT_EXCHANGE = CeleryConfig.TASK_DEFAULT_EXCHANGE
+CELERY_TASK_DEFAULT_ROUTING_KEY = CeleryConfig.TASK_DEFAULT_ROUTING_KEY
+
+# Configuración de beat (tareas periódicas)
+# Ruta completa para el archivo de schedule de Beat (se guarda en /var/run/udid/)
+CELERY_BEAT_SCHEDULE_FILENAME = os.path.join(
+    os.getenv("CELERY_BEAT_SCHEDULE_DIR", "/var/run/udid"),
+    CeleryConfig.BEAT_SCHEDULE_FILENAME
+)
+
+# Configuración de monitoreo (Flower)
+CELERY_FLOWER_PORT = CeleryConfig.FLOWER_PORT
+CELERY_FLOWER_BASIC_AUTH = CeleryConfig.FLOWER_BASIC_AUTH
+
+# Configuración de Beat Schedule (tareas periódicas)
+# Define cuándo se ejecutan las tareas automáticamente
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    # ========================================================================
+    # TAREAS PERIÓDICAS AUTOMÁTICAS
+    # ========================================================================
+    
+    # 1. Descargar nuevos suscriptores cada 5 minutos
+    # Mantiene la base de datos actualizada con nuevos suscriptores y sus credenciales
+    # Frecuencia alta para detectar nuevos registros rápidamente
+    'download-new-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.download_new_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
+    },
+    
+    # 2. Actualizar todos los suscriptores cada 5 minutos
+    # Actualiza datos existentes de suscriptores, credenciales e información consolidada
+    # Frecuencia alta para mantener datos actualizados en tiempo casi real
+    'update-all-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.update_all_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
+    },
+    
+    # 3. Actualizar smartcards desde suscriptores cada 5 minutos
+    # Corrige inconsistencias entre ListOfSubscriber y ListOfSmartcards
+    # Frecuencia alta para mantener consistencia entre tablas
+    'update-smartcards-from-subscribers-every-5-minutes': {
+        'task': 'udid.tasks.update_smartcards_from_subscribers',
+        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
+    },
+    
+    # 4. Validación y corrección completa diaria a las 2:00 AM
+    # Esta tarea sincroniza y valida todos los datos desde Panaccess
+    # Es la tarea más completa y exhaustiva, se ejecuta en horario de bajo tráfico
+    'validate-and-fix-all-data-daily': {
+        'task': 'udid.tasks.validate_and_fix_all_data',
+        'schedule': crontab(hour=2, minute=0),  # 2:00 AM todos los días
+        'options': {'expires': 3600},  # Expira después de 1 hora si no se ejecuta
+    },
+}
 
 # ============================================================================
 # CACHE: Redis distribuido (opcional)

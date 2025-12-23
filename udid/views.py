@@ -35,8 +35,8 @@ from .util import (
     get_client_token, check_token_bucket_lua
 )
 from .models import UDIDAuthRequest, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
-from .utils.log_buffer import log_audit_async
-from .utils.metrics import get_metrics, reset_metrics
+from .utils.server.log_buffer import log_audit_async
+from .utils.server.metrics import get_metrics, reset_metrics
 from .cron import execute_sync_tasks
 
 logger = logging.getLogger(__name__)

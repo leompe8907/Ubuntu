@@ -1,9 +1,17 @@
-from django_cron import CronJobBase, Schedule
-from .utils.auth  import CVClient
-from .utils.smartcard import sync_smartcards, update_smartcards_from_subscribers
-from .utils.subscriber import sync_subscribers
-from .utils.login import sync_subscriber_logins
-from .utils.subscriberinfo import sync_merge_all_subscribers
+"""
+Funciones de sincronización reutilizables.
+
+NOTA: Las tareas periódicas ahora se ejecutan con Celery Beat (ver ubuntu/settings.py CELERY_BEAT_SCHEDULE).
+Estas funciones se mantienen para ejecución manual desde views.py.
+"""
+from .utils.panaccess import (
+    CVClient,
+    sync_smartcards,
+    update_smartcards_from_subscribers,
+    sync_subscribers,
+    sync_subscriber_logins,
+    sync_merge_all_subscribers,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -367,172 +375,8 @@ def execute_update_subscribers():
     return result
 
 
-class MergeSyncCronJob(CronJobBase):
-    """
-    CronJob para sincronización completa y validación de toda la información.
-    
-    QUÉ HACE:
-    Esta tarea realiza una sincronización COMPLETA de todos los datos desde Panaccess:
-    - Smartcards completas (productos, paquetes, estado, etc.)
-    - Suscriptores completos
-    - Credenciales de login completas
-    - Tabla consolidada SubscriberInfo
-    - Asociación de smartcards con suscriptores
-    
-    CÓMO LO HACE:
-    Comportamiento inteligente según el estado de la base de datos:
-    
-    PRIMERA EJECUCIÓN (Base de datos vacía):
-    - Detecta automáticamente que no hay registros
-    - Descarga TODOS los datos desde Panaccess (descarga completa inicial)
-    - Crea todos los registros en las tablas correspondientes
-    - Genera la tabla consolidada SubscriberInfo
-    
-    EJECUCIONES SIGUIENTES (Base de datos con datos):
-    - Descarga NUEVOS registros que no existen en la BD
-    - VALIDA y COMPARA cada registro existente con Panaccess
-    - ACTUALIZA automáticamente los registros que han cambiado
-    - Sincroniza smartcards completas (productos, paquetes, estado) desde Panaccess
-    - Valida y actualiza la asociación de smartcards con suscriptores
-    - Mantiene sincronizada la tabla consolidada SubscriberInfo
-    
-    PROCESO PASO A PASO:
-    1. Ejecuta execute_sync_tasks() que:
-       - Autentica con Panaccess
-       - Sincroniza smartcards completas (puede tomar horas con muchos registros)
-       - Sincroniza suscriptores
-       - Sincroniza credenciales de login
-       - Hace merge en SubscriberInfo
-    
-    2. Actualiza smartcards desde suscriptores:
-       - Asegura que la asociación subscriberCode esté correcta
-       - Crea/actualiza smartcards basándose en la información de suscriptores
-    
-    FRECUENCIA:
-    - Se ejecuta una vez al día a las 00:00 (medianoche)
-    - Razón: Puede tomar varias horas con grandes volúmenes de datos (8-9 horas con 10,000 smartcards)
-    - Es una tarea de validación y corrección completa
-    - Se ejecuta en horario de bajo tráfico para no afectar el rendimiento del sistema
-    
-    DIFERENCIA CON UpdateSubscribersCronJob:
-    - Esta tarea sincroniza smartcards COMPLETAS desde Panaccess (productos, paquetes, etc.)
-    - UpdateSubscribersCronJob solo actualiza la asociación (más rápido, cada 5 minutos)
-    - Esta tarea asegura que toda la información esté 100% correcta y sincronizada
-    
-    IMPORTANTE:
-    Esta tarea asegura que toda la información esté correcta y sincronizada con Panaccess.
-    Es la tarea de validación y corrección completa del sistema.
-    """
-    # Programar para ejecutarse a las 00:00 (medianoche) todos los días
-    schedule = Schedule(run_at_times=['00:00'])
-    code = 'udid.sync_smartcards_cron'
-
-    def do(self):
-        """
-        Método principal que se ejecuta cuando el cron job se activa.
-        
-        QUÉ HACE:
-        - Ejecuta la sincronización completa de todos los datos
-        - Valida y corrige toda la información comparándola con Panaccess
-        - Asegura que la asociación de smartcards con suscriptores esté correcta
-        
-        CÓMO LO HACE:
-        1. Llama a execute_sync_tasks() para sincronización completa
-        2. Actualiza smartcards desde suscriptores para validar asociaciones
-        3. Registra el resultado en los logs
-        """
-        logger.info("[MERGE_SYNC] Iniciando validación y corrección completa de información")
-        
-        # Ejecuta la sincronización completa de todos los datos
-        # Esta función maneja automáticamente si es primera vez o ejecución siguiente
-        result = execute_sync_tasks()
-        
-        # Además, actualizar smartcards desde suscriptores para asegurar asociación correcta
-        # Esto valida que la relación entre smartcards y suscriptores esté correcta
-        try:
-            logger.info("[MERGE_SYNC] Validando asociación de smartcards con suscriptores")
-            update_result = update_smartcards_from_subscribers()
-            logger.info(f"[MERGE_SYNC] Asociación validada: {update_result.get('total_smartcards_created', 0)} creadas, {update_result.get('total_smartcards_updated', 0)} actualizadas")
-        except Exception as e:
-            logger.error(f"[MERGE_SYNC] Error validando asociación smartcards-suscriptores: {str(e)}", exc_info=True)
-        
-        logger.info("[MERGE_SYNC] Validación y corrección completa finalizada")
-        return result
-
-
-class UpdateSubscribersCronJob(CronJobBase):
-    """
-    CronJob para actualización rápida y frecuente de suscriptores y datos relacionados.
-    
-    QUÉ HACE:
-    Esta tarea realiza una actualización RÁPIDA de:
-    - Suscriptores (información de clientes)
-    - Credenciales de login de suscriptores
-    - Smartcards asociadas a suscriptores (solo asociación, NO productos/paquetes completos)
-    - Tabla consolidada SubscriberInfo (merge de toda la información)
-    
-    CÓMO LO HACE:
-    Proceso optimizado para ejecutarse frecuentemente:
-    
-    1. Sincronización de Suscriptores:
-       - Si BD vacía: Descarga TODOS los suscriptores
-       - Si BD con datos: Descarga nuevos Y actualiza existentes
-       - Compara y actualiza: código, nombre, dirección, smartcards asociadas, etc.
-    
-    2. Sincronización de Credenciales:
-       - Si BD vacía: Descarga TODAS las credenciales
-       - Si BD con datos: Descarga nuevas Y actualiza existentes
-       - Compara y actualiza: username, password, subscriberCode, etc.
-    
-    3. Actualización de Smartcards desde Suscriptores:
-       - Lee el campo 'smartcards' (JSON) de cada suscriptor
-       - Extrae los números de serie (SN) de las smartcards asociadas
-       - Crea/actualiza registros en ListOfSmartcards con la asociación al suscriptor
-       - IMPORTANTE: NO descarga productos/paquetes completos desde Panaccess
-       - Ventaja: Es MUY rápido (segundos) vs. 8-9 horas de sincronización completa
-    
-    4. Merge en SubscriberInfo:
-       - Consolida toda la información en la tabla SubscriberInfo
-       - Esta tabla se usa para validar UDIDs en tiempo real
-    
-    FRECUENCIA:
-    - Se ejecuta cada 5 minutos
-    - Razón: Mantener los datos actualizados para que los usuarios puedan asociar UDIDs rápidamente
-    - Es una tarea rápida (segundos/minutos) vs. horas de sincronización completa
-    
-    DIFERENCIA CON MergeSyncCronJob:
-    - Esta tarea NO sincroniza smartcards completas desde Panaccess (productos, paquetes, etc.)
-    - Solo actualiza la asociación de smartcards con suscriptores (más rápido)
-    - MergeSyncCronJob sí sincroniza smartcards completas (más lento, una vez al día)
-    - Esta tarea es suficiente para asociar UDIDs cuando un usuario se registra
-    
-    NOTA IMPORTANTE:
-    No sincroniza smartcards completas desde Panaccess aquí porque con 10,000 smartcards
-    puede tomar 8-9 horas. La actualización desde suscriptores es más rápida y suficiente
-    para asociar UDIDs. Para sincronizar productos/paquetes completos, usar MergeSyncCronJob
-    (diaria) o ejecución manual.
-    
-    VENTAJA:
-    Permite que cuando un usuario se registre y quiera asociar un UDID, la información
-    esté actualizada (máximo 5 minutos de retraso) sin tener que esperar la sincronización
-    completa diaria.
-    """
-    RUN_EVERY_MINS = 5  # Cada 5 minutos
-    schedule = Schedule(run_every_mins=RUN_EVERY_MINS)
-    code = 'udid.update_subscribers_cron'
-
-    def do(self):
-        """
-        Método principal que se ejecuta cuando el cron job se activa.
-        
-        QUÉ HACE:
-        - Ejecuta la actualización rápida de suscriptores y datos relacionados
-        - Mantiene la información actualizada para validación de UDIDs
-        
-        CÓMO LO HACE:
-        - Llama a execute_update_subscribers() que maneja todo el proceso
-        - Esta función es rápida y optimizada para ejecutarse frecuentemente
-        """
-        # Usar la función reutilizable que maneja toda la lógica de actualización
-        execute_update_subscribers()
+# NOTA: Las clases CronJob fueron eliminadas porque las tareas periódicas ahora se ejecutan
+# con Celery Beat (ver ubuntu/settings.py CELERY_BEAT_SCHEDULE).
+# Las funciones execute_sync_tasks() y execute_update_subscribers() se mantienen
+# para ejecución manual desde views.py.
 

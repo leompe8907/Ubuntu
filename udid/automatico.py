@@ -14,7 +14,7 @@ import json
 import logging
 
 from udid.models import UDIDAuthRequest, ListOfSubscriber, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
-from udid.utils.log_buffer import log_audit_async
+from udid.utils.server.log_buffer import log_audit_async
 from udid.util import (
     generate_device_fingerprint,
     check_device_fingerprint_rate_limit,

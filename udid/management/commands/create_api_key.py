@@ -5,7 +5,7 @@ Uso: python manage.py create_api_key --tenant <tenant_name> --plan <plan_name> [
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 from udid.models import Tenant, Plan, APIKey
-from udid.utils.token_signing import generate_simple_api_key
+from udid.utils.server.token_signing import generate_simple_api_key
 import secrets
 
 

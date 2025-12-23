@@ -95,10 +95,25 @@ sudo nano /etc/systemd/system/udid@.service
 sudo systemctl daemon-reload
 ```
 
-### 12. Iniciar Todo
+### 12. Configurar Celery (Tareas Automáticas)
 ```bash
-sudo systemctl enable postgresql redis-server nginx
-sudo systemctl start postgresql redis-server nginx
+# Crear servicios systemd para Celery
+sudo nano /etc/systemd/system/celery-worker.service
+sudo nano /etc/systemd/system/celery-beat.service
+# Copiar configuración de la guía completa
+
+# Crear directorios necesarios
+sudo mkdir -p /var/run/udid /var/log/udid
+sudo chown udid:udid /var/run/udid /var/log/udid
+
+# Recargar systemd
+sudo systemctl daemon-reload
+```
+
+### 13. Iniciar Todo
+```bash
+sudo systemctl enable postgresql redis-server nginx celery-worker celery-beat
+sudo systemctl start postgresql redis-server nginx celery-worker celery-beat
 for i in 0 1 2 3; do sudo systemctl enable udid@$i && sudo systemctl start udid@$i; done
 ```
 
@@ -114,6 +129,8 @@ for i in 0 1 2 3; do sudo systemctl enable udid@$i && sudo systemctl start udid@
 | **Ver estado**      | `sudo systemctl status udid@0`       |
 | **Ver logs**        | `sudo journalctl -u udid@0 -f`       |
 | **Reiniciar Nginx** | `sudo systemctl restart nginx`       |
+| **Reiniciar Celery**| `sudo systemctl restart celery-worker celery-beat` |
+| **Ver Celery**      | `sudo journalctl -u celery-worker -f` |
 | **Ver puertos**     | `sudo ss -tlnp \| grep 800`          |
 
 ---
@@ -143,10 +160,10 @@ for i in 0 1 2 3; do sudo systemctl enable udid@$i && sudo systemctl start udid@
 
 ```bash
 # Verificar servicios
-sudo systemctl status postgresql redis-server nginx udid@0
+sudo systemctl status postgresql redis-server nginx udid@0 celery-worker celery-beat
 
 # Verificar puertos
-sudo ss -tlnp | grep -E '(80|443|8000|5432|6379)'
+sudo ss -tlnp | grep -E '(80|443|8000|5432|6379|5555)'
 
 # Probar API
 curl -k https://localhost/health
@@ -167,6 +184,7 @@ psql -h localhost -U udid_user -d udid -c "SELECT 1;"
 | **502 Bad Gateway**       | `sudo systemctl restart udid@{0..3}`                          |
 | **PostgreSQL no conecta** | `sudo systemctl restart postgresql`                           |
 | **Redis no conecta**      | `sudo systemctl restart redis-server`                         |
+| **Celery no ejecuta**     | `sudo systemctl restart celery-worker celery-beat`            |
 | **Permisos**              | `sudo chown -R udid:udid /opt/udid`                           |
 | **ModuleNotFound**        | `source venv/bin/activate && pip install -r requirements.txt` |
 
@@ -196,38 +214,54 @@ password=              # Password Panaccess
 api_token=             # Token API Panaccess
 salt=                  # Salt Panaccess
 ENCRYPTION_KEY=        # 32 caracteres para AES-256
+CELERY_BROKER_URL=     # redis://localhost:6379/0
+CELERY_RESULT_BACKEND= # redis://localhost:6379/1
+CELERY_TIMEZONE=       # UTC
+CELERY_FLOWER_PORT=    # 5555 (opcional)
+CELERY_FLOWER_BASIC_AUTH= # admin:admin (opcional)
 ```
 
 ---
 
-## ⏰ Tareas Cron (Sincronización Automática)
+## ⏰ Tareas Automáticas con Celery
 
-### Configurar Crontab
+### Configurar Celery
 
 ```bash
-# Editar crontab
-sudo -u udid crontab -e
-
-# Agregar esta línea (ejecutar cada 5 minutos):
-*/5 * * * * /opt/udid/run_cron.sh
+# Los servicios de Celery ya están configurados en el paso 12
+# Verificar que están activos:
+sudo systemctl status celery-worker celery-beat
 ```
 
 ### Tareas Automáticas del Sistema
 
 | Tarea | Frecuencia | Propósito |
 |-------|------------|-----------|
-| `UpdateSubscribersCronJob` | Cada 5 min | Sincronización rápida (suscriptores, credenciales) |
-| `MergeSyncCronJob` | Diaria a las 00:00 | Sincronización completa (smartcards, productos) |
+| `download_new_subscribers` | Cada 5 min | Descarga solo suscriptores nuevos |
+| `update_all_subscribers` | Cada 5 min | Actualiza datos de suscriptores existentes |
+| `update_smartcards_from_subscribers` | Cada 5 min | Actualiza asociaciones de smartcards |
+| `validate_and_fix_all_data` | Diaria 2:00 AM | Sincronización completa y validación |
 
 ### Verificar Ejecución
 
 ```bash
-# Ver logs de cron
-tail -f /var/log/udid/cron.log
+# Ver logs de Celery Worker
+sudo journalctl -u celery-worker -f
+tail -f /var/log/udid/celery-worker.log
 
-# Ver historial en Django
+# Ver logs de Celery Beat
+sudo journalctl -u celery-beat -f
+tail -f /var/log/udid/celery-beat.log
+
+# Ver tareas activas
 cd /opt/udid && source venv/bin/activate
-python manage.py shell -c "from django_cron.models import CronJobLog; [print(f'{l.code} | {l.start_time} | OK:{l.is_success}') for l in CronJobLog.objects.order_by('-end_time')[:10]]"
+celery -A ubuntu inspect active
+
+# Ver estadísticas
+celery -A ubuntu inspect stats
+
+# Acceder a Flower (si está configurado)
+# http://IP_DEL_SERVIDOR:5555
 ```
 
 ---
@@ -250,6 +284,7 @@ python manage.py collectstatic --noinput
 
 # 4. Reiniciar servicios
 sudo systemctl start udid@{0..3}
+sudo systemctl restart celery-worker celery-beat
 sudo systemctl restart nginx
 ```
 

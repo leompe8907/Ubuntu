@@ -13,7 +13,7 @@
 9. [Configuración de Nginx](#9-configuración-de-nginx)
 10. [Configuración de SSL/HTTPS](#10-configuración-de-sslhttps)
 11. [Configuración de Systemd](#11-configuración-de-systemd)
-12. [Configuración de Cron Jobs](#12-configuración-de-cron-jobs)
+12. [Configuración de Celery (Tareas Automáticas)](#12-configuración-de-celery-tareas-automáticas)
 13. [Verificación y Pruebas](#13-verificación-y-pruebas)
 14. [Mantenimiento y Monitoreo](#14-mantenimiento-y-monitoreo)
 15. [Solución de Problemas](#15-solución-de-problemas)
@@ -89,14 +89,459 @@ Workers = (2 × CPU cores) + 1
 
 ## 2. Preparación del Servidor
 
-### 2.1 Acceder al Servidor
+### 2.1 Configurar SSH en el Servidor
 
-Conectarse por SSH al servidor Ubuntu:
+> **⚠️ IMPORTANTE:** Esta sección es para cuando tienes acceso físico o por consola al servidor (VPS, servidor dedicado, máquina virtual). Si estás usando un servicio en la nube (AWS, DigitalOcean, etc.), SSH generalmente ya viene configurado.
+
+#### ¿Necesitas configurar SSH?
+
+Si puedes conectarte físicamente al servidor o tienes acceso por consola (KVM, VNC, etc.), sigue estos pasos para habilitar SSH.
+
+#### Paso 1: Verificar si SSH está Instalado
 
 ```bash
-# Desde tu computadora local (Windows PowerShell, Terminal de Mac/Linux)
+# Verificar si el servicio SSH está instalado y corriendo
+sudo systemctl status ssh
+
+# O en algunas versiones de Ubuntu:
+sudo systemctl status sshd
+```
+
+**Si ves "active (running)"**: SSH ya está funcionando, puedes saltar al Paso 4.
+
+**Si ves "Unit ssh.service could not be found"**: Necesitas instalar SSH.
+
+#### Paso 2: Instalar OpenSSH Server
+
+```bash
+# Actualizar lista de paquetes
+sudo apt update
+
+# Instalar OpenSSH Server
+sudo apt install -y openssh-server
+
+# Verificar instalación
+sudo systemctl status ssh
+```
+
+#### Paso 3: Configurar SSH (Opcional pero Recomendado)
+
+```bash
+# Editar configuración de SSH
+sudo nano /etc/ssh/sshd_config
+```
+
+**Configuraciones recomendadas para producción:**
+
+```conf
+# Permitir autenticación por contraseña (cambiar a 'no' si solo usas claves SSH)
+PasswordAuthentication yes
+
+# Permitir autenticación por clave pública (recomendado)
+PubkeyAuthentication yes
+
+# Deshabilitar login como root directamente (más seguro)
+# Cambiar 'yes' a 'no' si quieres forzar login con usuario normal
+PermitRootLogin yes
+
+# Puerto SSH (por defecto 22, cambiar si quieres más seguridad)
+Port 22
+
+# Tiempo de inactividad antes de desconectar (segundos)
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Máximo de intentos de login
+MaxAuthTries 3
+
+# Deshabilitar protocolos antiguos e inseguros
+Protocol 2
+```
+
+**Guardar cambios:** `Ctrl + X`, luego `Y`, luego `Enter`
+
+#### Paso 4: Habilitar e Iniciar el Servicio SSH
+
+```bash
+# Habilitar SSH para que inicie automáticamente al arrancar
+sudo systemctl enable ssh
+
+# Iniciar el servicio SSH
+sudo systemctl start ssh
+
+# Verificar que está corriendo
+sudo systemctl status ssh
+```
+
+**Deberías ver:**
+```
+● ssh.service - OpenBSD Secure Shell server
+     Loaded: loaded (/lib/systemd/system/ssh.service; enabled; vendor preset: enabled)
+     Active: active (running) since ...
+```
+
+#### Paso 5: Configurar Firewall (UFW)
+
+Si tienes un firewall activo, necesitas permitir el tráfico SSH:
+
+```bash
+# Verificar si UFW está activo
+sudo ufw status
+
+# Si está inactivo, puedes activarlo (opcional)
+# sudo ufw enable
+
+# Permitir conexiones SSH (IMPORTANTE: hacer esto ANTES de activar el firewall)
+sudo ufw allow ssh
+# O específicamente el puerto 22:
+sudo ufw allow 22/tcp
+
+# Si cambiaste el puerto SSH (ejemplo: 2222), permitir ese puerto:
+# sudo ufw allow 2222/tcp
+
+# Verificar reglas
+sudo ufw status numbered
+```
+
+**⚠️ ADVERTENCIA CRÍTICA:**
+- **NUNCA** actives el firewall sin permitir SSH primero
+- Si bloqueas SSH sin tener acceso físico, perderás acceso al servidor
+- Si ya activaste el firewall y perdiste acceso, necesitarás acceso físico/consola
+
+#### Paso 6: Verificar que SSH Funciona
+
+**Desde el mismo servidor:**
+
+```bash
+# Verificar que el servicio está escuchando en el puerto 22
+sudo ss -tlnp | grep :22
+
+# Deberías ver algo como:
+# LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1234,fd=3))
+```
+
+**Obtener la IP del servidor:**
+
+```bash
+# Ver IP del servidor
+ip addr show
+# O más simple:
+hostname -I
+
+# Verificar conectividad
+ping -c 3 8.8.8.8
+```
+
+#### Paso 7: Probar Conexión SSH (Desde Otra Máquina)
+
+**Desde tu computadora local:**
+
+```bash
+# Intentar conectar
 ssh usuario@IP_DEL_SERVIDOR
 
+# Ejemplo:
+ssh root@192.168.1.100
+```
+
+**Si funciona correctamente:**
+- Te pedirá la contraseña del usuario
+- Después de ingresarla, deberías ver el prompt del servidor
+
+#### Solución de Problemas
+
+**SSH no inicia:**
+
+```bash
+# Ver logs de errores
+sudo journalctl -u ssh -n 50
+
+# Verificar configuración
+sudo sshd -t
+
+# Reiniciar servicio
+sudo systemctl restart ssh
+```
+
+**No puedes conectarte desde fuera:**
+
+1. **Verificar firewall:**
+   ```bash
+   sudo ufw status
+   sudo iptables -L -n  # Ver reglas de iptables
+   ```
+
+2. **Verificar que SSH está escuchando:**
+   ```bash
+   sudo ss -tlnp | grep :22
+   ```
+
+3. **Verificar red/router:**
+   - Si es servidor local: verificar que el router permite conexiones SSH
+   - Si es VPS: verificar reglas de firewall del proveedor (AWS Security Groups, etc.)
+
+4. **Verificar que el puerto está abierto:**
+   ```bash
+   # Desde otra máquina en la misma red
+   telnet IP_DEL_SERVIDOR 22
+   # O:
+   nc -zv IP_DEL_SERVIDOR 22
+   ```
+
+**Error "Connection refused":**
+- SSH no está corriendo o el puerto está bloqueado
+- Verificar: `sudo systemctl status ssh`
+
+**Error "Permission denied":**
+- Usuario o contraseña incorrectos
+- Verificar que el usuario existe: `getent passwd usuario`
+
+#### Seguridad Adicional (Opcional pero Recomendado)
+
+**Cambiar puerto SSH (más seguridad):**
+
+```bash
+# Editar configuración
+sudo nano /etc/ssh/sshd_config
+
+# Cambiar:
+Port 2222  # Usar un puerto diferente (ejemplo: 2222)
+
+# Reiniciar SSH
+sudo systemctl restart ssh
+
+# Permitir nuevo puerto en firewall
+sudo ufw allow 2222/tcp
+```
+
+**Deshabilitar login root (más seguro):**
+
+```bash
+# Crear usuario normal con sudo
+sudo adduser nuevo_usuario
+sudo usermod -aG sudo nuevo_usuario
+
+# Editar SSH
+sudo nano /etc/ssh/sshd_config
+# Cambiar: PermitRootLogin no
+
+# Reiniciar SSH
+sudo systemctl restart ssh
+```
+
+---
+
+### 2.2 Conectarse al Servidor por SSH
+
+#### ¿Qué es SSH?
+
+**SSH (Secure Shell)** es un protocolo que te permite conectarte de forma segura a un servidor remoto desde tu computadora local. Es la forma estándar de administrar servidores Linux/Ubuntu.
+
+#### Requisitos Previos
+
+Antes de conectarte, necesitas:
+- **IP del servidor** o **dominio** (ejemplo: `192.168.1.100` o `servidor.midominio.com`)
+- **Usuario** con permisos de administrador (normalmente `root` o un usuario con `sudo`)
+- **Contraseña** o **clave SSH** para autenticación
+- **Puerto SSH** (por defecto es `22`)
+
+#### Método 1: Conexión con Contraseña (Más Simple)
+
+**Desde Windows (PowerShell o CMD):**
+
+```powershell
+# Conectar al servidor
+ssh usuario@IP_DEL_SERVIDOR
+
+# Ejemplo con IP:
+ssh root@192.168.1.100
+
+# Ejemplo con dominio:
+ssh root@servidor.midominio.com
+
+# Si el puerto SSH no es el 22 (por defecto):
+ssh -p 2222 usuario@IP_DEL_SERVIDOR
+```
+
+**Desde Mac/Linux (Terminal):**
+
+```bash
+# Conectar al servidor
+ssh usuario@IP_DEL_SERVIDOR
+
+# Ejemplo:
+ssh root@192.168.1.100
+
+# Si el puerto SSH no es el 22:
+ssh -p 2222 usuario@IP_DEL_SERVIDOR
+```
+
+**Primera conexión:**
+- La primera vez que te conectes, verás un mensaje sobre la autenticidad del host
+- Escribe `yes` y presiona Enter
+- Ingresa tu contraseña cuando se solicite (no verás caracteres mientras escribes, es normal)
+
+#### Método 2: Conexión con Clave SSH (Más Seguro)
+
+**Ventajas:**
+- ✅ Más seguro (no necesitas contraseña cada vez)
+- ✅ Recomendado para producción
+- ✅ Puedes automatizar scripts
+
+**Paso 1: Generar clave SSH (si no tienes una)**
+
+**En Windows (PowerShell):**
+
+```powershell
+# Generar clave SSH
+ssh-keygen -t ed25519 -C "tu_email@ejemplo.com"
+
+# O si ed25519 no está disponible:
+ssh-keygen -t rsa -b 4096 -C "tu_email@ejemplo.com"
+
+# Presiona Enter para usar la ubicación por defecto
+# Ingresa una contraseña (opcional pero recomendado)
+```
+
+**En Mac/Linux:**
+
+```bash
+# Generar clave SSH
+ssh-keygen -t ed25519 -C "tu_email@ejemplo.com"
+
+# O si ed25519 no está disponible:
+ssh-keygen -t rsa -b 4096 -C "tu_email@ejemplo.com"
+```
+
+**Paso 2: Copiar la clave pública al servidor**
+
+**Opción A: Usando ssh-copy-id (Mac/Linux):**
+
+```bash
+# Copiar clave al servidor
+ssh-copy-id usuario@IP_DEL_SERVIDOR
+
+# Ejemplo:
+ssh-copy-id root@192.168.1.100
+```
+
+**Opción B: Manual (Windows/Mac/Linux):**
+
+```bash
+# 1. Ver tu clave pública
+cat ~/.ssh/id_ed25519.pub
+# O si usaste RSA:
+cat ~/.ssh/id_rsa.pub
+
+# 2. Copiar el contenido completo (desde "ssh-ed25519" hasta el final)
+
+# 3. Conectarte al servidor con contraseña
+ssh usuario@IP_DEL_SERVIDOR
+
+# 4. En el servidor, crear directorio .ssh si no existe
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# 5. Agregar tu clave pública
+nano ~/.ssh/authorized_keys
+# Pegar el contenido de tu clave pública aquí
+# Guardar: Ctrl + X, luego Y, luego Enter
+
+# 6. Ajustar permisos
+chmod 600 ~/.ssh/authorized_keys
+```
+
+**Paso 3: Conectarte con la clave**
+
+```bash
+# Ahora puedes conectarte sin contraseña
+ssh usuario@IP_DEL_SERVIDOR
+```
+
+#### Solución de Problemas Comunes
+
+**Error: "Connection refused" o "Connection timed out"**
+
+```bash
+# Verificar que el servidor esté encendido y accesible
+ping IP_DEL_SERVIDOR
+
+# Verificar que el puerto SSH esté abierto
+telnet IP_DEL_SERVIDOR 22
+# O usar:
+nc -zv IP_DEL_SERVIDOR 22
+```
+
+**Error: "Permission denied (publickey)"**
+
+```bash
+# Verificar permisos de la clave
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+
+# Verificar que la clave esté en el servidor
+ssh usuario@IP_DEL_SERVIDOR "cat ~/.ssh/authorized_keys"
+```
+
+**Error: "Host key verification failed"**
+
+```bash
+# Eliminar la entrada antigua del archivo known_hosts
+ssh-keygen -R IP_DEL_SERVIDOR
+```
+
+**No puedes conectarte desde Windows**
+
+- Asegúrate de tener **OpenSSH** instalado (Windows 10/11 lo incluye por defecto)
+- Si no funciona, instala **PuTTY** o **MobaXterm** como alternativa
+
+#### Verificar Conexión Exitosa
+
+Una vez conectado, deberías ver algo como:
+
+```bash
+Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-xx-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+Last login: Mon Dec 19 10:30:45 2024 from 192.168.1.50
+root@servidor:~#
+```
+
+**Comandos útiles para verificar:**
+
+```bash
+# Ver información del sistema
+uname -a
+
+# Ver versión de Ubuntu
+lsb_release -a
+
+# Ver uso de recursos
+free -h        # Memoria
+df -h          # Disco
+uptime         # Tiempo activo y carga
+```
+
+#### Desconectarse
+
+```bash
+# Para desconectarte del servidor
+exit
+
+# O simplemente presiona:
+Ctrl + D
+```
+
+---
+
+### 2.3 Actualizar el Sistema (Primer Paso Después de Conectar)
+
+Una vez conectado por SSH, lo primero que debes hacer es actualizar el sistema:
+
+```bash
 # Ejemplo:
 ssh sw4@192.168.1.100
 ```
@@ -609,6 +1054,34 @@ CACHE_KEY_PREFIX=udid_prod
 
 # Timeout de cache (segundos)
 CACHE_TIMEOUT=300
+
+# ============================================================================
+# CONFIGURACIÓN DE CELERY
+# ============================================================================
+
+# URL del broker de Celery (Redis)
+# Por defecto usa REDIS_URL, pero puedes usar una DB diferente
+CELERY_BROKER_URL=redis://localhost:6379/0
+
+# URL del backend de resultados (Redis)
+# Usa una DB diferente del broker para evitar conflictos
+CELERY_RESULT_BACKEND=redis://localhost:6379/1
+
+# Serialización de tareas (json es más seguro)
+CELERY_TASK_SERIALIZER=json
+CELERY_RESULT_SERIALIZER=json
+
+# Timezone para Celery
+CELERY_TIMEZONE=UTC
+CELERY_ENABLE_UTC=True
+
+# Configuración de resultados
+CELERY_RESULT_EXPIRES=3600
+CELERY_RESULT_PERSISTENT=True
+
+# Configuración de Flower (monitoreo opcional)
+CELERY_FLOWER_PORT=5555
+CELERY_FLOWER_BASIC_AUTH=admin:admin
 ```
 
 Guardar y salir: `Ctrl + X`, luego `Y`, luego `Enter`
@@ -1038,7 +1511,7 @@ ExecStart=/opt/udid/env/bin/daphne \
     --access-log - \
     --proxy-headers \
     -t 60 \
-    --websocket-timeout 300 \
+    --websocket_timeout 300 \
     ubuntu.asgi:application
 
 # Reinicio automático
@@ -1169,70 +1642,243 @@ sudo journalctl -u udid@0 -f
 
 ---
 
-## 12. Configuración de Cron Jobs
+## 12. Configuración de Celery (Tareas Automáticas)
 
 ### 📋 Información sobre las Tareas Automáticas
 
-El proyecto tiene **2 tareas cron** configuradas en `django-cron` con diferentes propósitos:
+El proyecto usa **Celery** para ejecutar tareas automáticas en background. Celery es un sistema de colas de tareas distribuidas que permite ejecutar tareas de forma asíncrona y escalable.
 
-| Tarea | Frecuencia | Propósito | Duración |
-|-------|------------|-----------|----------|
-| **UpdateSubscribersCronJob** | Cada 5 minutos | Sincronización RÁPIDA de suscriptores, credenciales y asociaciones | Segundos/Minutos |
-| **MergeSyncCronJob** | Diaria a las 00:00 (medianoche) | Sincronización COMPLETA de smartcards, productos, paquetes | Puede tomar horas |
+**Tareas periódicas configuradas:**
+
+| Tarea                                | Frecuencia           | Propósito                                  | Duración         |
+|--------------------------------------|----------------------|--------------------------------------------|------------------|
+| `download_new_subscribers`           | Cada 5 minutos       | Descarga solo suscriptores nuevos          | Segundos/Minutos |
+| `update_all_subscribers`             | Cada 5 minutos       | Actualiza datos de suscriptores existentes | Segundos/Minutos |
+| `update_smartcards_from_subscribers` | Cada 5 minutos       | Actualiza asociaciones de smartcards       | Segundos/Minutos |
+| `validate_and_fix_all_data`          | Diaria a las 2:00 AM | Sincronización COMPLETA y validación       | Puede tomar horas|
+
+**Componentes de Celery:**
+- **Celery Worker**: Ejecuta las tareas en background
+- **Celery Beat**: Programa y ejecuta tareas periódicas
+- **Flower** (opcional): Interfaz web para monitorear tareas
 
 **¿Cómo funciona?**
-- `django-cron` **define** las tareas y sus intervalos/horarios internamente
-- El **crontab del sistema** solo necesita llamar a `runcrons` frecuentemente
-- `django-cron` **decide** qué tareas ejecutar basándose en su última ejecución o el horario programado
-- `MergeSyncCronJob` se ejecuta automáticamente a las **00:00 (medianoche)** todos los días
+- Celery Beat programa las tareas según `CELERY_BEAT_SCHEDULE` en `settings.py`
+- Las tareas se envían a Redis (broker)
+- Celery Worker toma las tareas de Redis y las ejecuta
+- Los resultados se almacenan en Redis (backend)
 
-### 12.1 Crear Script de Cron
+### 12.1 Verificar Instalación de Celery
+
+Celery ya está incluido en `requirements.txt`, pero verifiquemos que se instaló correctamente:
 
 ```bash
-# Crear script para ejecutar cron jobs de Django
-sudo nano /opt/udid/run_cron.sh
+# Activar entorno virtual
+cd /opt/udid
+source venv/bin/activate
+
+# Verificar que Celery está instalado
+celery --version
+
+# Debería mostrar: celery 5.4.0 (o similar)
+```
+
+### 12.2 Crear Servicio Systemd para Celery Worker
+
+El Worker de Celery ejecuta las tareas en background:
+
+```bash
+# Crear archivo de servicio para Celery Worker
+sudo nano /etc/systemd/system/celery-worker.service
 ```
 
 Copiar el siguiente contenido:
 
-```bash
-#!/bin/bash
-# Script para ejecutar cron jobs de Django
-# 
-# IMPORTANTE: Este script llama a 'runcrons' que verifica qué tareas ejecutar:
-# - UpdateSubscribersCronJob: cada 5 minutos (sincronización rápida)
-# - MergeSyncCronJob: diaria a las 00:00 (medianoche) - sincronización completa
+```ini
+[Unit]
+Description=Celery Worker para UDID
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
 
-# Configuración
-PROJECT_DIR="/opt/udid"
-VENV_DIR="$PROJECT_DIR/venv"
-LOG_FILE="/var/log/udid/cron.log"
+[Service]
+Type=simple
+User=udid
+Group=udid
+WorkingDirectory=/opt/udid
+Environment="PATH=/opt/udid/venv/bin"
+EnvironmentFile=/opt/udid/.env
 
-# Crear directorio de logs si no existe
-mkdir -p /var/log/udid
+# Comando para ejecutar Celery Worker
+ExecStart=/opt/udid/venv/bin/celery -A ubuntu worker \
+    --loglevel=info \
+    --logfile=/var/log/udid/celery-worker.log \
+    --pidfile=/var/run/udid/celery-worker.pid
 
-# Activar entorno virtual y ejecutar cron
-cd $PROJECT_DIR
-source $VENV_DIR/bin/activate
+# Comando para detener
+ExecStop=/bin/kill -s TERM $MAINPID
+PIDFile=/var/run/udid/celery-worker.pid
 
-# Ejecutar django-cron (decide internamente qué tareas ejecutar)
-echo "$(date) - Iniciando verificación de cron jobs" >> $LOG_FILE
-python manage.py runcrons >> $LOG_FILE 2>&1
-echo "$(date) - Verificación de cron jobs finalizada" >> $LOG_FILE
+# Reinicio automático
+Restart=always
+RestartSec=3
+
+# Limitar recursos
+MemoryMax=2G
+CPUQuota=100%
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=celery-worker
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-Guardar y hacer ejecutable:
+Guardar y salir.
+
+### 12.3 Crear Servicio Systemd para Celery Beat
+
+Celery Beat programa y ejecuta las tareas periódicas:
 
 ```bash
-sudo chmod +x /opt/udid/run_cron.sh
-sudo chown udid:udid /opt/udid/run_cron.sh
+# Crear archivo de servicio para Celery Beat
+sudo nano /etc/systemd/system/celery-beat.service
+```
 
-# Crear directorio de logs
+Copiar el siguiente contenido:
+
+```ini
+[Unit]
+Description=Celery Beat Scheduler para UDID
+After=network.target postgresql.service redis-server.service celery-worker.service
+Requires=postgresql.service redis-server.service celery-worker.service
+
+[Service]
+Type=simple
+User=udid
+Group=udid
+WorkingDirectory=/opt/udid
+Environment="PATH=/opt/udid/venv/bin"
+EnvironmentFile=/opt/udid/.env
+
+# Comando para ejecutar Celery Beat
+ExecStart=/opt/udid/venv/bin/celery -A ubuntu beat \
+    --loglevel=info \
+    --logfile=/var/log/udid/celery-beat.log \
+    --pidfile=/var/run/udid/celery-beat.pid \
+    --schedule=/var/run/udid/celerybeat-schedule
+
+# Reinicio automático
+Restart=always
+RestartSec=3
+
+# Limitar recursos
+MemoryMax=512M
+CPUQuota=50%
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=celery-beat
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Guardar y salir.
+
+### 12.4 Crear Directorios Necesarios
+
+```bash
+# Crear directorio para archivos PID y schedule
+sudo mkdir -p /var/run/udid
+sudo chown udid:udid /var/run/udid
+
+# Crear directorio de logs (si no existe)
 sudo mkdir -p /var/log/udid
 sudo chown udid:udid /var/log/udid
 ```
 
-### 12.2 Configurar Crontab
+### 12.5 Iniciar y Habilitar Servicios de Celery
+
+```bash
+# Recargar systemd
+sudo systemctl daemon-reload
+
+# Iniciar servicios
+sudo systemctl start celery-worker
+sudo systemctl start celery-beat
+
+# Habilitar inicio automático
+sudo systemctl enable celery-worker
+sudo systemctl enable celery-beat
+
+# Verificar estado
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
+```
+
+### 12.6 (Opcional) Configurar Flower para Monitoreo
+
+Flower es una interfaz web para monitorear Celery:
+
+```bash
+# Crear archivo de servicio para Flower
+sudo nano /etc/systemd/system/celery-flower.service
+```
+
+Copiar el siguiente contenido:
+
+```ini
+[Unit]
+Description=Celery Flower (Monitor) para UDID
+After=network.target redis-server.service celery-worker.service
+Requires=redis-server.service celery-worker.service
+
+[Service]
+Type=simple
+User=udid
+Group=udid
+WorkingDirectory=/opt/udid
+Environment="PATH=/opt/udid/venv/bin"
+EnvironmentFile=/opt/udid/.env
+
+# Comando para ejecutar Flower
+# Cambiar usuario:contraseña en basic_auth si lo configuraste en .env
+ExecStart=/opt/udid/venv/bin/celery -A ubuntu flower \
+    --port=5555 \
+    --basic_auth=${CELERY_FLOWER_BASIC_AUTH:-admin:admin} \
+    --logfile=/var/log/udid/celery-flower.log
+
+# Reinicio automático
+Restart=always
+RestartSec=3
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=celery-flower
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Guardar y salir.
+
+```bash
+# Iniciar y habilitar Flower (opcional)
+sudo systemctl daemon-reload
+sudo systemctl start celery-flower
+sudo systemctl enable celery-flower
+
+# Acceder a Flower en: http://IP_DEL_SERVIDOR:5555
+# Usuario/contraseña por defecto: admin/admin (cambiar en .env)
+```
+
+### 12.7 Configurar Crontab para Tareas de Mantenimiento
+
+Aunque Celery maneja las tareas principales, algunas tareas de mantenimiento se ejecutan con crontab:
 
 ```bash
 # Editar crontab del usuario udid
@@ -1241,25 +1887,12 @@ sudo -u udid crontab -e
 # Si te pregunta qué editor usar, selecciona nano (opción 1)
 ```
 
-Agregar las siguientes líneas al final:
+Agregar las siguientes líneas:
 
 ```cron
 # ============================================================================
-# Cron Jobs para UDID Server
+# Tareas de Mantenimiento (no relacionadas con Celery)
 # ============================================================================
-#
-# IMPORTANTE: django-cron maneja internamente las frecuencias/horarios de cada tarea:
-# - UpdateSubscribersCronJob: cada 5 minutos (sincronización rápida)
-# - MergeSyncCronJob: diaria a las 00:00 (medianoche) - sincronización completa de smartcards
-#
-# El crontab del sistema solo necesita llamar a 'runcrons' cada 5 minutos
-# para que django-cron pueda verificar y ejecutar las tareas que correspondan.
-# MergeSyncCronJob se ejecutará automáticamente cuando sea medianoche.
-# ============================================================================
-
-# Ejecutar verificación de crons cada 5 minutos
-# (django-cron decide internamente qué tareas ejecutar según su última ejecución)
-*/5 * * * * /opt/udid/run_cron.sh
 
 # Limpiar sesiones expiradas de Django (diario a las 3 AM)
 0 3 * * * cd /opt/udid && /opt/udid/venv/bin/python manage.py clearsessions >> /var/log/udid/clearsessions.log 2>&1
@@ -1273,7 +1906,7 @@ Agregar las siguientes líneas al final:
 
 Guardar y salir.
 
-### 12.3 Configurar Rotación de Logs
+### 12.8 Configurar Rotación de Logs
 
 ```bash
 # Crear configuración de logrotate
@@ -1291,6 +1924,10 @@ Copiar el siguiente contenido:
     missingok
     notifempty
     create 0640 udid udid
+    postrotate
+        systemctl reload celery-worker > /dev/null 2>&1 || true
+        systemctl reload celery-beat > /dev/null 2>&1 || true
+    endscript
 }
 
 /opt/udid/server.log {
@@ -1309,87 +1946,125 @@ Copiar el siguiente contenido:
 
 Guardar y salir.
 
-### 12.4 Verificar Cron Jobs
+### 12.9 Verificar que Celery está Funcionando
+
+#### Método 1: Verificar servicios systemd
 
 ```bash
-# Ver crontab del usuario udid
-sudo -u udid crontab -l
-
-# Ejecutar manualmente para probar
-sudo -u udid /opt/udid/run_cron.sh
+# Verificar estado de los servicios
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
 
 # Ver logs en tiempo real
-tail -f /var/log/udid/cron.log
+sudo journalctl -u celery-worker -f
+sudo journalctl -u celery-beat -f
 ```
 
-### 12.5 Verificar que las Tareas se Ejecutan Correctamente
-
-#### Método 1: Revisar los logs
+#### Método 2: Revisar logs de Celery
 
 ```bash
-# Ver las últimas ejecuciones
-tail -50 /var/log/udid/cron.log
+# Ver logs del Worker
+tail -f /var/log/udid/celery-worker.log
 
-# Buscar ejecuciones específicas
-grep "UPDATE_SUBSCRIBERS" /var/log/udid/cron.log | tail -10  # Tarea cada 5 min
-grep "MERGE_SYNC" /var/log/udid/cron.log | tail -5           # Tarea diaria
+# Ver logs de Beat
+tail -f /var/log/udid/celery-beat.log
+
+# Buscar ejecuciones de tareas específicas
+grep "download_new_subscribers" /var/log/udid/celery-worker.log | tail -10
+grep "validate_and_fix_all_data" /var/log/udid/celery-worker.log | tail -5
 ```
 
-#### Método 2: Consultar la base de datos de django-cron
+#### Método 3: Usar Flower (si está configurado)
+
+```bash
+# Acceder a Flower en el navegador
+# http://IP_DEL_SERVIDOR:5555
+# Usuario/contraseña: admin/admin (o el configurado en .env)
+
+# Ver tareas ejecutándose, completadas, fallidas, etc.
+```
+
+#### Método 4: Verificar desde la línea de comandos
 
 ```bash
 cd /opt/udid
 source venv/bin/activate
+
+# Ver workers activos
+celery -A ubuntu inspect active
+
+# Ver tareas registradas
+celery -A ubuntu inspect registered
+
+# Ver estadísticas
+celery -A ubuntu inspect stats
+```
+
+#### Método 5: Ejecutar una tarea de prueba
+
+```bash
+cd /opt/udid
+source venv/bin/activate
+
+# Ejecutar una tarea de prueba manualmente
 python manage.py shell
 ```
 
 Dentro del shell de Python:
 
 ```python
-from django_cron.models import CronJobLog
+from udid.tasks import download_new_subscribers
 
-# Ver las últimas 10 ejecuciones de cualquier tarea
-logs = CronJobLog.objects.order_by('-end_time')[:10]
-for log in logs:
-    print(f"{log.code} | {log.start_time} | Éxito: {log.is_success}")
+# Ejecutar tarea de forma asíncrona
+result = download_new_subscribers.delay()
 
-# Ver solo las ejecuciones de UpdateSubscribersCronJob (cada 5 min)
-logs = CronJobLog.objects.filter(code='udid.update_subscribers_cron').order_by('-end_time')[:5]
-for log in logs:
-    print(f"{log.start_time} | Éxito: {log.is_success}")
+# Ver el ID de la tarea
+print(f"Task ID: {result.id}")
 
-# Ver solo las ejecuciones de MergeSyncCronJob (diaria)
-logs = CronJobLog.objects.filter(code='udid.sync_smartcards_cron').order_by('-end_time')[:5]
-for log in logs:
-    print(f"{log.start_time} | Éxito: {log.is_success}")
+# Verificar estado
+print(f"Estado: {result.state}")
 
-# Salir del shell
+# Esperar resultado (solo para pruebas, no usar en producción)
+# result.get(timeout=60)
+
+# Salir
 exit()
 ```
 
-#### Método 3: Verificar el servicio cron del sistema
+### 12.10 Diferencias entre las Tareas de Celery
+
+| Tarea                                | Frecuencia     | Propósito                                  | Duración          |
+|--------------------------------------|----------------|----------------------------------------------------------------|
+| `download_new_subscribers`           | Cada 5 min     | Descarga solo suscriptores nuevos          | Segundos/Minutos  |
+| `update_all_subscribers`             | Cada 5 min     | Actualiza datos de suscriptores existentes | Segundos/Minutos  |
+| `update_smartcards_from_subscribers` | Cada 5 min     | Actualiza asociaciones de smartcards       | Segundos/Minutos  |
+| `validate_and_fix_all_data`          | Diaria 2:00 AM | Sincronización completa y validación       | Puede tomar horas |
+
+### 12.11 Comandos Útiles de Celery
 
 ```bash
-# Verificar que el servicio cron está activo
-sudo systemctl status cron
+# Ver workers activos
+celery -A ubuntu inspect active
 
-# Ver logs del sistema relacionados con cron
-grep CRON /var/log/syslog | tail -20
+# Ver estadísticas de workers
+celery -A ubuntu inspect stats
+
+# Ver tareas registradas
+celery -A ubuntu inspect registered
+
+# Ver tareas programadas (Beat)
+celery -A ubuntu inspect scheduled
+
+# Reiniciar worker (después de cambios en código)
+sudo systemctl restart celery-worker
+
+# Reiniciar beat (después de cambios en schedule)
+sudo systemctl restart celery-beat
+
+# Ver logs en tiempo real
+sudo journalctl -u celery-worker -f
+sudo journalctl -u celery-beat -f
 ```
-
-### 12.6 Diferencias entre las Tareas Cron
-
-| Característica | UpdateSubscribersCronJob | MergeSyncCronJob |
-|----------------|-------------------------|------------------|
-| **Frecuencia** | Cada 5 minutos | Diaria a las 00:00 (medianoche) |
-| **Código** | `udid.update_subscribers_cron` | `udid.sync_smartcards_cron` |
-| **Duración** | Segundos/Minutos | Puede tomar horas |
-| **Sincroniza Smartcards Completas** | ❌ No | ✅ Sí |
-| **Sincroniza Suscriptores** | ✅ Sí | ✅ Sí |
-| **Sincroniza Credenciales** | ✅ Sí | ✅ Sí |
-| **Actualiza SubscriberInfo** | ✅ Sí | ✅ Sí |
-| **Propósito** | Mantener datos actualizados rápidamente | Validación y corrección completa |
-| **Horario** | Cada 5 minutos (todo el día) | Medianoche (horario de bajo tráfico) |
 
 ---
 
@@ -1412,6 +2087,12 @@ sudo systemctl status nginx | head -5
 
 echo "=== Verificando Daphne ==="
 sudo /opt/udid/manage_services.sh status
+
+echo "=== Verificando Celery Worker ==="
+sudo systemctl status celery-worker | head -5
+
+echo "=== Verificando Celery Beat ==="
+sudo systemctl status celery-beat | head -5
 
 # ====== 2. VERIFICAR CONEXIONES ======
 echo "=== Verificando conexión PostgreSQL ==="
@@ -1553,6 +2234,8 @@ echo "$(date) - Health Check Started" >> $LOG_FILE
 check_service postgresql >> $LOG_FILE
 check_service redis-server >> $LOG_FILE
 check_service nginx >> $LOG_FILE
+check_service celery-worker >> $LOG_FILE
+check_service celery-beat >> $LOG_FILE
 
 for i in 0 1 2 3; do
     check_service udid@$i >> $LOG_FILE
@@ -1614,10 +2297,12 @@ python manage.py collectstatic --noinput
 # Salir y reiniciar servicios
 exit
 sudo /opt/udid/manage_services.sh start
+sudo systemctl restart celery-worker celery-beat
 sudo systemctl restart nginx
 
 # Verificar estado
 sudo /opt/udid/manage_services.sh status
+sudo systemctl status celery-worker celery-beat
 ```
 
 ### 14.4 Backup de Base de Datos
@@ -1764,6 +2449,7 @@ Si todo falla, reiniciar todos los servicios:
 ```bash
 # Detener todos los servicios
 sudo /opt/udid/manage_services.sh stop
+sudo systemctl stop celery-worker celery-beat celery-flower
 sudo systemctl stop nginx
 sudo systemctl stop redis-server
 sudo systemctl stop postgresql
@@ -1775,12 +2461,16 @@ sleep 5
 sudo systemctl start postgresql
 sudo systemctl start redis-server
 sudo /opt/udid/manage_services.sh start
+sudo systemctl start celery-worker celery-beat
+sudo systemctl start celery-flower  # Opcional
 sudo systemctl start nginx
 
 # Verificar estado
 sudo systemctl status postgresql
 sudo systemctl status redis-server
 sudo /opt/udid/manage_services.sh status
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
 sudo systemctl status nginx
 ```
 
@@ -1789,6 +2479,28 @@ sudo systemctl status nginx
 ## 16. Recomendaciones de Recursos del Servidor
 
 ### 16.1 Configuración Recomendada según Carga
+
+> **📝 Nota sobre "Redis Memory":**
+> 
+> **Redis Memory** se refiere a la cantidad máxima de RAM que Redis puede usar para almacenar datos en memoria. Esta configuración se establece con `maxmemory` en `/etc/redis/redis.conf`.
+> 
+> **¿Por qué es importante?**
+> - Redis almacena datos en memoria para acceso rápido (cache, WebSockets, colas de Celery)
+> - Sin límite, Redis podría consumir toda la RAM del servidor
+> - Con `maxmemory` configurado, Redis usa la política `allkeys-lru` para eliminar datos antiguos cuando se llena
+> 
+> **¿Cómo se configura?**
+> ```bash
+> sudo nano /etc/redis/redis.conf
+> # Buscar y modificar:
+> maxmemory 2gb  # Ajustar según la RAM disponible del servidor
+> maxmemory-policy allkeys-lru  # Eliminar claves menos usadas cuando se llena
+> ```
+> 
+> **Recomendación:** Asignar entre 25-30% de la RAM total del servidor a Redis. Por ejemplo:
+> - Servidor con 8GB RAM → Redis Memory: 2GB
+> - Servidor con 16GB RAM → Redis Memory: 4GB
+> - Servidor con 32GB RAM → Redis Memory: 8GB
 
 #### 🟢 Carga Baja (hasta 500 conexiones simultáneas)
 
@@ -1893,31 +2605,42 @@ bash <(curl -Ss https://my-netdata.io/kickstart.sh)
 
 ```bash
 # === GESTIÓN DE SERVICIOS ===
-sudo /opt/udid/manage_services.sh start     # Iniciar aplicación
-sudo /opt/udid/manage_services.sh stop      # Detener aplicación
-sudo /opt/udid/manage_services.sh restart   # Reiniciar aplicación
-sudo /opt/udid/manage_services.sh status    # Ver estado
+sudo /opt/udid/manage_services.sh start     # Iniciar aplicación Daphne
+sudo /opt/udid/manage_services.sh stop      # Detener aplicación Daphne
+sudo /opt/udid/manage_services.sh restart   # Reiniciar aplicación Daphne
+sudo /opt/udid/manage_services.sh status    # Ver estado Daphne
 
 sudo systemctl restart nginx                # Reiniciar Nginx
 sudo systemctl restart postgresql           # Reiniciar PostgreSQL
 sudo systemctl restart redis-server         # Reiniciar Redis
+sudo systemctl restart celery-worker        # Reiniciar Celery Worker
+sudo systemctl restart celery-beat         # Reiniciar Celery Beat
+sudo systemctl restart celery-flower        # Reiniciar Flower (opcional)
 
 # === LOGS ===
 sudo journalctl -u udid@0 -f               # Ver logs de Daphne
+sudo journalctl -u celery-worker -f        # Ver logs de Celery Worker
+sudo journalctl -u celery-beat -f          # Ver logs de Celery Beat
 sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
-sudo tail -f /var/log/udid/cron.log        # Ver logs de cron
+sudo tail -f /var/log/udid/celery-worker.log  # Ver logs de Worker
+sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat
 
 # === DJANGO ===
 cd /opt/udid && source venv/bin/activate   # Activar entorno
 python manage.py migrate                    # Aplicar migraciones
 python manage.py collectstatic --noinput   # Recolectar estáticos
 python manage.py createsuperuser           # Crear admin
-python manage.py runcrons                   # Ejecutar cron manualmente
+
+# === CELERY ===
+celery -A ubuntu inspect active            # Ver tareas activas
+celery -A ubuntu inspect stats              # Ver estadísticas
+celery -A ubuntu inspect registered         # Ver tareas registradas
 
 # === VERIFICACIÓN ===
 curl -k https://localhost/health           # Verificar salud
 redis-cli ping                             # Verificar Redis
 sudo ss -tlnp | grep 800                   # Ver puertos Daphne
+sudo ss -tlnp | grep 5555                  # Ver puerto Flower (opcional)
 ```
 
 ---
@@ -1930,17 +2653,20 @@ Antes de considerar el despliegue completo, verificar:
 - [ ] Redis instalado y configurado
 - [ ] Proyecto copiado a `/opt/udid`
 - [ ] Entorno virtual creado y dependencias instaladas
-- [ ] Archivo `.env` configurado con todas las variables
+- [ ] Archivo `.env` configurado con todas las variables (incluyendo Celery)
 - [ ] Migraciones aplicadas
 - [ ] Archivos estáticos recolectados
 - [ ] Superusuario creado
 - [ ] Certificado SSL configurado
 - [ ] Nginx configurado y funcionando
-- [ ] Servicios systemd creados y habilitados
-- [ ] Cron jobs configurados
+- [ ] Servicios systemd de Daphne creados y habilitados
+- [ ] Servicios systemd de Celery (Worker y Beat) creados y habilitados
+- [ ] Flower configurado (opcional pero recomendado)
+- [ ] Tareas de mantenimiento en crontab configuradas
 - [ ] Firewall configurado
 - [ ] Pruebas de API exitosas
 - [ ] Pruebas de WebSocket exitosas
+- [ ] Verificación de tareas de Celery ejecutándose correctamente
 
 ---
 

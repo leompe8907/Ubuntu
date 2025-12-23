@@ -14,7 +14,7 @@ logger = logging.getLogger('rate_limiting')
 
 # Importar utilidades de Redis HA
 try:
-    from .utils.redis_ha import get_redis_client_safe, is_redis_available
+    from .utils.server.redis_ha import get_redis_client_safe, is_redis_available
     REDIS_HA_AVAILABLE = True
 except ImportError:
     REDIS_HA_AVAILABLE = False
