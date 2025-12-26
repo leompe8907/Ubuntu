@@ -242,6 +242,9 @@ def download_new_subscribers(self):
     """
     Tarea que descarga solo los suscriptores nuevos desde Panaccess.
     
+    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
+    en lugar de descargar solo nuevos suscriptores.
+    
     Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
     para mantener la base de datos actualizada con nuevos suscriptores.
     
@@ -272,6 +275,31 @@ def download_new_subscribers(self):
         PanaccessException: Si hay errores críticos de autenticación o conexión
     """
     logger.info("📥 [NEW_SUBSCRIBERS] Iniciando descarga de suscriptores nuevos desde Panaccess")
+    
+    # Verificar si las tablas base están vacías
+    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
+    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
+    from .utils.panaccess.login import DataBaseEmpty as logins_empty
+    
+    subscribers_is_empty = subscribers_empty()
+    smartcards_is_empty = smartcards_empty()
+    logins_is_empty = logins_empty()
+    
+    # Si alguna tabla base está vacía, ejecutar sincronización completa
+    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
+        logger.info(
+            f"📊 [NEW_SUBSCRIBERS] Tablas base vacías detectadas - "
+            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
+            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
+            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+        )
+        logger.info("🚀 [NEW_SUBSCRIBERS] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
+        
+        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
+        return initial_sync_all_data.apply().get()
+    
+    # Si las tablas tienen datos, continuar con la lógica normal
+    logger.info("✅ [NEW_SUBSCRIBERS] Las tablas base tienen datos, continuando con descarga de nuevos suscriptores...")
     
     result = {
         'success': False,
@@ -429,6 +457,9 @@ def update_all_subscribers(self):
     """
     Tarea que actualiza todos los suscriptores existentes y su información desde Panaccess.
     
+    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
+    en lugar de actualizar suscriptores existentes.
+    
     Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
     para mantener la base de datos actualizada con los cambios en Panaccess.
     
@@ -459,6 +490,31 @@ def update_all_subscribers(self):
         PanaccessException: Si hay errores críticos de autenticación o conexión
     """
     logger.info("🔄 [UPDATE_ALL] Iniciando actualización de todos los suscriptores desde Panaccess")
+    
+    # Verificar si las tablas base están vacías
+    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
+    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
+    from .utils.panaccess.login import DataBaseEmpty as logins_empty
+    
+    subscribers_is_empty = subscribers_empty()
+    smartcards_is_empty = smartcards_empty()
+    logins_is_empty = logins_empty()
+    
+    # Si alguna tabla base está vacía, ejecutar sincronización completa
+    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
+        logger.info(
+            f"📊 [UPDATE_ALL] Tablas base vacías detectadas - "
+            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
+            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
+            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+        )
+        logger.info("🚀 [UPDATE_ALL] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
+        
+        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
+        return initial_sync_all_data.apply().get()
+    
+    # Si las tablas tienen datos, continuar con la lógica normal
+    logger.info("✅ [UPDATE_ALL] Las tablas base tienen datos, continuando con actualización de suscriptores...")
     
     result = {
         'success': False,
@@ -613,6 +669,9 @@ def update_smartcards_from_subscribers(self):
     """
     Tarea que actualiza el modelo de smartcards basándose en la información del modelo de suscriptores.
     
+    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
+    en lugar de actualizar smartcards desde suscriptores.
+    
     Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
     para mantener la tabla ListOfSmartcards sincronizada con los datos de suscriptores.
     
@@ -654,6 +713,31 @@ def update_smartcards_from_subscribers(self):
         Exception: Si hay errores críticos durante el proceso
     """
     logger.info("🔄 [UPDATE_SMARTCARDS] Iniciando actualización de smartcards desde suscriptores")
+    
+    # Verificar si las tablas base están vacías
+    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
+    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
+    from .utils.panaccess.login import DataBaseEmpty as logins_empty
+    
+    subscribers_is_empty = subscribers_empty()
+    smartcards_is_empty = smartcards_empty()
+    logins_is_empty = logins_empty()
+    
+    # Si alguna tabla base está vacía, ejecutar sincronización completa
+    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
+        logger.info(
+            f"📊 [UPDATE_SMARTCARDS] Tablas base vacías detectadas - "
+            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
+            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
+            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+        )
+        logger.info("🚀 [UPDATE_SMARTCARDS] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
+        
+        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
+        return initial_sync_all_data.apply().get()
+    
+    # Si las tablas tienen datos, continuar con la lógica normal
+    logger.info("✅ [UPDATE_SMARTCARDS] Las tablas base tienen datos, continuando con actualización de smartcards...")
     
     result = {
         'success': False,
@@ -755,6 +839,9 @@ def validate_and_fix_all_data(self):
     """
     Tarea de validación y corrección completa que sincroniza y valida todos los datos desde Panaccess.
     
+    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
+    en lugar de validar y corregir datos existentes.
+    
     Esta tarea está diseñada para ejecutarse a una hora específica (configurada con Celery Beat)
     para mantener la integridad y consistencia de todos los datos en la base de datos.
     
@@ -792,6 +879,31 @@ def validate_and_fix_all_data(self):
         PanaccessException: Si hay errores críticos de autenticación o conexión
     """
     logger.info("🔍 [VALIDATE_FIX] Iniciando validación y corrección completa de datos desde Panaccess")
+    
+    # Verificar si las tablas base están vacías
+    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
+    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
+    from .utils.panaccess.login import DataBaseEmpty as logins_empty
+    
+    subscribers_is_empty = subscribers_empty()
+    smartcards_is_empty = smartcards_empty()
+    logins_is_empty = logins_empty()
+    
+    # Si alguna tabla base está vacía, ejecutar sincronización completa
+    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
+        logger.info(
+            f"📊 [VALIDATE_FIX] Tablas base vacías detectadas - "
+            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
+            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
+            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+        )
+        logger.info("🚀 [VALIDATE_FIX] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
+        
+        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
+        return initial_sync_all_data.apply().get()
+    
+    # Si las tablas tienen datos, continuar con la lógica normal
+    logger.info("✅ [VALIDATE_FIX] Las tablas base tienen datos, continuando con validación y corrección...")
     
     result = {
         'success': False,

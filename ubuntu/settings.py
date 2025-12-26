@@ -304,8 +304,8 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 #     "default": {
 #         "ENGINE": "django.db.backends.postgresql",
 #         "NAME": os.getenv("POSTGRES_DB", "udid"),
-#         "USER": os.getenv("POSTGRES_USER", "dev"),
-#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "devpass"),
+#         "USER": os.getenv("POSTGRES_USER", "udid_user"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
 #         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
 #         "PORT": os.getenv("POSTGRES_PORT", "5432"),
 #         "CONN_MAX_AGE": 60,
@@ -508,6 +508,7 @@ LOGGING = {
         },
         'console': {
             'class': 'udid.utils.server.logging_handlers.SafeConsoleHandler',
+            'level': 'DEBUG',
             'formatter': 'verbose',
         },
     },
@@ -530,6 +531,28 @@ LOGGING = {
             'handlers': ['file', 'console'],
             'level': 'DEBUG',
             'propagate': True,
+        },
+        # Logger para todas las tareas de Celery en udid
+        'udid': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'udid.tasks': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        # Logger para Celery (tareas, workers, etc.)
+        'celery': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'celery.task': {
+            'handlers': ['file', 'console'],
+            'level': 'DEBUG',
+            'propagate': False,
         },
     },
 }
@@ -621,7 +644,7 @@ CELERY_BEAT_SCHEDULE = {
     # Frecuencia alta para detectar nuevos registros rápidamente
     'download-new-subscribers-every-5-minutes': {
         'task': 'udid.tasks.download_new_subscribers',
-        'schedule': 300.0,  # 300 segundos = 5 minutos
+        'schedule': 50.0,  # 300 segundos = 5 minutos
         'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
     },
     

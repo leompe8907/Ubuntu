@@ -13,7 +13,7 @@
 9. [Configuración de Nginx](#9-configuración-de-nginx)
 10. [Configuración de SSL/HTTPS](#10-configuración-de-sslhttps)
 11. [Configuración de Systemd](#11-configuración-de-systemd)
-12. [Configuración de Celery (Tareas Automáticas)](#12-configuración-de-celery-tareas-automáticas)
+12. [Configuración de Celery (Ejecución Manual de Tareas)](#12-configuración-de-celery-ejecución-manual-de-tareas)
 13. [Verificación y Pruebas](#13-verificación-y-pruebas)
 14. [Mantenimiento y Monitoreo](#14-mantenimiento-y-monitoreo)
 15. [Solución de Problemas](#15-solución-de-problemas)
@@ -1642,28 +1642,29 @@ sudo journalctl -u udid@0 -f
 
 ---
 
-## 12. Configuración de Celery (Tareas Automáticas)
+## 12. Configuración de Celery (Ejecución Manual de Tareas)
 
-### 📋 Información sobre las Tareas Automáticas
+### 📋 Información sobre las Tareas de Celery
 
-El proyecto usa **Celery** para ejecutar tareas automáticas en background. Celery es un sistema de colas de tareas distribuidas que permite ejecutar tareas de forma asíncrona y escalable.
+El proyecto usa **Celery** para ejecutar tareas en background de forma asíncrona y escalable. **Por defecto, las tareas NO se ejecutan automáticamente** - tú decides cuándo ejecutarlas manualmente.
 
-**Tareas periódicas configuradas:**
+**Tareas disponibles para ejecución manual:**
 
-| Tarea                                | Frecuencia           | Propósito                                  | Duración         |
-|--------------------------------------|----------------------|--------------------------------------------|------------------|
-| `download_new_subscribers`           | Cada 5 minutos       | Descarga solo suscriptores nuevos          | Segundos/Minutos |
-| `update_all_subscribers`             | Cada 5 minutos       | Actualiza datos de suscriptores existentes | Segundos/Minutos |
-| `update_smartcards_from_subscribers` | Cada 5 minutos       | Actualiza asociaciones de smartcards       | Segundos/Minutos |
-| `validate_and_fix_all_data`          | Diaria a las 2:00 AM | Sincronización COMPLETA y validación       | Puede tomar horas|
+| Tarea                                | Propósito                                  | Duración         |
+|--------------------------------------|--------------------------------------------|------------------|
+| `initial_sync_all_data`              | Sincronización COMPLETA inicial de todos los datos | Puede tomar horas |
+| `download_new_subscribers`           | Descarga solo suscriptores nuevos          | Segundos/Minutos |
+| `update_all_subscribers`             | Actualiza datos de suscriptores existentes | Segundos/Minutos |
+| `update_smartcards_from_subscribers` | Actualiza asociaciones de smartcards       | Segundos/Minutos |
+| `validate_and_fix_all_data`          | Sincronización completa y validación       | Puede tomar horas|
 
 **Componentes de Celery:**
-- **Celery Worker**: Ejecuta las tareas en background
-- **Celery Beat**: Programa y ejecuta tareas periódicas
+- **Celery Worker**: Ejecuta las tareas en background (SIEMPRE debe estar activo)
+- **Celery Beat**: Programa y ejecuta tareas periódicas (NO se activa por defecto)
 - **Flower** (opcional): Interfaz web para monitorear tareas
 
 **¿Cómo funciona?**
-- Celery Beat programa las tareas según `CELERY_BEAT_SCHEDULE` en `settings.py`
+- Tú ejecutas las tareas manualmente cuando lo necesites
 - Las tareas se envían a Redis (broker)
 - Celery Worker toma las tareas de Redis y las ejecuta
 - Los resultados se almacenan en Redis (backend)
@@ -1685,7 +1686,7 @@ celery --version
 
 ### 12.2 Crear Servicio Systemd para Celery Worker
 
-El Worker de Celery ejecuta las tareas en background:
+El Worker de Celery ejecuta las tareas en background. **Este servicio DEBE estar activo** para poder ejecutar tareas manualmente:
 
 ```bash
 # Crear archivo de servicio para Celery Worker
@@ -1737,9 +1738,11 @@ WantedBy=multi-user.target
 
 Guardar y salir.
 
-### 12.3 Crear Servicio Systemd para Celery Beat
+### 12.3 Crear Servicio Systemd para Celery Beat (Opcional - NO se activa por defecto)
 
-Celery Beat programa y ejecuta las tareas periódicas:
+> ⚠️ **NOTA:** Celery Beat se crea pero **NO se inicia automáticamente**. Solo úsalo si en el futuro quieres activar tareas periódicas. Por ahora, las tareas se ejecutan manualmente.
+
+Celery Beat programa y ejecuta las tareas periódicas. Este servicio está disponible pero **deshabilitado por defecto**:
 
 ```bash
 # Crear archivo de servicio para Celery Beat
@@ -1802,38 +1805,36 @@ sudo chown udid:udid /var/log/udid
 
 ### 12.5 Iniciar y Habilitar Servicios de Celery
 
+**IMPORTANTE:** Solo iniciamos el **Worker** (necesario para ejecutar tareas). **NO iniciamos Beat** (tareas automáticas deshabilitadas):
+
 ```bash
 # Recargar systemd
 sudo systemctl daemon-reload
 
-# Iniciar servicios
+# Iniciar SOLO el Worker (necesario para ejecutar tareas manualmente)
 sudo systemctl start celery-worker
-sudo systemctl start celery-beat
 
-# Habilitar inicio automático
+# Habilitar inicio automático SOLO del Worker
 sudo systemctl enable celery-worker
-sudo systemctl enable celery-beat
 
-# Verificar estado
+# Verificar estado del Worker
 sudo systemctl status celery-worker
+
+# Verificar que Beat NO está corriendo (debe estar inactivo)
 sudo systemctl status celery-beat
+# Debería mostrar: "inactive (dead)" o similar
 ```
 
-### 12.6 Ejecutar Sincronización Inicial de Datos (IMPORTANTE)
+### 12.6 Ejecutar Tareas Manualmente
 
-> ⚠️ **IMPORTANTE:** Antes de que las tareas periódicas comiencen a ejecutarse, es necesario ejecutar la tarea `initial_sync_all_data` para poblar la base de datos con todos los datos desde Panaccess. Esta tarea debe ejecutarse **UNA SOLA VEZ** cuando la base de datos está vacía o cuando necesitas una sincronización completa inicial.
+Ahora puedes ejecutar cualquier tarea cuando lo necesites. Aquí te mostramos cómo:
 
-**¿Por qué es necesario?**
-- Las tareas periódicas (`download_new_subscribers`, `update_all_subscribers`, etc.) asumen que ya hay datos en la base de datos
-- `initial_sync_all_data` descarga TODOS los datos desde Panaccess (suscriptores, smartcards, credenciales)
-- Esta tarea puede tomar varias horas si hay muchos registros (ej: 10,000+ smartcards)
-- Una vez completada, las tareas periódicas mantendrán los datos actualizados
-
-**¿Cuándo ejecutarla?**
-- ✅ Primera vez que despliegas el sistema
-- ✅ Cuando la base de datos está vacía
-- ✅ Después de una migración completa de datos
-- ❌ NO ejecutarla periódicamente (solo cuando sea necesario)
+**Tareas disponibles:**
+- `initial_sync_all_data`: Sincronización inicial completa (ejecutar UNA VEZ cuando la BD está vacía)
+- `download_new_subscribers`: Descargar solo suscriptores nuevos
+- `update_all_subscribers`: Actualizar datos de suscriptores existentes
+- `update_smartcards_from_subscribers`: Actualizar asociaciones de smartcards
+- `validate_and_fix_all_data`: Validación y corrección completa (puede tomar horas)
 
 #### Método 1: Ejecutar desde el Shell de Django (Recomendado)
 
@@ -1849,13 +1850,19 @@ source env/bin/activate
 python manage.py shell
 ```
 
-Dentro del shell de Python, ejecutar:
+Dentro del shell de Python, ejecutar la tarea que necesites:
 
 ```python
-from udid.tasks import initial_sync_all_data
+# Importar las tareas disponibles
+from udid.tasks import (
+    initial_sync_all_data,
+    download_new_subscribers,
+    update_all_subscribers,
+    update_smartcards_from_subscribers,
+    validate_and_fix_all_data
+)
 
-# Ejecutar la tarea de forma asíncrona (recomendado)
-# Esto la ejecuta en background usando Celery
+# Ejecutar la tarea que quieras (ejemplo: sincronización inicial)
 task = initial_sync_all_data.delay()
 
 # Ver el ID de la tarea
@@ -1865,6 +1872,11 @@ print(f"Estado: {task.state}")
 # IMPORTANTE: La tarea se ejecuta en background
 # Puedes salir del shell y la tarea continuará ejecutándose
 # Para verificar el progreso, usar Flower o los logs
+
+# Ejemplos de otras tareas:
+# task = download_new_subscribers.delay()
+# task = update_all_subscribers.delay()
+# task = validate_and_fix_all_data.delay()
 
 # Salir del shell
 exit()
@@ -1984,7 +1996,7 @@ print(f"SubscriberInfo: {SubscriberInfo.objects.count()}")
 exit()
 ```
 
-**Si los conteos son mayores a 0**, la sincronización inicial fue exitosa. Ahora las tareas periódicas pueden mantener los datos actualizados.
+**Si los conteos son mayores a 0**, la sincronización inicial fue exitosa.
 
 #### Solución de Problemas
 
@@ -2023,7 +2035,41 @@ cat /opt/udid/.env | grep -E "(url_panaccess|username|password|api_token)"
 grep "INITIAL_SYNC.*finalizada\|completada\|success" /var/log/udid/celery-worker.log | tail -5
 ```
 
-### 12.7 (Opcional) Configurar Flower para Monitoreo
+### 12.7 (Opcional) Activar Tareas Automáticas con Celery Beat
+
+Si en el futuro quieres activar las tareas periódicas automáticas, puedes hacerlo así:
+
+```bash
+# Iniciar Celery Beat
+sudo systemctl start celery-beat
+
+# Habilitar inicio automático (opcional)
+sudo systemctl enable celery-beat
+
+# Verificar que está corriendo
+sudo systemctl status celery-beat
+
+# Ver logs
+sudo journalctl -u celery-beat -f
+```
+
+**Tareas periódicas que se activarían:**
+- `download_new_subscribers`: Cada 5 minutos
+- `update_all_subscribers`: Cada 5 minutos
+- `update_smartcards_from_subscribers`: Cada 5 minutos
+- `validate_and_fix_all_data`: Diaria a las 2:00 AM
+
+**Para desactivar las tareas automáticas nuevamente:**
+
+```bash
+# Detener Celery Beat
+sudo systemctl stop celery-beat
+
+# Deshabilitar inicio automático
+sudo systemctl disable celery-beat
+```
+
+### 12.8 (Opcional) Configurar Flower para Monitoreo
 
 Flower es una interfaz web para monitorear Celery:
 
@@ -2080,7 +2126,7 @@ sudo systemctl enable celery-flower
 # Usuario/contraseña por defecto: admin/admin (cambiar en .env)
 ```
 
-### 12.8 Configurar Crontab para Tareas de Mantenimiento
+### 12.9 Configurar Crontab para Tareas de Mantenimiento
 
 Aunque Celery maneja las tareas principales, algunas tareas de mantenimiento se ejecutan con crontab:
 
@@ -2110,7 +2156,7 @@ Agregar las siguientes líneas:
 
 Guardar y salir.
 
-### 12.9 Configurar Rotación de Logs
+### 12.10 Configurar Rotación de Logs
 
 ```bash
 # Crear configuración de logrotate
@@ -2150,18 +2196,19 @@ Copiar el siguiente contenido:
 
 Guardar y salir.
 
-### 12.10 Verificar que Celery está Funcionando
+### 12.11 Verificar que Celery está Funcionando
 
 #### Método 1: Verificar servicios systemd
 
 ```bash
-# Verificar estado de los servicios
+# Verificar estado del Worker (debe estar activo)
 sudo systemctl status celery-worker
+
+# Verificar que Beat NO está corriendo (debe estar inactivo)
 sudo systemctl status celery-beat
 
 # Ver logs en tiempo real
 sudo journalctl -u celery-worker -f
-sudo journalctl -u celery-beat -f
 ```
 
 #### Método 2: Revisar logs de Celery
@@ -2170,12 +2217,9 @@ sudo journalctl -u celery-beat -f
 # Ver logs del Worker
 tail -f /var/log/udid/celery-worker.log
 
-# Ver logs de Beat
-tail -f /var/log/udid/celery-beat.log
-
 # Buscar ejecuciones de tareas específicas
 grep "download_new_subscribers" /var/log/udid/celery-worker.log | tail -10
-grep "validate_and_fix_all_data" /var/log/udid/celery-worker.log | tail -5
+grep "initial_sync_all_data" /var/log/udid/celery-worker.log | tail -5
 ```
 
 #### Método 3: Usar Flower (si está configurado)
@@ -2202,6 +2246,14 @@ celery -A ubuntu inspect registered
 
 # Ver estadísticas
 celery -A ubuntu inspect stats
+
+# Ver estado de una tarea específica
+python manage.py shell
+# Luego:
+# from celery.result import AsyncResult
+# from ubuntu.celery import app
+# result = AsyncResult('TASK_ID', app=app)
+# print(result.state)
 ```
 
 #### Método 5: Ejecutar una tarea de prueba
@@ -2235,16 +2287,17 @@ print(f"Estado: {result.state}")
 exit()
 ```
 
-### 12.11 Diferencias entre las Tareas de Celery
+### 12.12 Tareas Disponibles y Cuándo Usarlas
 
-| Tarea                                | Frecuencia     | Propósito                                  | Duración          |
-|--------------------------------------|----------------|----------------------------------------------------------------|
-| `download_new_subscribers`           | Cada 5 min     | Descarga solo suscriptores nuevos          | Segundos/Minutos  |
-| `update_all_subscribers`             | Cada 5 min     | Actualiza datos de suscriptores existentes | Segundos/Minutos  |
-| `update_smartcards_from_subscribers` | Cada 5 min     | Actualiza asociaciones de smartcards       | Segundos/Minutos  |
-| `validate_and_fix_all_data`          | Diaria 2:00 AM | Sincronización completa y validación       | Puede tomar horas |
+| Tarea                                | Cuándo Usarla                                  | Duración          |
+|--------------------------------------|------------------------------------------------|-------------------|
+| `initial_sync_all_data`              | Primera vez que despliegas el sistema o cuando la BD está vacía | Puede tomar horas |
+| `download_new_subscribers`           | Cuando quieres descargar solo suscriptores nuevos | Segundos/Minutos  |
+| `update_all_subscribers`             | Cuando quieres actualizar datos de suscriptores existentes | Segundos/Minutos  |
+| `update_smartcards_from_subscribers` | Cuando quieres actualizar asociaciones de smartcards | Segundos/Minutos  |
+| `validate_and_fix_all_data`          | Cuando quieres una sincronización completa y validación | Puede tomar horas |
 
-### 12.12 Comandos Útiles de Celery
+### 12.13 Comandos Útiles de Celery
 
 ```bash
 # Ver workers activos
@@ -2256,18 +2309,22 @@ celery -A ubuntu inspect stats
 # Ver tareas registradas
 celery -A ubuntu inspect registered
 
-# Ver tareas programadas (Beat)
-celery -A ubuntu inspect scheduled
+# Ver estado de una tarea específica
+python manage.py shell
+# Luego:
+# from celery.result import AsyncResult
+# from ubuntu.celery import app
+# result = AsyncResult('TASK_ID', app=app)
+# print(result.state)
 
 # Reiniciar worker (después de cambios en código)
 sudo systemctl restart celery-worker
 
-# Reiniciar beat (después de cambios en schedule)
-sudo systemctl restart celery-beat
-
 # Ver logs en tiempo real
 sudo journalctl -u celery-worker -f
-sudo journalctl -u celery-beat -f
+
+# Detener todas las tareas activas (emergencia)
+sudo systemctl stop celery-worker
 ```
 
 ---
@@ -2295,7 +2352,7 @@ sudo /opt/udid/manage_services.sh status
 echo "=== Verificando Celery Worker ==="
 sudo systemctl status celery-worker | head -5
 
-echo "=== Verificando Celery Beat ==="
+echo "=== Verificando Celery Beat (debe estar inactivo) ==="
 sudo systemctl status celery-beat | head -5
 
 # ====== 2. VERIFICAR CONEXIONES ======
@@ -2439,7 +2496,8 @@ check_service postgresql >> $LOG_FILE
 check_service redis-server >> $LOG_FILE
 check_service nginx >> $LOG_FILE
 check_service celery-worker >> $LOG_FILE
-check_service celery-beat >> $LOG_FILE
+# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
+# check_service celery-beat >> $LOG_FILE
 
 for i in 0 1 2 3; do
     check_service udid@$i >> $LOG_FILE
@@ -2501,12 +2559,14 @@ python manage.py collectstatic --noinput
 # Salir y reiniciar servicios
 exit
 sudo /opt/udid/manage_services.sh start
-sudo systemctl restart celery-worker celery-beat
+sudo systemctl restart celery-worker
+# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
+# sudo systemctl restart celery-beat
 sudo systemctl restart nginx
 
 # Verificar estado
 sudo /opt/udid/manage_services.sh status
-sudo systemctl status celery-worker celery-beat
+sudo systemctl status celery-worker
 ```
 
 ### 14.4 Backup de Base de Datos
@@ -2653,7 +2713,9 @@ Si todo falla, reiniciar todos los servicios:
 ```bash
 # Detener todos los servicios
 sudo /opt/udid/manage_services.sh stop
-sudo systemctl stop celery-worker celery-beat celery-flower
+sudo systemctl stop celery-worker celery-flower
+# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
+# sudo systemctl stop celery-beat
 sudo systemctl stop nginx
 sudo systemctl stop redis-server
 sudo systemctl stop postgresql
@@ -2665,7 +2727,9 @@ sleep 5
 sudo systemctl start postgresql
 sudo systemctl start redis-server
 sudo /opt/udid/manage_services.sh start
-sudo systemctl start celery-worker celery-beat
+sudo systemctl start celery-worker
+# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
+# sudo systemctl start celery-beat
 sudo systemctl start celery-flower  # Opcional
 sudo systemctl start nginx
 
@@ -2674,7 +2738,8 @@ sudo systemctl status postgresql
 sudo systemctl status redis-server
 sudo /opt/udid/manage_services.sh status
 sudo systemctl status celery-worker
-sudo systemctl status celery-beat
+# Nota: celery-beat está deshabilitado por defecto
+# sudo systemctl status celery-beat
 sudo systemctl status nginx
 ```
 
@@ -2818,16 +2883,18 @@ sudo systemctl restart nginx                # Reiniciar Nginx
 sudo systemctl restart postgresql           # Reiniciar PostgreSQL
 sudo systemctl restart redis-server         # Reiniciar Redis
 sudo systemctl restart celery-worker        # Reiniciar Celery Worker
-sudo systemctl restart celery-beat         # Reiniciar Celery Beat
+# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
+# sudo systemctl restart celery-beat         # Reiniciar Celery Beat (si está activo)
 sudo systemctl restart celery-flower        # Reiniciar Flower (opcional)
 
 # === LOGS ===
 sudo journalctl -u udid@0 -f               # Ver logs de Daphne
 sudo journalctl -u celery-worker -f        # Ver logs de Celery Worker
-sudo journalctl -u celery-beat -f          # Ver logs de Celery Beat
+# Nota: celery-beat está deshabilitado por defecto
+# sudo journalctl -u celery-beat -f        # Ver logs de Celery Beat (si está activo)
 sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
 sudo tail -f /var/log/udid/celery-worker.log  # Ver logs de Worker
-sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat
+# sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat (si está activo)
 
 # === DJANGO ===
 cd /opt/udid && source venv/bin/activate   # Activar entorno
@@ -2864,13 +2931,14 @@ Antes de considerar el despliegue completo, verificar:
 - [ ] Certificado SSL configurado
 - [ ] Nginx configurado y funcionando
 - [ ] Servicios systemd de Daphne creados y habilitados
-- [ ] Servicios systemd de Celery (Worker y Beat) creados y habilitados
+- [ ] Servicios systemd de Celery Worker creado y habilitado
+- [ ] Celery Beat creado pero NO habilitado (tareas manuales por defecto)
 - [ ] Flower configurado (opcional pero recomendado)
 - [ ] Tareas de mantenimiento en crontab configuradas
 - [ ] Firewall configurado
 - [ ] Pruebas de API exitosas
 - [ ] Pruebas de WebSocket exitosas
-- [ ] Verificación de tareas de Celery ejecutándose correctamente
+- [ ] Verificación de ejecución manual de tareas de Celery
 
 ---
 
