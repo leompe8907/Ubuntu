@@ -366,3 +366,108 @@ def sync_logins_view(request):
             'message': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+@api_view(['GET', 'POST'])
+@permission_classes([AllowAny])
+def sync_subscriberinfo_view(request):
+    """
+    Vista para sincronizar y consolidar información de suscriptores en SubscriberInfo.
+    
+    Este endpoint busca información en las tablas base:
+    - ListOfSubscriber (información básica de suscriptores)
+    - ListOfSmartcards (información de smartcards)
+    - SubscriberLoginInfo (credenciales de login)
+    
+    Y consolida todo en la tabla SubscriberInfo (tabla consolidada).
+    
+    Parámetros opcionales (GET o POST):
+    - mode: 'full' (merge completo), 'sync' (automático - default)
+    
+    Returns:
+        Respuesta con estadísticas de la consolidación
+    """
+    try:
+        # Obtener parámetros
+        if request.method == 'GET':
+            mode = request.query_params.get('mode', 'sync')
+        else:
+            mode = request.data.get('mode', 'sync')
+        
+        logger.info(f"🔄 Iniciando consolidación de información en SubscriberInfo - Modo: {mode}")
+        
+        # Importar función de consolidación
+        from .utils.panaccess.subscriberinfo import (
+            sync_merge_all_subscribers,
+            subscriber_info_empty,
+            last_subscriber_info,
+            get_all_subscriber_codes
+        )
+        
+        # Ejecutar según el modo
+        if mode == 'full':
+            logger.info("📥 Modo: Consolidación completa (fuerza merge de todos)")
+            # Obtener todos los códigos y hacer merge completo
+            codes = sorted(get_all_subscriber_codes())
+            logger.info(f"📊 Total de códigos a procesar: {len(codes)}")
+            
+            from .utils.panaccess.subscriberinfo import merge_subscriber_data
+            total_processed = 0
+            for code in codes:
+                merge_subscriber_data(code)
+                total_processed += 1
+            
+            message = f"Consolidación completa de {total_processed} suscriptores en SubscriberInfo completada"
+            result = {'total_processed': total_processed, 'mode': 'full'}
+            
+        else:  # mode == 'sync' (default)
+            logger.info("🔄 Modo: Sincronización automática (nuevos + actualización)")
+            # Usar la función que evalúa automáticamente
+            sync_merge_all_subscribers()
+            message = "Sincronización automática de SubscriberInfo completada"
+            result = {'mode': 'sync', 'automatic': True}
+        
+        # Obtener estadísticas
+        last_info = last_subscriber_info()
+        last_code = last_info.subscriber_code if last_info else None
+        total_codes = len(get_all_subscriber_codes())
+        
+        logger.info(f"✅ {message}")
+        
+        return Response({
+            'success': True,
+            'message': message,
+            'mode': mode,
+            'last_subscriber_code': last_code,
+            'total_subscriber_codes': total_codes,
+            'database_empty': subscriber_info_empty(),
+            'result': result
+        }, status=status.HTTP_200_OK)
+        
+    except PanaccessException as e:
+        error_msg = f"Error de PanAccess: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        
+        return Response({
+            'success': False,
+            'error_type': type(e).__name__,
+            'message': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    except ValueError as e:
+        error_msg = f"Error de parámetros: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        
+        return Response({
+            'success': False,
+            'error_type': 'ValueError',
+            'message': str(e)
+        }, status=status.HTTP_400_BAD_REQUEST)
+        
+    except Exception as e:
+        error_msg = f"Error inesperado: {str(e)}"
+        logger.error(f"💥 {error_msg}", exc_info=True)
+        
+        return Response({
+            'success': False,
+            'error_type': 'Exception',
+            'message': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
