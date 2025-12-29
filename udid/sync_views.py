@@ -1,7 +1,7 @@
 """
 Vistas para sincronizar datos desde PanAccess.
 
-Endpoints que ejecutan procesos de sincronización completos de suscriptores y smartcards.
+Endpoints que ejecutan procesos de sincronización completos de suscriptores, smartcards y credenciales de login.
 """
 import logging
 from rest_framework.decorators import api_view, permission_classes
@@ -24,6 +24,14 @@ from .utils.panaccess.smartcard import (
     compare_and_update_all_smartcards,
     DataBaseEmpty as SmartcardsDataBaseEmpty,
     LastSmartcard
+)
+from .utils.panaccess.login import (
+    sync_subscriber_logins,
+    fetch_all_logins_from_panaccess,
+    fetch_new_logins_from_panaccess,
+    compare_and_update_all_existing,
+    DataBaseEmpty as LoginsDataBaseEmpty,
+    LastSubscriberLoginInfo
 )
 from .utils.panaccess.exceptions import PanaccessException
 
@@ -222,6 +230,109 @@ def sync_smartcards_view(request):
             'limit_used': limit,
             'last_smartcard_sn': last_sn,
             'database_empty': SmartcardsDataBaseEmpty(),
+            'result': result if result is not None else 'update_completed'
+        }, status=status.HTTP_200_OK)
+        
+    except PanaccessException as e:
+        error_msg = f"Error de PanAccess: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        
+        return Response({
+            'success': False,
+            'error_type': type(e).__name__,
+            'message': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    except ValueError as e:
+        error_msg = f"Error de parámetros: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        
+        return Response({
+            'success': False,
+            'error_type': 'ValueError',
+            'message': str(e)
+        }, status=status.HTTP_400_BAD_REQUEST)
+        
+    except Exception as e:
+        error_msg = f"Error inesperado: {str(e)}"
+        logger.error(f"💥 {error_msg}", exc_info=True)
+        
+        return Response({
+            'success': False,
+            'error_type': 'Exception',
+            'message': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([AllowAny])
+def sync_logins_view(request):
+    """
+    Vista para sincronizar credenciales de login de suscriptores desde PanAccess.
+    
+    Parámetros opcionales (GET o POST):
+    - mode: 'full' (descarga completa), 'incremental' (solo nuevos), 
+            'update' (solo actualizar existentes), 'sync' (completo - default)
+    
+    Returns:
+        Respuesta con estadísticas de la sincronización
+    """
+    try:
+        # Obtener parámetros
+        if request.method == 'GET':
+            mode = request.query_params.get('mode', 'sync')
+        else:
+            mode = request.data.get('mode', 'sync')
+        
+        logger.info(f"🔄 Iniciando sincronización de credenciales de login - Modo: {mode}")
+        
+        # Ejecutar según el modo
+        if mode == 'full':
+            logger.info("📥 Modo: Descarga completa")
+            result = fetch_all_logins_from_panaccess(session_id=None)
+            message = "Descarga completa de credenciales de login completada"
+            
+        elif mode == 'incremental':
+            logger.info("📥 Modo: Descarga incremental (solo nuevos)")
+            if LoginsDataBaseEmpty():
+                return Response({
+                    'success': False,
+                    'message': 'La base de datos está vacía. Use mode=full para descarga completa.',
+                    'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            result = fetch_new_logins_from_panaccess(session_id=None)
+            message = "Descarga incremental de credenciales de login completada"
+            
+        elif mode == 'update':
+            logger.info("🔄 Modo: Actualización de existentes")
+            if LoginsDataBaseEmpty():
+                return Response({
+                    'success': False,
+                    'message': 'La base de datos está vacía. No hay registros para actualizar.',
+                    'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            result = compare_and_update_all_existing(session_id=None)
+            message = "Actualización de credenciales de login existentes completada"
+            
+        else:  # mode == 'sync' (default)
+            logger.info("🔄 Modo: Sincronización completa (nuevos + actualización)")
+            result = sync_subscriber_logins(session_id=None)
+            message = "Sincronización completa de credenciales de login completada"
+        
+        # Obtener estadísticas
+        last_login = LastSubscriberLoginInfo()
+        last_code = last_login.subscriberCode if last_login else None
+        
+        logger.info(f"✅ {message}")
+        
+        return Response({
+            'success': True,
+            'message': message,
+            'mode': mode,
+            'last_subscriber_code': last_code,
+            'database_empty': LoginsDataBaseEmpty(),
             'result': result if result is not None else 'update_completed'
         }, status=status.HTTP_200_OK)
         

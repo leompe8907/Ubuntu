@@ -118,3 +118,5 @@ except Exception as e:
 finally:
     print("\n   Para detener el worker, presiona Ctrl+C o cierra esta ventana")
 
+
+

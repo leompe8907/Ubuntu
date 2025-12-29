@@ -1101,7 +1101,6 @@ class SubscriberInfoListView(ListAPIView):
     # 🔎 Búsqueda parcial (parámetro: ?search=juan)
     search_fields = ['subscriber_code', 'sn', 'login1']
 
-
 class MetricsDashboardView(APIView):
     """
     Vista del dashboard de métricas del sistema (solo JSON para pruebas).

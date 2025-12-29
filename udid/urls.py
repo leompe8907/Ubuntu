@@ -14,7 +14,8 @@ from .panaccess_views import (
 )
 from .sync_views import (
     sync_subscribers_view,
-    sync_smartcards_view
+    sync_smartcards_view,
+    sync_logins_view
 )
 
 urlpatterns = [
@@ -58,4 +59,5 @@ urlpatterns = [
     #* Sincronización de datos desde PanAccess
     path('sync/subscribers/', sync_subscribers_view, name='sync-subscribers'),
     path('sync/smartcards/', sync_smartcards_view, name='sync-smartcards'),
+    path('sync/logins/', sync_logins_view, name='sync-logins'),
 ]

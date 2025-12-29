@@ -125,3 +125,5 @@ print("   1. Verifica que el worker esté corriendo")
 print("   2. Revisa los logs del worker en la terminal donde lo iniciaste")
 print("   3. Reinicia el worker si es necesario")
 
+
+
