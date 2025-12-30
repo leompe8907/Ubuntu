@@ -1,13 +1,25 @@
 import logging
 import json
+import time
 from django.db import transaction
 from typing import Optional
 from .singleton import get_panaccess
-from .exceptions import PanaccessException, PanaccessAPIError
+from .exceptions import (
+    PanaccessException, 
+    PanaccessAPIError, 
+    PanaccessTimeoutError,
+    PanaccessSessionError
+)
+from .checkpoint import save_checkpoint, get_last_processed_offset, clear_checkpoint
 from ...models import ListOfSmartcards, ListOfSubscriber
 from ...serializers import ListOfSmartcardsSerializer
 
 logger = logging.getLogger(__name__)
+
+# Configuración de timeouts y reintentos
+DEFAULT_TIMEOUT = 30  # 30 segundos (el servidor tiene timeout de ~20s)
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # segundos entre reintentos
 
 
 def DataBaseEmpty():
@@ -28,38 +40,117 @@ def LastSmartcard():
         logger.warning("No se encontraron smartcards en la base de datos.")
         return None
 
-def fetch_all_smartcards(session_id=None, limit=100, timeout=None):
+def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, resume=False):
     """
     Descarga todos los smartcards desde Panaccess y los almacena en la base de datos.
+    
+    Guarda cada lote inmediatamente para evitar pérdida de datos en caso de fallos.
+    Implementa reintentos automáticos y manejo de timeouts.
     
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
-        timeout: Timeout en segundos (ignorado, siempre usa timeout=None para sin límite)
+        timeout: Timeout en segundos para cada llamada (default: 30)
+        resume: Si True, reanuda desde el último checkpoint guardado
+    
+    Returns:
+        Dict con estadísticas de la descarga
     """
-    logger.info("Iniciando descarga completa de smartcards desde Panaccess (sin timeout)...")
-    offset = 0
-    all_data = []
+    logger.info(f"🔄 Iniciando descarga completa de smartcards (timeout: {timeout}s, resume: {resume})...")
+    
+    # Obtener offset inicial (desde checkpoint si resume=True)
+    if resume:
+        offset = get_last_processed_offset('smartcards')
+        if offset > 0:
+            logger.info(f"📌 Reanudando desde offset {offset}")
+    else:
+        offset = 0
+        clear_checkpoint('smartcards')
+    
+    total_saved = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 5
     
     while True:
-        result = CallListSmartcards(session_id, offset, limit)
-        smartcard_entries = result.get("smartcardEntries", [])
-        if not smartcard_entries:
+        retry_count = 0
+        batch_saved = False
+        
+        while retry_count < MAX_RETRIES:
+            try:
+                # Llamar API con timeout configurable
+                result = CallListSmartcards(session_id, offset, limit, timeout=timeout)
+                smartcard_entries = result.get("smartcardEntries", [])
+                
+                if not smartcard_entries:
+                    logger.info("✅ No hay más smartcards. Descarga completada.")
+                    clear_checkpoint('smartcards')
+                    break
+                
+                # Guardar INMEDIATAMENTE en BD
+                saved_count = store_smartcards_batch(smartcard_entries)
+                total_saved += saved_count
+                
+                # Guardar checkpoint
+                save_checkpoint('smartcards', offset + limit, {
+                    'total_saved': total_saved,
+                    'last_batch_size': len(smartcard_entries)
+                })
+                
+                offset += limit
+                consecutive_errors = 0
+                batch_saved = True
+                
+                logger.info(f"✅ Guardados {total_saved} smartcards (offset: {offset}, lote: {len(smartcard_entries)})")
+                break  # Salir del loop de reintentos
+                
+            except PanaccessTimeoutError as e:
+                retry_count += 1
+                consecutive_errors += 1
+                
+                if retry_count >= MAX_RETRIES:
+                    logger.error(f"❌ Timeout después de {MAX_RETRIES} reintentos en offset {offset}")
+                    raise
+                
+                logger.warning(f"⏱️ Timeout en offset {offset} (intento {retry_count}/{MAX_RETRIES}), reintentando...")
+                time.sleep(RETRY_DELAY * retry_count)  # Backoff exponencial
+                
+            except PanaccessSessionError as e:
+                # Refrescar sesión y reintentar
+                logger.warning(f"🔑 Sesión expirada en offset {offset}, refrescando...")
+                panaccess = get_panaccess()
+                panaccess.reset_session()
+                panaccess.ensure_session()
+                time.sleep(1)
+                # No incrementar retry_count para errores de sesión
+                
+            except PanaccessException as e:
+                retry_count += 1
+                consecutive_errors += 1
+                
+                if retry_count >= MAX_RETRIES:
+                    logger.error(f"❌ Error después de {MAX_RETRIES} reintentos: {str(e)}")
+                    raise
+                
+                logger.warning(f"⚠️ Error en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
+                time.sleep(RETRY_DELAY * retry_count)
+        
+        # Si no se pudo guardar el lote después de todos los reintentos, salir
+        if not batch_saved:
+            logger.error(f"❌ No se pudo procesar el lote en offset {offset} después de {MAX_RETRIES} intentos")
             break
         
-        for entry in smartcard_entries:
-            # Validar que entry tenga la estructura esperada
-            if not isinstance(entry, dict) or 'sn' not in entry:
-                logger.warning(f"Entrada con estructura inválida, se omite: {entry.get('sn', 'unknown')}")
-                continue
-            
-            all_data.append(entry)
-        
-        offset += limit
-        logger.info(f"Procesados {len(all_data)} smartcards hasta ahora...")
+        # Si hay muchos errores consecutivos, puede ser un problema mayor
+        if consecutive_errors >= max_consecutive_errors:
+            logger.error(f"❌ Demasiados errores consecutivos ({consecutive_errors}). Deteniendo descarga.")
+            break
     
-    logger.info(f"Total de smartcards descargados: {len(all_data)}")
-    return store_all_smartcards_in_chunks(all_data)
+    logger.info(f"✅ Descarga completada. Total guardados: {total_saved} smartcards")
+    clear_checkpoint('smartcards')
+    
+    return {
+        'total_saved': total_saved,
+        'last_offset': offset
+    }
 
 def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
     """
@@ -81,63 +172,150 @@ def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
         except Exception as e:
             logger.error(f"Error al insertar chunk desde {i} hasta {i+chunk_size}: {str(e)}")
 
-def download_smartcards_since_last(session_id=None, limit=100):
+
+def store_smartcards_batch(smartcard_entries, chunk_size=100):
+    """
+    Guarda un lote de smartcards inmediatamente en la base de datos.
+    
+    Args:
+        smartcard_entries: Lista de smartcards a guardar
+        chunk_size: Tamaño del chunk para bulk_create
+    
+    Returns:
+        Número de smartcards guardadas exitosamente
+    """
+    if not smartcard_entries:
+        return 0
+    
+    total_saved = 0
+    
+    try:
+        with transaction.atomic():
+            # Validar y preparar registros
+            registros = []
+            for entry in smartcard_entries:
+                if not isinstance(entry, dict) or 'sn' not in entry:
+                    logger.warning(f"Entrada inválida omitida: {entry.get('sn', 'unknown')}")
+                    continue
+                
+                try:
+                    registros.append(ListOfSmartcards(**entry))
+                except Exception as e:
+                    logger.warning(f"Error creando objeto para SN {entry.get('sn')}: {str(e)}")
+                    continue
+            
+            if not registros:
+                return 0
+            
+            # Guardar en chunks
+            for i in range(0, len(registros), chunk_size):
+                chunk = registros[i:i + chunk_size]
+                ListOfSmartcards.objects.bulk_create(chunk, ignore_conflicts=True)
+                total_saved += len(chunk)
+            
+            logger.debug(f"💾 Guardados {total_saved} smartcards en BD")
+            
+    except Exception as e:
+        logger.error(f"❌ Error guardando lote de smartcards: {str(e)}")
+        raise
+    
+    return total_saved
+
+def download_smartcards_since_last(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Descarga smartcards nuevos desde el último registrado (modo incremental).
+    Guarda cada lote inmediatamente.
     
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
+        timeout: Timeout en segundos para cada llamada
     """
-    logger.info("Iniciando descarga incremental de smartcards desde Panaccess...")
+    logger.info("🔄 Iniciando descarga incremental de smartcards desde Panaccess...")
     last = LastSmartcard()
     if not last:
-        logger.warning("No hay smartcards registradas. Se recomienda usar descarga total.")
-        return []
+        logger.warning("⚠️ No hay smartcards registradas. Se recomienda usar descarga total.")
+        return {'total_saved': 0}
     
     highest_sn = last.sn
-    logger.info(f"Buscando smartcards posteriores al SN: {highest_sn}")
+    logger.info(f"🔍 Buscando smartcards posteriores al SN: {highest_sn}")
     offset = 0
-    new_data = []
+    total_saved = 0
     found = False
     
     while True:
-        result = CallListSmartcards(session_id, offset, limit)
-        smartcard_entries = result.get("smartcardEntries", [])
-        if not smartcard_entries:
+        retry_count = 0
+        batch_processed = False
+        
+        while retry_count < MAX_RETRIES:
+            try:
+                result = CallListSmartcards(session_id, offset, limit, timeout=timeout)
+                smartcard_entries = result.get("smartcardEntries", [])
+                
+                if not smartcard_entries:
+                    logger.info("✅ No hay más smartcards nuevos.")
+                    break
+                
+                # Procesar y guardar inmediatamente
+                batch_to_save = []
+                for entry in smartcard_entries:
+                    if not isinstance(entry, dict) or 'sn' not in entry:
+                        logger.warning(f"Entrada inválida omitida: {entry.get('sn', 'unknown')}")
+                        continue
+                    
+                    sn = entry.get('sn')
+                    
+                    if sn == highest_sn:
+                        found = True
+                        logger.info(f"✅ SN {highest_sn} encontrado. Fin de descarga incremental.")
+                        break
+                    
+                    batch_to_save.append(entry)
+                
+                # Guardar lote inmediatamente
+                if batch_to_save:
+                    saved_count = store_smartcards_batch(batch_to_save)
+                    total_saved += saved_count
+                    logger.info(f"✅ Guardados {total_saved} smartcards nuevos (offset: {offset})")
+                
+                batch_processed = True
+                break  # Salir del loop de reintentos
+                
+            except (PanaccessTimeoutError, PanaccessSessionError) as e:
+                retry_count += 1
+                if retry_count >= MAX_RETRIES:
+                    logger.error(f"❌ Error después de {MAX_RETRIES} reintentos: {str(e)}")
+                    raise
+                
+                logger.warning(f"⚠️ Error en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
+                if isinstance(e, PanaccessSessionError):
+                    panaccess = get_panaccess()
+                    panaccess.reset_session()
+                    panaccess.ensure_session()
+                time.sleep(RETRY_DELAY * retry_count)
+        
+        if not batch_processed:
+            logger.error(f"❌ No se pudo procesar el lote en offset {offset}")
             break
         
-        for entry in smartcard_entries:
-            if not isinstance(entry, dict) or 'sn' not in entry:
-                logger.warning(f"Entrada con estructura inválida, se omite: {entry.get('sn', 'unknown')}")
-                continue
-            
-            sn = entry.get('sn')
-            
-            if sn == highest_sn:
-                found = True
-                logger.info(f"SN {highest_sn} encontrado. Fin de descarga incremental.")
-                break
-            
-            new_data.append(entry)
-        
-        if found:
+        if found or not smartcard_entries:
             break
+        
         offset += limit
-        logger.info(f"Procesados {len(new_data)} smartcards nuevos hasta ahora...")
     
-    logger.info(f"Total de smartcards nuevos descargados: {len(new_data)}")
-    return store_all_smartcards_in_chunks(new_data)
+    logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} smartcards nuevos")
+    return {'total_saved': total_saved}
 
-def compare_and_update_all_smartcards(session_id=None, limit=100):
+def compare_and_update_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Compara todos los smartcards de Panaccess con los de la base local y actualiza si hay diferencias.
     
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
+        timeout: Timeout en segundos para cada llamada
     """
-    logger.info("Comparando smartcards de Panaccess con la base de datos...")
+    logger.info("🔄 Comparando smartcards de Panaccess con la base de datos...")
     local_data = {
         obj.sn: obj for obj in ListOfSmartcards.objects.all() if obj.sn
     }
@@ -145,7 +323,13 @@ def compare_and_update_all_smartcards(session_id=None, limit=100):
     total_updated = 0
     
     while True:
-        response = CallListSmartcards(session_id, offset, limit)
+        try:
+            response = CallListSmartcards(session_id, offset, limit, timeout=timeout)
+        except (PanaccessTimeoutError, PanaccessSessionError) as e:
+            logger.warning(f"⚠️ Error en offset {offset}: {str(e)}. Continuando...")
+            offset += limit
+            continue
+        
         remote_list = response.get("smartcardEntries", [])
         if not remote_list:
             break
@@ -233,7 +417,7 @@ def sync_smartcards(session_id=None, limit=100):
         logger.error(f"Error inesperado: {str(e)}", exc_info=True)
         raise
 
-def CallListSmartcards(session_id=None, offset=0, limit=100):
+def CallListSmartcards(session_id=None, offset=0, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Llama a la API de Panaccess para obtener la lista de smartcards.
     
@@ -241,11 +425,18 @@ def CallListSmartcards(session_id=None, offset=0, limit=100):
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         offset: Índice de inicio para paginación
         limit: Cantidad máxima de registros a obtener
+        timeout: Timeout en segundos (default: 30)
     
     Returns:
         Diccionario con la respuesta de PanAccess
+    
+    Raises:
+        PanaccessTimeoutError: Si la llamada excede el timeout
+        PanaccessSessionError: Si la sesión ha expirado
+        PanaccessAPIError: Si hay un error en la API
     """
-    logger.info(f"Llamando API Panaccess: offset={offset}, limit={limit} (sin timeout)")
+    timeout_msg = f"{timeout}s" if timeout else "sin límite"
+    logger.info(f"📞 Llamando API Panaccess: offset={offset}, limit={limit} (timeout: {timeout_msg})")
     
     try:
         # Usar el singleton de PanAccess
@@ -259,22 +450,34 @@ def CallListSmartcards(session_id=None, offset=0, limit=100):
             'orderBy': 'sn'
         }
         
-        # Hacer la llamada usando el singleton SIN timeout (None)
-        # Esto permite que la llamada espere indefinidamente hasta que Panaccess responda
-        response = panaccess.call('getListOfSmartcards', parameters, timeout=None)
+        # Hacer la llamada con timeout configurable
+        response = panaccess.call('getListOfSmartcards', parameters, timeout=timeout)
 
         if response.get('success'):
-            return response.get('answer', {})
+            answer = response.get('answer', {})
+            count = answer.get('count', 0)
+            entries = answer.get('smartcardEntries', [])
+            logger.debug(f"✅ Respuesta recibida: {len(entries)} smartcards (total: {count})")
+            return answer
         else:
             error_message = response.get('errorMessage', 'Error desconocido al obtener smartcards')
-            logger.error(f"Error en respuesta de PanAccess: {error_message}")
+            
+            # Detectar errores de sesión
+            if 'session' in error_message.lower() or 'logged' in error_message.lower():
+                logger.error(f"🔑 Error de sesión: {error_message}")
+                raise PanaccessSessionError(f"Sesión expirada o inválida: {error_message}")
+            
+            logger.error(f"❌ Error en respuesta de PanAccess: {error_message}")
             raise PanaccessAPIError(error_message)
 
+    except (PanaccessTimeoutError, PanaccessSessionError):
+        # Re-lanzar excepciones específicas
+        raise
     except PanaccessException:
         raise
     except Exception as e:
-        logger.error(f"Fallo en la llamada a getListOfSmartcards: {str(e)}", exc_info=True)
-        raise
+        logger.error(f"💥 Fallo en la llamada a getListOfSmartcards: {str(e)}", exc_info=True)
+        raise PanaccessAPIError(f"Error inesperado: {str(e)}")
 
 
 def extract_sns_from_smartcards_field(smartcards_data):

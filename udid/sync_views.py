@@ -71,7 +71,9 @@ def sync_subscribers_view(request):
         # Ejecutar según el modo
         if mode == 'full':
             logger.info("📥 Modo: Descarga completa")
-            result = fetch_all_subscribers(session_id=None, limit=limit)
+            # Permitir reanudar si hay checkpoint
+            resume = request.query_params.get('resume', 'false').lower() == 'true' if request.method == 'GET' else request.data.get('resume', False)
+            result = fetch_all_subscribers(session_id=None, limit=limit, resume=resume)
             message = "Descarga completa de suscriptores completada"
             
         elif mode == 'incremental':
@@ -95,7 +97,7 @@ def sync_subscribers_view(request):
                     'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
                 }, status=status.HTTP_400_BAD_REQUEST)
             
-            compare_and_update_all_subscribers(session_id=None, limit=limit)
+            compare_and_update_all_subscribers(session_id=None, limit=limit, timeout=30)
             result = None
             message = "Actualización de suscriptores existentes completada"
             
@@ -184,7 +186,9 @@ def sync_smartcards_view(request):
         # Ejecutar según el modo
         if mode == 'full':
             logger.info("📥 Modo: Descarga completa")
-            result = fetch_all_smartcards(session_id=None, limit=limit)
+            # Permitir reanudar si hay checkpoint
+            resume = request.query_params.get('resume', 'false').lower() == 'true' if request.method == 'GET' else request.data.get('resume', False)
+            result = fetch_all_smartcards(session_id=None, limit=limit, resume=resume)
             message = "Descarga completa de smartcards completada"
             
         elif mode == 'incremental':
@@ -208,7 +212,7 @@ def sync_smartcards_view(request):
                     'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
                 }, status=status.HTTP_400_BAD_REQUEST)
             
-            compare_and_update_all_smartcards(session_id=None, limit=limit)
+            compare_and_update_all_smartcards(session_id=None, limit=limit, timeout=30)
             result = None
             message = "Actualización de smartcards existentes completada"
             
