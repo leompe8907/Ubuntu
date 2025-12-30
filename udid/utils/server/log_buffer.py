@@ -95,17 +95,41 @@ class LogBuffer:
         # Escribir en BD en batch (fire-and-forget)
         # Usar thread separado para no bloquear
         def write_to_db():
-            try:
-                with transaction.atomic():
-                    from udid.models import AuthAuditLog
-                    # Usar bulk_create para mejor rendimiento
-                    AuthAuditLog.objects.bulk_create([
-                        AuthAuditLog(**log_data) for log_data in logs_to_write
-                    ], ignore_conflicts=True)  # Ignorar conflictos si hay duplicados
-                logger.debug(f"LogBuffer: Wrote {buffer_size} logs to DB")
-            except Exception as e:
-                # Log error pero no bloquear
-                logger.error(f"Error writing {buffer_size} logs to DB: {e}", exc_info=True)
+            from django.db.utils import OperationalError, DatabaseError
+            from udid.utils.db_utils import is_connection_error, reconnect_database
+            
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    with transaction.atomic():
+                        from udid.models import AuthAuditLog
+                        # Usar bulk_create para mejor rendimiento
+                        AuthAuditLog.objects.bulk_create([
+                            AuthAuditLog(**log_data) for log_data in logs_to_write
+                        ], ignore_conflicts=True)  # Ignorar conflictos si hay duplicados
+                    logger.debug(f"LogBuffer: Wrote {buffer_size} logs to DB")
+                    return  # Éxito
+                except (OperationalError, DatabaseError) as e:
+                    if is_connection_error(e):
+                        retry_count += 1
+                        logger.warning(f"LogBuffer: Conexión perdida (intento {retry_count}/{max_retries}). Reconectando...")
+                        reconnect_database()
+                        if retry_count < max_retries:
+                            time.sleep(2 * retry_count)
+                            continue
+                        else:
+                            logger.error(f"LogBuffer: No se pudo reconectar después de {max_retries} intentos")
+                            return
+                    else:
+                        # Otro error de BD, loggear y salir
+                        logger.error(f"LogBuffer: Error de BD escribiendo {buffer_size} logs: {e}", exc_info=True)
+                        return
+                except Exception as e:
+                    # Log error pero no bloquear
+                    logger.error(f"LogBuffer: Error writing {buffer_size} logs to DB: {e}", exc_info=True)
+                    return
         
         # Ejecutar en thread separado para no bloquear
         write_thread = threading.Thread(target=write_to_db, daemon=True)

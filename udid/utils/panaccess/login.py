@@ -1,10 +1,12 @@
 import logging
-from django.db import transaction
+from django.db import transaction, connection
+from django.db.utils import OperationalError, DatabaseError
 from typing import Optional
 from .singleton import get_panaccess
 from .exceptions import PanaccessException, PanaccessAPIError
 from ...models import ListOfSubscriber, SubscriberLoginInfo
 from ...serializers import SubscriberLoginInfoSerializer
+from ...utils.db_utils import is_connection_error, reconnect_database
 
 logger = logging.getLogger(__name__)
 
@@ -71,29 +73,48 @@ def store_logins_to_db(login_data_list):
     """
     logger.info("Iniciando almacenamiento de logins en la base de datos...")
     saved_count = 0
-    with transaction.atomic():
-        for login_data in login_data_list:
-            subscriber_code = login_data.get('subscriberCode')
-            if not subscriber_code:
-                logger.warning("Registro omitido: falta 'subscriberCode'.")
-                continue
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            with transaction.atomic():
+                for login_data in login_data_list:
+                    subscriber_code = login_data.get('subscriberCode')
+                    if not subscriber_code:
+                        logger.warning("Registro omitido: falta 'subscriberCode'.")
+                        continue
 
-            try:
-                # CORRECCIÓN: Usar get_or_create para evitar duplicados
-                obj, created = SubscriberLoginInfo.objects.get_or_create(
-                    subscriberCode=subscriber_code,
-                    defaults={k: v for k, v in login_data.items() if k != 'subscriberCode'}
-                )
-                if created:
-                    saved_count += 1
-                    logger.debug(f"Nuevo registro creado para {subscriber_code}")
+                    try:
+                        # CORRECCIÓN: Usar get_or_create para evitar duplicados
+                        obj, created = SubscriberLoginInfo.objects.get_or_create(
+                            subscriberCode=subscriber_code,
+                            defaults={k: v for k, v in login_data.items() if k != 'subscriberCode'}
+                        )
+                        if created:
+                            saved_count += 1
+                            logger.debug(f"Nuevo registro creado para {subscriber_code}")
+                        else:
+                            logger.debug(f"Registro ya existe para {subscriber_code}")
+                    except Exception as e:
+                        logger.error(f"Error al guardar login de {subscriber_code}: {str(e)}")
+            
+            logger.info(f"Total de registros guardados correctamente: {saved_count}")
+            return saved_count
+            
+        except (OperationalError, DatabaseError) as e:
+            if is_connection_error(e):
+                retry_count += 1
+                logger.warning(f"Conexión perdida (intento {retry_count}/{max_retries}). Reconectando...")
+                reconnect_database()
+                if retry_count < max_retries:
+                    import time
+                    time.sleep(2 * retry_count)
+                    continue
                 else:
-                    logger.debug(f"Registro ya existe para {subscriber_code}")
-            except Exception as e:
-                logger.error(f"Error al guardar login de {subscriber_code}: {str(e)}")
-
-    logger.info(f"Total de registros guardados correctamente: {saved_count}")
-    return saved_count
+                    raise DatabaseError(f"No se pudo reconectar después de {max_retries} intentos")
+            else:
+                raise
 
 def fetch_new_logins_from_panaccess(session_id=None):
     """
@@ -198,9 +219,29 @@ def compare_and_update_all_existing(session_id=None):
             # Guardar solo si hay cambios
             if changed_fields:
                 try:
-                    local_obj.save(update_fields=changed_fields)
-                    total_updated += 1
-                    logger.debug(f"Subscriber {subscriber_code} actualizado. Campos: {changed_fields}")
+                    max_retries = 3
+                    retry_count = 0
+                    
+                    while retry_count < max_retries:
+                        try:
+                            local_obj.save(update_fields=changed_fields)
+                            total_updated += 1
+                            logger.debug(f"Subscriber {subscriber_code} actualizado. Campos: {changed_fields}")
+                            break  # Éxito
+                        except (OperationalError, DatabaseError) as e:
+                            if is_connection_error(e):
+                                retry_count += 1
+                                logger.warning(f"Conexión perdida al actualizar {subscriber_code} (intento {retry_count}/{max_retries})")
+                                reconnect_database()
+                                if retry_count < max_retries:
+                                    import time
+                                    time.sleep(2 * retry_count)
+                                    continue
+                                else:
+                                    logger.error(f"No se pudo reconectar después de {max_retries} intentos para {subscriber_code}")
+                                    break
+                            else:
+                                raise
                 except Exception as e:
                     logger.error(f"Error actualizando subscriber {subscriber_code}: {str(e)}")
             else:

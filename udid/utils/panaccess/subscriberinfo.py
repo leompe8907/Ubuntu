@@ -1,6 +1,8 @@
 from ...models import ListOfSubscriber, ListOfSmartcards, SubscriberLoginInfo, SubscriberInfo
-from django.db import transaction
+from django.db import transaction, connection
+from django.db.utils import OperationalError, DatabaseError
 import logging
+from ...utils.db_utils import is_connection_error, reconnect_database
 
 logger = logging.getLogger(__name__)
 
@@ -121,47 +123,67 @@ def merge_subscriber_data(subscriber_code):
             logger.warning(f"[merge_subscriber_data] No hay datos de login para {subscriber_code}")
             return
 
-        # Crear un registro por cada SN
-        with transaction.atomic():
-            logger.info(f"[merge_subscriber_data] Procesando {len(smartcard_data_list)} smartcards para {subscriber_code}")
-            for smartcard_data in smartcard_data_list:
-                sn = smartcard_data.get('sn')
-                if not sn:
-                    continue
+        # Crear un registro por cada SN con reconexión automática
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                with transaction.atomic():
+                    logger.info(f"[merge_subscriber_data] Procesando {len(smartcard_data_list)} smartcards para {subscriber_code}")
+                    for smartcard_data in smartcard_data_list:
+                        sn = smartcard_data.get('sn')
+                        if not sn:
+                            continue
 
-                obj, created = SubscriberInfo.objects.get_or_create(
-                    subscriber_code=subscriber_code,
-                    sn=sn,
-                )
+                        obj, created = SubscriberInfo.objects.get_or_create(
+                            subscriber_code=subscriber_code,
+                            sn=sn,
+                        )
 
-                # Datos de Smartcard
-                obj.first_name = smartcard_data.get('firstName')
-                obj.last_name = smartcard_data.get('lastName')
-                obj.lastActivation = smartcard_data.get('lastActivation')
-                obj.lastContact = smartcard_data.get('lastContact')
-                obj.lastServiceListDownload = smartcard_data.get('lastServiceListDownload')
-                obj.lastActivationIP = smartcard_data.get('lastActivationIP')
-                obj.lastApiKeyId = smartcard_data.get('lastApiKeyId')
-                obj.products = smartcard_data.get('products')
-                obj.packages = smartcard_data.get('packages')
-                obj.packageNames = smartcard_data.get('packageNames')
-                obj.model = smartcard_data.get('model')
+                        # Datos de Smartcard
+                        obj.first_name = smartcard_data.get('firstName')
+                        obj.last_name = smartcard_data.get('lastName')
+                        obj.lastActivation = smartcard_data.get('lastActivation')
+                        obj.lastContact = smartcard_data.get('lastContact')
+                        obj.lastServiceListDownload = smartcard_data.get('lastServiceListDownload')
+                        obj.lastActivationIP = smartcard_data.get('lastActivationIP')
+                        obj.lastApiKeyId = smartcard_data.get('lastApiKeyId')
+                        obj.products = smartcard_data.get('products')
+                        obj.packages = smartcard_data.get('packages')
+                        obj.packageNames = smartcard_data.get('packageNames')
+                        obj.model = smartcard_data.get('model')
 
-                pin_raw = smartcard_data.get('pin')
-                if pin_raw:
-                    obj.set_pin(pin_raw)
+                        pin_raw = smartcard_data.get('pin')
+                        if pin_raw:
+                            obj.set_pin(pin_raw)
 
-                # Datos de login
-                if login_data:
-                    obj.login1 = login_data.get('login1')
-                    obj.login2 = login_data.get('login2')
-                    password_raw = login_data.get('password')
-                    if password_raw:
-                        obj.set_password(password_raw)
+                        # Datos de login
+                        if login_data:
+                            obj.login1 = login_data.get('login1')
+                            obj.login2 = login_data.get('login2')
+                            password_raw = login_data.get('password')
+                            if password_raw:
+                                obj.set_password(password_raw)
 
-                obj.save()
+                        obj.save()
 
-                logger.info(f"[merge_subscriber_data] Registro {'creado' if created else 'actualizado'} para SN={sn}")
+                        logger.info(f"[merge_subscriber_data] Registro {'creado' if created else 'actualizado'} para SN={sn}")
+                break  # Éxito, salir del loop
+                
+            except (OperationalError, DatabaseError) as e:
+                if is_connection_error(e):
+                    retry_count += 1
+                    logger.warning(f"[merge_subscriber_data] Conexión perdida (intento {retry_count}/{max_retries}). Reconectando...")
+                    reconnect_database()
+                    if retry_count < max_retries:
+                        import time
+                        time.sleep(2 * retry_count)
+                        continue
+                    else:
+                        raise DatabaseError(f"No se pudo reconectar después de {max_retries} intentos")
+                else:
+                    raise
 
     except Exception as e:
         logger.error(f"[merge_subscriber_data] Error inesperado en {subscriber_code}: {str(e)}")
@@ -192,86 +214,104 @@ def compare_and_update_subscriber_data(subscriber_code):
         existing_by_sn = {record.sn: record for record in existing_records}
 
         total_updated = 0
+        max_retries = 3
+        retry_count = 0
         
-        with transaction.atomic():
-            for smartcard_data in smartcard_data_list:
-                sn = smartcard_data.get('sn')
-                if not sn or sn not in existing_by_sn:
-                    continue
+        while retry_count < max_retries:
+            try:
+                with transaction.atomic():
+                    for smartcard_data in smartcard_data_list:
+                        sn = smartcard_data.get('sn')
+                        if not sn or sn not in existing_by_sn:
+                            continue
 
-                obj = existing_by_sn[sn]
-                changed_fields = []
+                        obj = existing_by_sn[sn]
+                        changed_fields = []
 
-                # Comparar campos de smartcard
-                smartcard_fields = {
-                    'first_name': smartcard_data.get('firstName'),
-                    'last_name': smartcard_data.get('lastName'),
-                    'lastActivation': smartcard_data.get('lastActivation'),
-                    'lastContact': smartcard_data.get('lastContact'),
-                    'lastServiceListDownload': smartcard_data.get('lastServiceListDownload'),
-                    'lastActivationIP': smartcard_data.get('lastActivationIP'),
-                    'lastApiKeyId': smartcard_data.get('lastApiKeyId'),
-                    'products': smartcard_data.get('products'),
-                    'packages': smartcard_data.get('packages'),
-                    'packageNames': smartcard_data.get('packageNames'),
-                    'model': smartcard_data.get('model'),
-                }
+                        # Comparar campos de smartcard
+                        smartcard_fields = {
+                            'first_name': smartcard_data.get('firstName'),
+                            'last_name': smartcard_data.get('lastName'),
+                            'lastActivation': smartcard_data.get('lastActivation'),
+                            'lastContact': smartcard_data.get('lastContact'),
+                            'lastServiceListDownload': smartcard_data.get('lastServiceListDownload'),
+                            'lastActivationIP': smartcard_data.get('lastActivationIP'),
+                            'lastApiKeyId': smartcard_data.get('lastApiKeyId'),
+                            'products': smartcard_data.get('products'),
+                            'packages': smartcard_data.get('packages'),
+                            'packageNames': smartcard_data.get('packageNames'),
+                            'model': smartcard_data.get('model'),
+                        }
 
-                for field_name, new_value in smartcard_fields.items():
-                    current_value = getattr(obj, field_name)
-                    # Comparar valores, manejando None y listas
-                    if isinstance(current_value, list) and isinstance(new_value, list):
-                        if current_value != new_value:
-                            setattr(obj, field_name, new_value)
-                            changed_fields.append(field_name)
-                    elif isinstance(current_value, dict) and isinstance(new_value, dict):
-                        # También manejar diccionarios si es necesario
-                        if current_value != new_value:
-                            setattr(obj, field_name, new_value)
-                            changed_fields.append(field_name)
-                    elif str(current_value) != str(new_value):
-                        setattr(obj, field_name, new_value)
-                        changed_fields.append(field_name)
+                        for field_name, new_value in smartcard_fields.items():
+                            current_value = getattr(obj, field_name)
+                            # Comparar valores, manejando None y listas
+                            if isinstance(current_value, list) and isinstance(new_value, list):
+                                if current_value != new_value:
+                                    setattr(obj, field_name, new_value)
+                                    changed_fields.append(field_name)
+                            elif isinstance(current_value, dict) and isinstance(new_value, dict):
+                                # También manejar diccionarios si es necesario
+                                if current_value != new_value:
+                                    setattr(obj, field_name, new_value)
+                                    changed_fields.append(field_name)
+                            elif str(current_value) != str(new_value):
+                                setattr(obj, field_name, new_value)
+                                changed_fields.append(field_name)
 
-                # Comparar PIN
-                pin_raw = smartcard_data.get('pin')
-                if pin_raw:
-                    current_pin = obj.get_pin()
-                    if current_pin != pin_raw:
-                        obj.set_pin(pin_raw)
-                        changed_fields.append('pin_hash')
+                        # Comparar PIN
+                        pin_raw = smartcard_data.get('pin')
+                        if pin_raw:
+                            current_pin = obj.get_pin()
+                            if current_pin != pin_raw:
+                                obj.set_pin(pin_raw)
+                                changed_fields.append('pin_hash')
 
-                # Comparar campos de login
-                if login_data:
-                    login_fields = {
-                        'login1': login_data.get('login1'),
-                        'login2': login_data.get('login2'),
-                    }
+                        # Comparar campos de login
+                        if login_data:
+                            login_fields = {
+                                'login1': login_data.get('login1'),
+                                'login2': login_data.get('login2'),
+                            }
 
-                    for field_name, new_value in login_fields.items():
-                        current_value = getattr(obj, field_name)
-                        if str(current_value) != str(new_value):
-                            setattr(obj, field_name, new_value)
-                            changed_fields.append(field_name)
+                            for field_name, new_value in login_fields.items():
+                                current_value = getattr(obj, field_name)
+                                if str(current_value) != str(new_value):
+                                    setattr(obj, field_name, new_value)
+                                    changed_fields.append(field_name)
 
-                    # Comparar password
-                    password_raw = login_data.get('password')
-                    if password_raw:
-                        current_password = obj.get_password()
-                        if current_password != password_raw:
-                            obj.set_password(password_raw)
-                            changed_fields.append('password_hash')
+                            # Comparar password
+                            password_raw = login_data.get('password')
+                            if password_raw:
+                                current_password = obj.get_password()
+                                if current_password != password_raw:
+                                    obj.set_password(password_raw)
+                                    changed_fields.append('password_hash')
 
-                # Guardar solo si hay cambios
-                if changed_fields:
-                    obj.save(update_fields=changed_fields)
-                    total_updated += 1
-                    logger.info(f"[compare_and_update_subscriber_data] SN={sn} actualizado. Campos: {changed_fields}")
+                        # Guardar solo si hay cambios
+                        if changed_fields:
+                            obj.save(update_fields=changed_fields)
+                            total_updated += 1
+                            logger.info(f"[compare_and_update_subscriber_data] SN={sn} actualizado. Campos: {changed_fields}")
+                        else:
+                            logger.debug(f"[compare_and_update_subscriber_data] Sin cambios para SN={sn}")
+                
+                logger.info(f"[compare_and_update_subscriber_data] Total actualizados para {subscriber_code}: {total_updated}")
+                return total_updated
+                
+            except (OperationalError, DatabaseError) as e:
+                if is_connection_error(e):
+                    retry_count += 1
+                    logger.warning(f"[compare_and_update_subscriber_data] Conexión perdida (intento {retry_count}/{max_retries}). Reconectando...")
+                    reconnect_database()
+                    if retry_count < max_retries:
+                        import time
+                        time.sleep(2 * retry_count)
+                        continue
+                    else:
+                        raise DatabaseError(f"No se pudo reconectar después de {max_retries} intentos")
                 else:
-                    logger.debug(f"[compare_and_update_subscriber_data] Sin cambios para SN={sn}")
-
-        logger.info(f"[compare_and_update_subscriber_data] Total actualizados para {subscriber_code}: {total_updated}")
-        return total_updated
+                    raise
 
     except Exception as e:
         logger.error(f"[compare_and_update_subscriber_data] Error inesperado en {subscriber_code}: {str(e)}")

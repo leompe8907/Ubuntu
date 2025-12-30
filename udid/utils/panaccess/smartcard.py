@@ -1,7 +1,8 @@
 import logging
 import json
 import time
-from django.db import transaction
+from django.db import transaction, connection
+from django.db.utils import OperationalError, DatabaseError
 from typing import Optional
 from .singleton import get_panaccess
 from .exceptions import (
@@ -13,6 +14,7 @@ from .exceptions import (
 from .checkpoint import save_checkpoint, get_last_processed_offset, clear_checkpoint
 from ...models import ListOfSmartcards, ListOfSubscriber
 from ...serializers import ListOfSmartcardsSerializer
+from ...utils.db_utils import is_connection_error, reconnect_database
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,25 @@ def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, re
                 time.sleep(1)
                 # No incrementar retry_count para errores de sesión
                 
+            except (OperationalError, DatabaseError) as e:
+                if is_connection_error(e):
+                    logger.warning(f"🔌 Conexión a BD perdida en offset {offset}. Reconectando...")
+                    reconnect_database()
+                    time.sleep(2)
+                    # No incrementar retry_count, reintentar inmediatamente
+                    continue
+                else:
+                    # Otro error de BD, tratarlo como error general
+                    retry_count += 1
+                    consecutive_errors += 1
+                    
+                    if retry_count >= MAX_RETRIES:
+                        logger.error(f"❌ Error de BD después de {MAX_RETRIES} reintentos: {str(e)}")
+                        raise
+                    
+                    logger.warning(f"⚠️ Error de BD en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
+                    time.sleep(RETRY_DELAY * retry_count)
+                    
             except PanaccessException as e:
                 retry_count += 1
                 consecutive_errors += 1
@@ -173,13 +194,15 @@ def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
             logger.error(f"Error al insertar chunk desde {i} hasta {i+chunk_size}: {str(e)}")
 
 
-def store_smartcards_batch(smartcard_entries, chunk_size=100):
+def store_smartcards_batch(smartcard_entries, chunk_size=100, max_db_retries=3):
     """
     Guarda un lote de smartcards inmediatamente en la base de datos.
+    Maneja reconexión automática en caso de pérdida de conexión.
     
     Args:
         smartcard_entries: Lista de smartcards a guardar
         chunk_size: Tamaño del chunk para bulk_create
+        max_db_retries: Número máximo de reintentos por errores de BD
     
     Returns:
         Número de smartcards guardadas exitosamente
@@ -188,38 +211,61 @@ def store_smartcards_batch(smartcard_entries, chunk_size=100):
         return 0
     
     total_saved = 0
+    db_retry_count = 0
     
-    try:
-        with transaction.atomic():
-            # Validar y preparar registros
-            registros = []
-            for entry in smartcard_entries:
-                if not isinstance(entry, dict) or 'sn' not in entry:
-                    logger.warning(f"Entrada inválida omitida: {entry.get('sn', 'unknown')}")
-                    continue
+    while db_retry_count < max_db_retries:
+        try:
+            with transaction.atomic():
+                # Validar y preparar registros
+                registros = []
+                for entry in smartcard_entries:
+                    if not isinstance(entry, dict) or 'sn' not in entry:
+                        logger.warning(f"Entrada inválida omitida: {entry.get('sn', 'unknown')}")
+                        continue
+                    
+                    try:
+                        registros.append(ListOfSmartcards(**entry))
+                    except Exception as e:
+                        logger.warning(f"Error creando objeto para SN {entry.get('sn')}: {str(e)}")
+                        continue
                 
-                try:
-                    registros.append(ListOfSmartcards(**entry))
-                except Exception as e:
-                    logger.warning(f"Error creando objeto para SN {entry.get('sn')}: {str(e)}")
+                if not registros:
+                    return 0
+                
+                # Guardar en chunks
+                for i in range(0, len(registros), chunk_size):
+                    chunk = registros[i:i + chunk_size]
+                    ListOfSmartcards.objects.bulk_create(chunk, ignore_conflicts=True)
+                    total_saved += len(chunk)
+                
+                logger.debug(f"💾 Guardados {total_saved} smartcards en BD")
+                return total_saved  # Éxito, salir del loop de reintentos
+                
+        except (OperationalError, DatabaseError) as e:
+            if is_connection_error(e):
+                db_retry_count += 1
+                logger.warning(f"🔌 Conexión a BD perdida (intento {db_retry_count}/{max_db_retries}). Reconectando...")
+                
+                # Cerrar conexión actual para forzar reconexión
+                reconnect_database()
+                
+                if db_retry_count < max_db_retries:
+                    time.sleep(2 * db_retry_count)  # Backoff exponencial
                     continue
-            
-            if not registros:
-                return 0
-            
-            # Guardar en chunks
-            for i in range(0, len(registros), chunk_size):
-                chunk = registros[i:i + chunk_size]
-                ListOfSmartcards.objects.bulk_create(chunk, ignore_conflicts=True)
-                total_saved += len(chunk)
-            
-            logger.debug(f"💾 Guardados {total_saved} smartcards en BD")
-            
-    except Exception as e:
-        logger.error(f"❌ Error guardando lote de smartcards: {str(e)}")
-        raise
+                else:
+                    logger.error(f"❌ No se pudo reconectar a la BD después de {max_db_retries} intentos")
+                    raise DatabaseError(f"No se pudo reconectar a la BD después de {max_db_retries} intentos: {str(e)}")
+            else:
+                # Otro error de BD, no reintentar
+                logger.error(f"❌ Error de base de datos: {str(e)}")
+                raise
+                
+        except Exception as e:
+            logger.error(f"❌ Error guardando lote de smartcards: {str(e)}")
+            raise
     
-    return total_saved
+    # Si llegamos aquí, se agotaron los reintentos
+    raise DatabaseError(f"No se pudo guardar el lote después de {max_db_retries} intentos de reconexión")
 
 def download_smartcards_since_last(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
