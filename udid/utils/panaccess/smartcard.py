@@ -11,7 +11,6 @@ from .exceptions import (
     PanaccessTimeoutError,
     PanaccessSessionError
 )
-from .checkpoint import save_checkpoint, get_last_processed_offset, clear_checkpoint
 from ...models import ListOfSmartcards, ListOfSubscriber
 from ...serializers import ListOfSmartcardsSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
@@ -42,7 +41,7 @@ def LastSmartcard():
         logger.warning("No se encontraron smartcards en la base de datos.")
         return None
 
-def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, resume=False):
+def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Descarga todos los smartcards desde Panaccess y los almacena en la base de datos.
     
@@ -53,22 +52,14 @@ def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, re
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
         timeout: Timeout en segundos para cada llamada (default: 30)
-        resume: Si True, reanuda desde el último checkpoint guardado
     
     Returns:
         Dict con estadísticas de la descarga
     """
-    logger.info(f"🔄 Iniciando descarga completa de smartcards (timeout: {timeout}s, resume: {resume})...")
+    logger.info(f"🔄 Iniciando descarga completa de smartcards (timeout: {timeout}s)...")
     
-    # Obtener offset inicial (desde checkpoint si resume=True)
-    if resume:
-        offset = get_last_processed_offset('smartcards')
-        if offset > 0:
-            logger.info(f"📌 Reanudando desde offset {offset}")
-    else:
-        offset = 0
-        clear_checkpoint('smartcards')
-    
+    # Siempre comenzar desde offset 0
+    offset = 0
     total_saved = 0
     consecutive_errors = 0
     max_consecutive_errors = 5
@@ -85,18 +76,11 @@ def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, re
                 
                 if not smartcard_entries:
                     logger.info("✅ No hay más smartcards. Descarga completada.")
-                    clear_checkpoint('smartcards')
                     break
                 
                 # Guardar INMEDIATAMENTE en BD
                 saved_count = store_smartcards_batch(smartcard_entries)
                 total_saved += saved_count
-                
-                # Guardar checkpoint
-                save_checkpoint('smartcards', offset + limit, {
-                    'total_saved': total_saved,
-                    'last_batch_size': len(smartcard_entries)
-                })
                 
                 offset += limit
                 consecutive_errors = 0
@@ -166,7 +150,6 @@ def fetch_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, re
             break
     
     logger.info(f"✅ Descarga completada. Total guardados: {total_saved} smartcards")
-    clear_checkpoint('smartcards')
     
     return {
         'total_saved': total_saved,
@@ -192,7 +175,6 @@ def store_all_smartcards_in_chunks(data_batch, chunk_size=100):
             logger.info(f"Chunk {i//chunk_size + 1}: insertadas {len(registros)} smartcards.")
         except Exception as e:
             logger.error(f"Error al insertar chunk desde {i} hasta {i+chunk_size}: {str(e)}")
-
 
 def store_smartcards_batch(smartcard_entries, chunk_size=100, max_db_retries=3):
     """
@@ -525,7 +507,6 @@ def CallListSmartcards(session_id=None, offset=0, limit=100, timeout=DEFAULT_TIM
         logger.error(f"💥 Fallo en la llamada a getListOfSmartcards: {str(e)}", exc_info=True)
         raise PanaccessAPIError(f"Error inesperado: {str(e)}")
 
-
 def extract_sns_from_smartcards_field(smartcards_data):
     """
     Extrae los números de serie (SN) del campo smartcards de un suscriptor.
@@ -584,7 +565,6 @@ def extract_sns_from_smartcards_field(smartcards_data):
     
     # Filtrar SNs vacíos y duplicados
     return list(set([sn for sn in sns if sn]))
-
 
 def update_smartcards_from_subscribers():
     """

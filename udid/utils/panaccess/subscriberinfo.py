@@ -317,7 +317,6 @@ def compare_and_update_subscriber_data(subscriber_code):
         logger.error(f"[compare_and_update_subscriber_data] Error inesperado en {subscriber_code}: {str(e)}")
         return 0
 
-
 def sync_merge_all_subscribers():
     """
     Ejecuta el proceso de sincronización para todos los suscriptores activos.

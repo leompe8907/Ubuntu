@@ -10,7 +10,6 @@ from .exceptions import (
     PanaccessTimeoutError,
     PanaccessSessionError
 )
-from .checkpoint import save_checkpoint, get_last_processed_offset, clear_checkpoint
 from ...models import ListOfSubscriber
 from ...serializers import ListOfSubscriberSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
@@ -30,7 +29,6 @@ def DataBaseEmpty():
     logger.info("Verificando si la base de datos de suscriptores está vacía...")
     return not ListOfSubscriber.objects.exists()
 
-
 def LastSubscriber():
     """
     Retorna el último suscriptor registrado en la base de datos según el campo 'code'.
@@ -41,7 +39,6 @@ def LastSubscriber():
     except ListOfSubscriber.DoesNotExist:
         logger.warning("No se encontró ningún suscriptor en la base de datos.")
         return None
-
 
 def store_or_update_subscribers(data_batch):
     """
@@ -91,8 +88,7 @@ def store_or_update_subscribers(data_batch):
     logger.info(f"Suscriptores procesados: nuevos={total_new}, inválidos={total_invalid}")
     return total_new, total_invalid
 
-
-def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, resume=False):
+def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Descarga todos los suscriptores desde Panaccess y los almacena en la base de datos.
     
@@ -103,21 +99,14 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
         timeout: Timeout en segundos para cada llamada (default: 30)
-        resume: Si True, reanuda desde el último checkpoint guardado
     
     Returns:
         Dict con estadísticas de la descarga
     """
-    logger.info(f"🔄 Iniciando descarga completa de suscriptores (timeout: {timeout}s, resume: {resume})...")
+    logger.info(f"🔄 Iniciando descarga completa de suscriptores (timeout: {timeout}s)...")
     
-    # Obtener offset inicial (desde checkpoint si resume=True)
-    if resume:
-        offset = get_last_processed_offset('subscribers')
-        if offset > 0:
-            logger.info(f"📌 Reanudando desde offset {offset}")
-    else:
-        offset = 0
-        clear_checkpoint('subscribers')
+    # Siempre comenzar desde offset 0
+    offset = 0
     
     total_saved = 0
     consecutive_errors = 0
@@ -135,18 +124,11 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
                 
                 if not rows:
                     logger.info("✅ No hay más suscriptores. Descarga completada.")
-                    clear_checkpoint('subscribers')
                     break
                 
                 # Procesar y guardar INMEDIATAMENTE en BD
                 saved_count = store_subscribers_batch(rows)
                 total_saved += saved_count
-                
-                # Guardar checkpoint
-                save_checkpoint('subscribers', offset + limit, {
-                    'total_saved': total_saved,
-                    'last_batch_size': len(rows)
-                })
                 
                 offset += limit
                 consecutive_errors = 0
@@ -215,7 +197,6 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
             break
     
     logger.info(f"✅ Descarga completada. Total guardados: {total_saved} suscriptores")
-    clear_checkpoint('subscribers')
     
     return {
         'total_saved': total_saved,
@@ -236,7 +217,6 @@ def store_all_subscribers_in_chunks(data_batch, chunk_size=100):
             logger.info(f"Chunk {i//chunk_size + 1}: insertados {len(registros)} suscriptores")
         except Exception as e:
             logger.error(f"Error insertando chunk desde {i} hasta {i+chunk_size}: {str(e)}")
-
 
 def store_subscribers_batch(rows, chunk_size=100, max_db_retries=3):
     """
@@ -324,7 +304,6 @@ def store_subscribers_batch(rows, chunk_size=100, max_db_retries=3):
     
     raise DatabaseError(f"No se pudo guardar el lote después de {max_db_retries} intentos de reconexión")
 
-
 def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Descarga suscriptores nuevos desde el último registrado (modo incremental).
@@ -411,7 +390,6 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
     logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos")
     return {'total_saved': total_saved}
 
-
 def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Compara todos los suscriptores de Panaccess con los de la base local y actualiza si hay diferencias.
@@ -484,7 +462,6 @@ def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAU
         logger.info(f"Procesados {offset} registros, {total_updated} actualizados hasta ahora...")
     logger.info(f"Actualización completa. Total modificados: {total_updated}")
 
-
 def sync_subscribers(session_id=None, limit=100):
     """
     Ejecuta el proceso de sincronización de suscriptores:
@@ -531,7 +508,6 @@ def sync_subscribers(session_id=None, limit=100):
     except Exception as e:
         logger.error(f"Error inesperado: {str(e)}", exc_info=True)
         raise
-
 
 def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TIMEOUT):
     """
