@@ -108,7 +108,9 @@ def login() -> str:
         # Verificar status code
         if response.status_code != 200:
             logger.error(f"❌ [login] Status code inesperado: {response.status_code}")
-            logger.error(f"❌ [login] Respuesta completa: {response.text}")
+            # Truncar respuesta para evitar logs enormes
+            response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+            logger.error(f"❌ [login] Respuesta (primeros 1000 chars): {response_text}")
             raise PanaccessAPIError(
                 f"Respuesta inesperada del servidor Panaccess: {response.status_code}",
                 status_code=response.status_code
@@ -117,10 +119,21 @@ def login() -> str:
         # Parsear respuesta JSON
         try:
             json_response = response.json()
-            logger.info(f"📦 [login] Respuesta JSON completa: {json_response}")
+            # NO loguear la respuesta completa - solo un resumen
+            if logger.isEnabledFor(logging.DEBUG):
+                json_str = str(json_response)
+                if len(json_str) > 500:
+                    json_summary = json_str[:500] + "... [truncado]"
+                else:
+                    json_summary = json_str
+                logger.debug(f"📦 [login] Respuesta JSON (resumen): {json_summary}")
+            else:
+                logger.info(f"📦 [login] Respuesta JSON recibida exitosamente")
         except ValueError as e:
             logger.error(f"❌ [login] Error al parsear JSON: {str(e)}")
-            logger.error(f"❌ [login] Respuesta raw: {response.text}")
+            # Truncar respuesta raw para evitar logs enormes
+            response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+            logger.error(f"❌ [login] Respuesta raw (primeros 1000 chars): {response_text}")
             raise PanaccessAPIError(
                 f"Respuesta inválida del servidor Panaccess: {response.text}",
                 status_code=response.status_code
@@ -134,7 +147,13 @@ def login() -> str:
             error_message = json_response.get("errorMessage", "Login fallido sin mensaje explícito")
             answer = json_response.get("answer")
             logger.error(f"❌ [login] Login fallido - Error: {error_message}")
-            logger.error(f"❌ [login] Campo 'answer': {answer}")
+            # Solo loguear un resumen del answer si es muy grande
+            if answer:
+                answer_str = str(answer)
+                if len(answer_str) > 200:
+                    logger.error(f"❌ [login] Campo 'answer': {answer_str[:200]}... [truncado]")
+                else:
+                    logger.error(f"❌ [login] Campo 'answer': {answer}")
             
             # Si retorna 'false' como string, es error de autenticación
             if answer == "false" or error_message:
@@ -238,7 +257,9 @@ def logged_in(session_id: str) -> bool:
         # Verificar status code
         if response.status_code != 200:
             logger.error(f"❌ [logged_in] Status code inesperado: {response.status_code}")
-            logger.error(f"❌ [logged_in] Respuesta completa: {response.text}")
+            # Truncar respuesta para evitar logs enormes
+            response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+            logger.error(f"❌ [logged_in] Respuesta (primeros 1000 chars): {response_text}")
             raise PanaccessAPIError(
                 f"Respuesta inesperada del servidor Panaccess: {response.status_code}",
                 status_code=response.status_code
@@ -247,10 +268,21 @@ def logged_in(session_id: str) -> bool:
         # Parsear respuesta JSON
         try:
             json_response = response.json()
-            logger.info(f"📦 [logged_in] Respuesta JSON completa: {json_response}")
+            # NO loguear la respuesta completa - solo un resumen
+            if logger.isEnabledFor(logging.DEBUG):
+                json_str = str(json_response)
+                if len(json_str) > 500:
+                    json_summary = json_str[:500] + "... [truncado]"
+                else:
+                    json_summary = json_str
+                logger.debug(f"📦 [logged_in] Respuesta JSON (resumen): {json_summary}")
+            else:
+                logger.info(f"📦 [logged_in] Respuesta JSON recibida exitosamente")
         except ValueError as e:
             logger.error(f"❌ [logged_in] Error al parsear JSON: {str(e)}")
-            logger.error(f"❌ [logged_in] Respuesta raw: {response.text}")
+            # Truncar respuesta raw para evitar logs enormes
+            response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+            logger.error(f"❌ [logged_in] Respuesta raw (primeros 1000 chars): {response_text}")
             raise PanaccessAPIError(
                 f"Respuesta inválida del servidor Panaccess: {response.text}",
                 status_code=response.status_code
@@ -269,7 +301,15 @@ def logged_in(session_id: str) -> bool:
         
         # La respuesta debe ser un booleano
         answer = json_response.get("answer")
-        logger.info(f"📋 [logged_in] Campo 'answer' en respuesta: {answer} (tipo: {type(answer).__name__})")
+        # NO loguear el answer completo - solo tipo y resumen
+        if isinstance(answer, dict):
+            logger.info(f"📋 [logged_in] Campo 'answer' en respuesta: recibido (tipo: {type(answer).__name__}, keys: {list(answer.keys())[:5]})")
+        else:
+            answer_str = str(answer)
+            if len(answer_str) > 100:
+                logger.info(f"📋 [logged_in] Campo 'answer' en respuesta: {answer_str[:100]}... [truncado] (tipo: {type(answer).__name__})")
+            else:
+                logger.info(f"📋 [logged_in] Campo 'answer' en respuesta: {answer} (tipo: {type(answer).__name__})")
         
         # Panaccess puede retornar el booleano como string o como booleano
         if isinstance(answer, bool):
