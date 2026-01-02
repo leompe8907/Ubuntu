@@ -1924,12 +1924,7 @@ Dentro del shell de Python, ejecutar la tarea que necesites:
 
 ```python
 # Importar las tareas disponibles
-from udid.tasks import (
-    sync_all_data_automatic,
-    check_and_sync_smartcards_monthly,
-    check_and_sync_subscribers_periodic,
-    validate_and_sync_all_data_daily
-)
+from udid.tasks import (sync_all_data_automatic,check_and_sync_smartcards_monthly,check_and_sync_subscribers_periodic,validate_and_sync_all_data_daily)
 
 # Ejecutar la tarea que quieras (ejemplo: sincronización inicial)
 task = sync_all_data_automatic.delay()

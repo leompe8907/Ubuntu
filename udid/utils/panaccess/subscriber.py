@@ -10,7 +10,7 @@ from .exceptions import (
     PanaccessTimeoutError,
     PanaccessSessionError
 )
-from ...models import ListOfSubscriber
+from udid.models import ListOfSubscriber
 from ...serializers import ListOfSubscriberSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
 

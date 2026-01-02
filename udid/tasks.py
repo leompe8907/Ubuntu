@@ -40,7 +40,7 @@ from .utils.panaccess.subscriberinfo import (
     compare_and_update_subscriber_data,
     get_all_subscriber_codes
 )
-from ...models import ListOfSmartcards, ListOfSubscriber
+from udid.models import ListOfSmartcards, ListOfSubscriber
 from .utils.panaccess.exceptions import (
     PanaccessException,
     PanaccessAuthenticationError,

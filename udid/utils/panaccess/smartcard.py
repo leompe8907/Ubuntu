@@ -11,7 +11,7 @@ from .exceptions import (
     PanaccessTimeoutError,
     PanaccessSessionError
 )
-from ...models import ListOfSmartcards, ListOfSubscriber
+from udid.models import ListOfSmartcards, ListOfSubscriber
 from ...serializers import ListOfSmartcardsSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
 
