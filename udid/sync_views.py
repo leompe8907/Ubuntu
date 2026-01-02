@@ -11,25 +11,16 @@ from rest_framework import status
 
 from .utils.panaccess.subscriber import (
     sync_subscribers,
-    fetch_all_subscribers,
-    download_subscribers_since_last,
-    compare_and_update_all_subscribers,
     DataBaseEmpty,
     LastSubscriber
 )
 from .utils.panaccess.smartcard import (
     sync_smartcards,
-    fetch_all_smartcards,
-    download_smartcards_since_last,
-    compare_and_update_all_smartcards,
     DataBaseEmpty as SmartcardsDataBaseEmpty,
     LastSmartcard
 )
 from .utils.panaccess.login import (
     sync_subscriber_logins,
-    fetch_all_logins_from_panaccess,
-    fetch_new_logins_from_panaccess,
-    compare_and_update_all_existing,
     DataBaseEmpty as LoginsDataBaseEmpty,
     LastSubscriberLoginInfo
 )
@@ -47,6 +38,12 @@ def sync_subscribers_view(request):
     
     Parámetros opcionales (GET o POST):
     - limit: Cantidad de registros por página (default: 100)
+    
+    Lógica automática:
+    - Si BD vacía → descarga completa desde cero
+    - Si BD tiene registros → descarga nuevos desde último registro + actualiza existentes
+    - Si hay error/interrupción → los reintentos están implementados
+    - Si reintentos fallan → al llamar de nuevo, detecta registros y continúa desde último
     
     Returns:
         Respuesta con estadísticas de la sincronización
@@ -125,6 +122,12 @@ def sync_smartcards_view(request):
     Parámetros opcionales (GET o POST):
     - limit: Cantidad de registros por página (default: 100)
     
+    Lógica automática:
+    - Si BD vacía → descarga completa desde cero
+    - Si BD tiene registros → descarga nuevos desde último registro + actualiza existentes
+    - Si hay error/interrupción → los reintentos están implementados
+    - Si reintentos fallan → al llamar de nuevo, detecta registros y continúa desde último
+    
     Returns:
         Respuesta con estadísticas de la sincronización
     """
@@ -197,71 +200,40 @@ def sync_smartcards_view(request):
 def sync_logins_view(request):
     """
     Vista para sincronizar credenciales de login de suscriptores desde PanAccess.
+    Usa lógica automática basada en el estado de la base de datos.
     
     Parámetros opcionales (GET o POST):
-    - mode: 'full' (descarga completa), 'incremental' (solo nuevos), 
-            'update' (solo actualizar existentes), 'sync' (completo - default)
+    - limit: Cantidad de registros por página (default: 100) - No aplica para logins
+    
+    Lógica automática:
+    - Si BD vacía → descarga completa desde cero
+    - Si BD tiene registros → descarga nuevos desde último registro + actualiza existentes
+    - Si hay error/interrupción → los reintentos están implementados
+    - Si reintentos fallan → al llamar de nuevo, detecta registros y continúa desde último
     
     Returns:
         Respuesta con estadísticas de la sincronización
     """
     try:
-        # Obtener parámetros
-        if request.method == 'GET':
-            mode = request.query_params.get('mode', 'sync')
-        else:
-            mode = request.data.get('mode', 'sync')
+        logger.info(f"🔄 Iniciando sincronización automática de credenciales de login")
         
-        logger.info(f"🔄 Iniciando sincronización de credenciales de login - Modo: {mode}")
-        
-        # Ejecutar según el modo
-        if mode == 'full':
-            logger.info("📥 Modo: Descarga completa")
-            result = fetch_all_logins_from_panaccess(session_id=None)
-            message = "Descarga completa de credenciales de login completada"
-            
-        elif mode == 'incremental':
-            logger.info("📥 Modo: Descarga incremental (solo nuevos)")
-            if LoginsDataBaseEmpty():
-                return Response({
-                    'success': False,
-                    'message': 'La base de datos está vacía. Use mode=full para descarga completa.',
-                    'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            result = fetch_new_logins_from_panaccess(session_id=None)
-            message = "Descarga incremental de credenciales de login completada"
-            
-        elif mode == 'update':
-            logger.info("🔄 Modo: Actualización de existentes")
-            if LoginsDataBaseEmpty():
-                return Response({
-                    'success': False,
-                    'message': 'La base de datos está vacía. No hay registros para actualizar.',
-                    'suggestion': 'Use ?mode=full para realizar una descarga completa primero'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            result = compare_and_update_all_existing(session_id=None)
-            message = "Actualización de credenciales de login existentes completada"
-            
-        else:  # mode == 'sync' (default)
-            logger.info("🔄 Modo: Sincronización completa (nuevos + actualización)")
-            result = sync_subscriber_logins(session_id=None)
-            message = "Sincronización completa de credenciales de login completada"
+        # Usar la lógica automática que ya existe en sync_subscriber_logins()
+        # - Si BD vacía → fetch_all_logins_from_panaccess()
+        # - Si BD tiene registros → fetch_new_logins_from_panaccess() + compare_and_update_all_existing()
+        result = sync_subscriber_logins(session_id=None)
         
         # Obtener estadísticas
         last_login = LastSubscriberLoginInfo()
         last_code = last_login.subscriberCode if last_login else None
         
-        logger.info(f"✅ {message}")
+        logger.info(f"✅ Sincronización de credenciales de login completada")
         
         return Response({
             'success': True,
-            'message': message,
-            'mode': mode,
+            'message': 'Sincronización automática de credenciales de login completada',
             'last_subscriber_code': last_code,
             'database_empty': LoginsDataBaseEmpty(),
-            'result': result if result is not None else 'update_completed'
+            'result': result
         }, status=status.HTTP_200_OK)
         
     except PanaccessException as e:

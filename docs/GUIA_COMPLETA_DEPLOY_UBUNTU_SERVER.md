@@ -13,7 +13,7 @@
 9. [Configuración de Nginx](#9-configuración-de-nginx)
 10. [Configuración de SSL/HTTPS](#10-configuración-de-sslhttps)
 11. [Configuración de Systemd](#11-configuración-de-systemd)
-12. [Configuración de Celery (Ejecución Manual de Tareas)](#12-configuración-de-celery-ejecución-manual-de-tareas)
+12. [Configuración de Celery (Tareas Automáticas y Manuales)](#12-configuración-de-celery-tareas-automáticas-y-manuales)
 13. [Verificación y Pruebas](#13-verificación-y-pruebas)
 14. [Mantenimiento y Monitoreo](#14-mantenimiento-y-monitoreo)
 15. [Solución de Problemas](#15-solución-de-problemas)
@@ -1642,32 +1642,38 @@ sudo journalctl -u udid@0 -f
 
 ---
 
-## 12. Configuración de Celery (Ejecución Manual de Tareas)
+## 12. Configuración de Celery (Tareas Automáticas y Manuales)
 
 ### 📋 Información sobre las Tareas de Celery
 
-El proyecto usa **Celery** para ejecutar tareas en background de forma asíncrona y escalable. **Por defecto, las tareas NO se ejecutan automáticamente** - tú decides cuándo ejecutarlas manualmente.
+El proyecto usa **Celery** para ejecutar tareas en background de forma asíncrona y escalable. **Las tareas se ejecutan automáticamente según su periodicidad configurada**, y también puedes ejecutarlas manualmente cuando lo necesites.
 
-**Tareas disponibles para ejecución manual:**
+**Tareas configuradas:**
 
-| Tarea                                | Propósito                                  | Duración         |
-|--------------------------------------|--------------------------------------------|------------------|
-| `initial_sync_all_data`              | Sincronización COMPLETA inicial de todos los datos | Puede tomar horas |
-| `download_new_subscribers`           | Descarga solo suscriptores nuevos          | Segundos/Minutos |
-| `update_all_subscribers`             | Actualiza datos de suscriptores existentes | Segundos/Minutos |
-| `update_smartcards_from_subscribers` | Actualiza asociaciones de smartcards       | Segundos/Minutos |
-| `validate_and_fix_all_data`          | Sincronización completa y validación       | Puede tomar horas|
+| Tarea                                | Periodicidad                     | Propósito                                  | Prioridad |
+|--------------------------------------|----------------------------------|--------------------------------------------|-----------|
+| `sync_all_data_automatic`            | **MANUAL - UNA VEZ** (al iniciar) | **OBLIGATORIA**: Sincronización inicial completa. Debe ejecutarse PRIMERO antes de activar las demás tareas | 🔴 CRÍTICA |
+| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Verifica y descarga nuevas smartcards desde Panaccess | 🟡 Automática |
+| `check_and_sync_subscribers_periodic`| Cada 5 minutos                   | Detecta nuevos suscriptores, descarga credenciales y actualiza smartcards | 🟡 Automática |
+| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 (10:00 PM)  | Valida y corrige todos los registros existentes comparándolos con Panaccess | 🟡 Automática |
+
+**⚠️ IMPORTANTE - Orden de Ejecución:**
+1. **PRIMERO**: Ejecutar `sync_all_data_automatic` manualmente UNA VEZ cuando se despliega el sistema por primera vez
+2. **DESPUÉS**: Activar Celery Beat para que las demás tareas se ejecuten automáticamente según su periodicidad
+3. Las tareas automáticas dependen de que `sync_all_data_automatic` se haya ejecutado primero para tener datos base
 
 **Componentes de Celery:**
 - **Celery Worker**: Ejecuta las tareas en background (SIEMPRE debe estar activo)
-- **Celery Beat**: Programa y ejecuta tareas periódicas (NO se activa por defecto)
+- **Celery Beat**: Programa y ejecuta tareas periódicas automáticamente (DEBE estar activo para tareas automáticas)
 - **Flower** (opcional): Interfaz web para monitorear tareas
 
 **¿Cómo funciona?**
-- Tú ejecutas las tareas manualmente cuando lo necesites
+- **Tareas automáticas**: Celery Beat programa y ejecuta las tareas según su periodicidad configurada
+- **Tareas manuales**: Puedes ejecutar cualquier tarea manualmente cuando lo necesites
 - Las tareas se envían a Redis (broker)
 - Celery Worker toma las tareas de Redis y las ejecuta
 - Los resultados se almacenan en Redis (backend)
+- **Mecanismo de lock**: Las tareas tienen un sistema de bloqueo para evitar ejecuciones simultáneas
 
 ### 12.1 Verificar Instalación de Celery
 
@@ -1738,11 +1744,11 @@ WantedBy=multi-user.target
 
 Guardar y salir.
 
-### 12.3 Crear Servicio Systemd para Celery Beat (Opcional - NO se activa por defecto)
+### 12.3 Crear Servicio Systemd para Celery Beat (Requerido para Tareas Automáticas)
 
-> ⚠️ **NOTA:** Celery Beat se crea pero **NO se inicia automáticamente**. Solo úsalo si en el futuro quieres activar tareas periódicas. Por ahora, las tareas se ejecutan manualmente.
+> ✅ **IMPORTANTE:** Celery Beat es **REQUERIDO** para que las tareas periódicas se ejecuten automáticamente. Debe estar activo junto con el Worker.
 
-Celery Beat programa y ejecuta las tareas periódicas. Este servicio está disponible pero **deshabilitado por defecto**:
+Celery Beat programa y ejecuta las tareas periódicas automáticamente según la configuración en `ubuntu/settings.py`:
 
 ```bash
 # Crear archivo de servicio para Celery Beat
@@ -1805,36 +1811,100 @@ sudo chown udid:udid /var/log/udid
 
 ### 12.5 Iniciar y Habilitar Servicios de Celery
 
-**IMPORTANTE:** Solo iniciamos el **Worker** (necesario para ejecutar tareas). **NO iniciamos Beat** (tareas automáticas deshabilitadas):
+**⚠️ IMPORTANTE - Orden de Configuración:**
+
+1. **PRIMERO**: Iniciar solo el Worker para ejecutar la tarea inicial obligatoria
+2. **SEGUNDO**: Ejecutar `sync_all_data_automatic` manualmente (ver sección 12.6)
+3. **TERCERO**: Después de completar la sincronización inicial, iniciar Beat para tareas automáticas
 
 ```bash
 # Recargar systemd
 sudo systemctl daemon-reload
 
-# Iniciar SOLO el Worker (necesario para ejecutar tareas manualmente)
+# ========================================================================
+# PASO 1: Iniciar SOLO el Worker (para ejecutar tarea inicial)
+# ========================================================================
+# Iniciar Worker (necesario para ejecutar tareas)
 sudo systemctl start celery-worker
 
-# Habilitar inicio automático SOLO del Worker
+# Habilitar inicio automático del Worker
 sudo systemctl enable celery-worker
 
 # Verificar estado del Worker
 sudo systemctl status celery-worker
+# Debe mostrar: "active (running)"
 
-# Verificar que Beat NO está corriendo (debe estar inactivo)
+# ========================================================================
+# PASO 2: Ejecutar sync_all_data_automatic (ver sección 12.6)
+# ========================================================================
+# 🔴 CRÍTICO: Ejecutar la tarea inicial ANTES de activar Beat
+# Ir a la sección 12.6 para ejecutar sync_all_data_automatic
+# Esta tarea descarga TODA la información inicial desde Panaccess
+
+# ========================================================================
+# PASO 3: Después de completar sync_all_data_automatic, activar Beat
+# ========================================================================
+# Iniciar Beat (solo después de ejecutar sync_all_data_automatic)
+sudo systemctl start celery-beat
+
+# Habilitar inicio automático de Beat
+sudo systemctl enable celery-beat
+
+# Verificar estado de Beat
 sudo systemctl status celery-beat
-# Debería mostrar: "inactive (dead)" o similar
+# Debe mostrar: "active (running)"
 ```
 
-### 12.6 Ejecutar Tareas Manualmente
+### 12.5.1 Verificar Configuración de Tareas Periódicas
 
-Ahora puedes ejecutar cualquier tarea cuando lo necesites. Aquí te mostramos cómo:
+Las tareas periódicas están configuradas en `ubuntu/settings.py` en la variable `CELERY_BEAT_SCHEDULE`:
 
-**Tareas disponibles:**
-- `initial_sync_all_data`: Sincronización inicial completa (ejecutar UNA VEZ cuando la BD está vacía)
-- `download_new_subscribers`: Descargar solo suscriptores nuevos
-- `update_all_subscribers`: Actualizar datos de suscriptores existentes
-- `update_smartcards_from_subscribers`: Actualizar asociaciones de smartcards
-- `validate_and_fix_all_data`: Validación y corrección completa (puede tomar horas)
+```python
+CELERY_BEAT_SCHEDULE = {
+    'check-and-sync-smartcards-monthly': {
+        'task': 'udid.tasks.check_and_sync_smartcards_monthly',
+        'schedule': crontab(day_of_month='28', hour=3, minute=0),  # Día 28 a las 3:00 AM
+    },
+    'check-and-sync-subscribers-periodic': {
+        'task': 'udid.tasks.check_and_sync_subscribers_periodic',
+        'schedule': 300.0,  # Cada 5 minutos
+    },
+    'validate-and-sync-all-data-daily': {
+        'task': 'udid.tasks.validate_and_sync_all_data_daily',
+        'schedule': crontab(hour=22, minute=0),  # Cada día a las 22:00
+    },
+}
+```
+
+**⚠️ IMPORTANTE:** `sync_all_data_automatic` NO está en el schedule porque:
+- Debe ejecutarse MANUALMENTE UNA VEZ al desplegar el sistema por primera vez
+- Es OBLIGATORIA ejecutarla ANTES de activar Beat
+- Las demás tareas automáticas dependen de que esta tarea se haya ejecutado primero
+- Si activas Beat sin ejecutar `sync_all_data_automatic`, las tareas automáticas no tendrán datos base con los que trabajar
+
+**Mecanismo de Lock:**
+- Todas las tareas tienen un sistema de bloqueo para evitar ejecuciones simultáneas
+- Si una tarea está en ejecución, las demás esperarán hasta que termine
+- Esto previene conflictos y sobrecarga del sistema
+
+### 12.6 Ejecutar Tarea Inicial OBLIGATORIA: sync_all_data_automatic
+
+> 🔴 **CRÍTICO**: Esta tarea DEBE ejecutarse PRIMERO antes de activar las tareas automáticas. Es la sincronización inicial completa que descarga todos los datos desde Panaccess.
+
+**¿Por qué es obligatoria?**
+- Descarga TODA la información inicial desde Panaccess (suscriptores, smartcards, credenciales)
+- Las demás tareas automáticas dependen de tener datos base en la BD
+- Sin esta tarea, las tareas automáticas no tendrán datos con los que trabajar
+
+**⚠️ IMPORTANTE:**
+- Ejecutar SOLO UNA VEZ cuando se despliega el sistema por primera vez
+- NO está en el schedule de Celery Beat porque debe ejecutarse manualmente
+- Después de ejecutarla, puedes activar Celery Beat para las tareas periódicas
+
+**Tareas automáticas (se ejecutan después de sync_all_data_automatic):**
+- `check_and_sync_smartcards_monthly`: Verifica y descarga nuevas smartcards (normalmente se ejecuta el día 28 de cada mes)
+- `check_and_sync_subscribers_periodic`: Detecta nuevos suscriptores y actualiza datos (normalmente cada 5 minutos)
+- `validate_and_sync_all_data_daily`: Valida y corrige todos los registros (normalmente cada día a las 22:00)
 
 #### Método 1: Ejecutar desde el Shell de Django (Recomendado)
 
@@ -1855,15 +1925,14 @@ Dentro del shell de Python, ejecutar la tarea que necesites:
 ```python
 # Importar las tareas disponibles
 from udid.tasks import (
-    initial_sync_all_data,
-    download_new_subscribers,
-    update_all_subscribers,
-    update_smartcards_from_subscribers,
-    validate_and_fix_all_data
+    sync_all_data_automatic,
+    check_and_sync_smartcards_monthly,
+    check_and_sync_subscribers_periodic,
+    validate_and_sync_all_data_daily
 )
 
 # Ejecutar la tarea que quieras (ejemplo: sincronización inicial)
-task = initial_sync_all_data.delay()
+task = sync_all_data_automatic.delay()
 
 # Ver el ID de la tarea
 print(f"Task ID: {task.id}")
@@ -1873,10 +1942,14 @@ print(f"Estado: {task.state}")
 # Puedes salir del shell y la tarea continuará ejecutándose
 # Para verificar el progreso, usar Flower o los logs
 
-# Ejemplos de otras tareas:
-# task = download_new_subscribers.delay()
-# task = update_all_subscribers.delay()
-# task = validate_and_fix_all_data.delay()
+# ⚠️ IMPORTANTE: Ejecutar sync_all_data_automatic PRIMERO
+# Las demás tareas automáticas se ejecutarán después según su periodicidad
+# cuando actives Celery Beat (ver sección 12.5, Paso 3)
+
+# Ejemplos de otras tareas (solo después de ejecutar sync_all_data_automatic):
+# task = check_and_sync_smartcards_monthly.delay()
+# task = check_and_sync_subscribers_periodic.delay()
+# task = validate_and_sync_all_data_daily.delay()
 
 # Salir del shell
 exit()
@@ -1894,8 +1967,8 @@ source env/bin/activate
 
 # Ejecutar la tarea directamente desde Python
 python -c "
-from udid.tasks import initial_sync_all_data
-task = initial_sync_all_data.delay()
+from udid.tasks import sync_all_data_automatic
+task = sync_all_data_automatic.delay()
 print(f'Task ID: {task.id}')
 print('Tarea iniciada. Verifica el progreso con:')
 print('  - Flower: http://IP_DEL_SERVIDOR:5555')
@@ -1917,8 +1990,8 @@ source env/bin/activate
 
 # Ejecutar de forma síncrona (bloquea hasta completar)
 python manage.py shell -c "
-from udid.tasks import initial_sync_all_data
-result = initial_sync_all_data()
+from udid.tasks import sync_all_data_automatic
+result = sync_all_data_automatic()
 print('Resultado:', result)
 "
 ```
@@ -1932,7 +2005,7 @@ print('Resultado:', result)
 # http://IP_DEL_SERVIDOR:5555
 # Usuario/contraseña: admin/admin (o el configurado en .env)
 
-# Buscar la tarea por ID o nombre: initial_sync_all_data
+# Buscar la tarea por ID o nombre: sync_all_data_automatic
 # Verás el estado: PENDING → STARTED → SUCCESS/FAILURE
 ```
 
@@ -2053,11 +2126,10 @@ sudo systemctl status celery-beat
 sudo journalctl -u celery-beat -f
 ```
 
-**Tareas periódicas que se activarían:**
-- `download_new_subscribers`: Cada 5 minutos
-- `update_all_subscribers`: Cada 5 minutos
-- `update_smartcards_from_subscribers`: Cada 5 minutos
-- `validate_and_fix_all_data`: Diaria a las 2:00 AM
+**Tareas periódicas configuradas:**
+- `check_and_sync_subscribers_periodic`: Cada 5 minutos
+- `check_and_sync_smartcards_monthly`: Día 28 de cada mes a las 3:00 AM
+- `validate_and_sync_all_data_daily`: Cada día a las 22:00 (10:00 PM)
 
 **Para desactivar las tareas automáticas nuevamente:**
 
@@ -2218,8 +2290,8 @@ sudo journalctl -u celery-worker -f
 tail -f /var/log/udid/celery-worker.log
 
 # Buscar ejecuciones de tareas específicas
-grep "download_new_subscribers" /var/log/udid/celery-worker.log | tail -10
-grep "initial_sync_all_data" /var/log/udid/celery-worker.log | tail -5
+grep "check_and_sync_subscribers_periodic" /var/log/udid/celery-worker.log | tail -10
+grep "sync_all_data_automatic" /var/log/udid/celery-worker.log | tail -5
 ```
 
 #### Método 3: Usar Flower (si está configurado)
@@ -2269,10 +2341,10 @@ python manage.py shell
 Dentro del shell de Python:
 
 ```python
-from udid.tasks import download_new_subscribers
+from udid.tasks import sync_all_data_automatic
 
 # Ejecutar tarea de forma asíncrona
-result = download_new_subscribers.delay()
+result = check_and_sync_subscribers_periodic.delay()
 
 # Ver el ID de la tarea
 print(f"Task ID: {result.id}")
@@ -2289,13 +2361,17 @@ exit()
 
 ### 12.12 Tareas Disponibles y Cuándo Usarlas
 
-| Tarea                                | Cuándo Usarla                                  | Duración          |
-|--------------------------------------|------------------------------------------------|-------------------|
-| `initial_sync_all_data`              | Primera vez que despliegas el sistema o cuando la BD está vacía | Puede tomar horas |
-| `download_new_subscribers`           | Cuando quieres descargar solo suscriptores nuevos | Segundos/Minutos  |
-| `update_all_subscribers`             | Cuando quieres actualizar datos de suscriptores existentes | Segundos/Minutos  |
-| `update_smartcards_from_subscribers` | Cuando quieres actualizar asociaciones de smartcards | Segundos/Minutos  |
-| `validate_and_fix_all_data`          | Cuando quieres una sincronización completa y validación | Puede tomar horas |
+| Tarea                                | Periodicidad Automática | Cuándo Usarla Manualmente | Duración          |
+|--------------------------------------|-------------------------|----------------------------|-------------------|
+| `sync_all_data_automatic`            | Una vez al iniciar | Primera vez que despliegas el sistema o cuando la BD está vacía | Puede tomar horas |
+| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Cuando quieres verificar smartcards fuera del horario programado | Minutos/Horas |
+| `check_and_sync_subscribers_periodic`| Cada 5 minutos | Cuando quieres forzar una verificación inmediata | Segundos/Minutos  |
+| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 | Cuando quieres validar y corregir datos fuera del horario programado | Puede tomar horas |
+
+**Nota sobre ejecución simultánea:**
+- Las tareas tienen un mecanismo de lock para evitar ejecuciones simultáneas
+- Si una tarea está en ejecución, las demás esperarán hasta que termine
+- Esto previene conflictos y sobrecarga del sistema
 
 ### 12.13 Comandos Útiles de Celery
 
@@ -2317,14 +2393,17 @@ python manage.py shell
 # result = AsyncResult('TASK_ID', app=app)
 # print(result.state)
 
-# Reiniciar worker (después de cambios en código)
-sudo systemctl restart celery-worker
+# Reiniciar ambos servicios (después de cambios en código)
+sudo systemctl restart celery-worker celery-beat
 
-# Ver logs en tiempo real
+# Ver logs en tiempo real del Worker
 sudo journalctl -u celery-worker -f
 
+# Ver logs en tiempo real de Beat
+sudo journalctl -u celery-beat -f
+
 # Detener todas las tareas activas (emergencia)
-sudo systemctl stop celery-worker
+sudo systemctl stop celery-worker celery-beat
 ```
 
 ---

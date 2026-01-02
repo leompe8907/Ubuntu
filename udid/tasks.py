@@ -4,14 +4,43 @@ Tareas de Celery para sincronización de datos desde Panaccess.
 Este módulo contiene todas las tareas asíncronas que se ejecutan en background
 usando Celery. Las tareas se pueden ejecutar de forma periódica (con celery-beat)
 o bajo demanda.
+
+PERIODICIDAD CONFIGURADA:
+1. sync_all_data_automatic -> Se ejecuta UNA VEZ cuando se levante el proyecto en la VM
+2. check_and_sync_smartcards_monthly -> Día 28 de cada mes a las 3:00 AM
+3. check_and_sync_subscribers_periodic -> Cada 5 minutos
+4. validate_and_sync_all_data_daily -> Cada día a las 22:00 (10:00 PM)
+
+IMPORTANTE: Las tareas tienen un mecanismo de lock para evitar ejecuciones simultáneas.
+Si una tarea está en ejecución, las demás esperarán hasta que termine.
 """
 import logging
+import time
 from celery import shared_task
-# from celery.exceptions import Retry  # No usado actualmente
+from django.core.cache import cache
 
-from .utils.panaccess import (
-    sync_merge_all_subscribers,
+from .utils.panaccess.subscriber import (
+    sync_subscribers, 
+    CallListSubscribers,
+    compare_and_update_all_subscribers
 )
+from .utils.panaccess.smartcard import (
+    sync_smartcards, 
+    CallListSmartcards, 
+    update_smartcards_from_subscribers,
+    compare_and_update_all_smartcards
+)
+from .utils.panaccess.login import (
+    sync_subscriber_logins, 
+    fetch_new_logins_from_panaccess,
+    compare_and_update_all_existing
+)
+from .utils.panaccess.subscriberinfo import (
+    sync_merge_all_subscribers,
+    compare_and_update_subscriber_data,
+    get_all_subscriber_codes
+)
+from ...models import ListOfSmartcards, ListOfSubscriber
 from .utils.panaccess.exceptions import (
     PanaccessException,
     PanaccessAuthenticationError,
@@ -21,813 +50,55 @@ from .utils.panaccess.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+# Lock key para evitar ejecuciones simultáneas de tareas
+TASK_LOCK_KEY = 'panaccess_sync_task_lock'
+TASK_LOCK_TIMEOUT = 3600 * 6  # 6 horas máximo (por si una tarea se cuelga)
 
-@shared_task(
-    bind=True,
-    name='udid.tasks.initial_sync_all_data',
-    max_retries=3,
-    default_retry_delay=3,  # 3 segundos entre reintentos
-    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
-    retry_backoff=True,
-    retry_backoff_max=3600,  # Máximo 1 hora de delay
-    retry_jitter=True,
-)
-def initial_sync_all_data(self):
+
+def acquire_task_lock(task_name, timeout=TASK_LOCK_TIMEOUT):
     """
-    Tarea de inicialización completa que descarga todos los datos desde Panaccess.
+    Adquiere un lock para evitar que múltiples tareas se ejecuten simultáneamente.
     
-    Esta tarea está diseñada para ejecutarse UNA SOLA VEZ cuando se necesita
-    inicializar la base de datos con todos los datos de Panaccess.
-    
-    QUÉ HACE:
-    - Descarga TODOS los suscriptores desde Panaccess
-    - Descarga TODAS las smartcards desde Panaccess
-    - Descarga TODA la información de login de suscriptores
-    - Crea los registros en las tablas correspondientes:
-      * ListOfSubscriber
-      * ListOfSmartcards
-      * SubscriberLoginInfo
-      * SubscriberInfo (tabla consolidada)
-    
-    CÓMO LO HACE:
-    - Usa el singleton de Panaccess para autenticación automática
-    - Fuerza descarga completa (modo 'full') para asegurar que descargue todo
-    - Ejecuta las sincronizaciones en orden:
-      1. Suscriptores
-      2. Smartcards
-      3. Credenciales de login
-      4. Merge en SubscriberInfo
-    
-    IMPORTANTE:
-    - Esta tarea puede tomar varias horas si hay muchos registros (ej: 10,000 smartcards)
-    - Se recomienda ejecutarla cuando la base de datos está vacía o se necesita
-      una sincronización completa inicial
-    - No está diseñada para ejecutarse periódicamente
+    Args:
+        task_name: Nombre de la tarea que intenta adquirir el lock
+        timeout: Tiempo máximo que el lock estará activo (en segundos)
     
     Returns:
-        dict: Resultado de la sincronización con información detallada de cada paso
-        
-    Raises:
-        PanaccessException: Si hay errores críticos de autenticación o conexión
+        bool: True si se adquirió el lock, False si otra tarea está en ejecución
     """
-    logger.info("🚀 [INITIAL_SYNC] Iniciando sincronización inicial completa de datos desde Panaccess")
+    lock_key = f"{TASK_LOCK_KEY}:{task_name}"
     
-    result = {
-        'success': False,
-        'message': '',
-        'steps': {
-            'subscribers': {'success': False, 'message': '', 'count': 0},
-            'smartcards': {'success': False, 'message': '', 'count': 0},
-            'subscriber_logins': {'success': False, 'message': '', 'count': 0},
-            'merge_subscribers': {'success': False, 'message': '', 'count': 0},
-        },
-        'total_time_seconds': 0,
-    }
+    # Intentar adquirir el lock (si no existe, lo crea con timeout)
+    acquired = cache.add(lock_key, task_name, timeout)
     
-    import time
-    start_time = time.time()
-    
-    try:
-        # ========================================================================
-        # PASO 1: SINCRONIZACIÓN DE SUSCRIPTORES (FORZAR MODO FULL)
-        # ========================================================================
-        logger.info("📥 [INITIAL_SYNC] Paso 1/4: Descargando todos los suscriptores...")
-        try:
-            # Usar fetch_all_subscribers directamente para forzar descarga completa
-            from .utils.panaccess.subscriber import fetch_all_subscribers
-            subscribers_result = fetch_all_subscribers(session_id=None, limit=100)
-            result['steps']['subscribers'] = {
-                'success': True,
-                'message': 'Suscriptores descargados correctamente',
-                'count': len(subscribers_result) if isinstance(subscribers_result, list) else 'N/A'
-            }
-            logger.info(f"✅ [INITIAL_SYNC] Suscriptores descargados: {result['steps']['subscribers']['count']}")
-        except Exception as e:
-            error_msg = f"Error descargando suscriptores: {str(e)}"
-            logger.error(f"❌ [INITIAL_SYNC] {error_msg}", exc_info=True)
-            result['steps']['subscribers'] = {
-                'success': False,
-                'message': error_msg,
-                'count': 0
-            }
-            # Continuar con los siguientes pasos aunque este falle
-        
-        # ========================================================================
-        # PASO 2: SINCRONIZACIÓN DE SMARTCARDS (FORZAR MODO FULL)
-        # ========================================================================
-        logger.info("📥 [INITIAL_SYNC] Paso 2/4: Descargando todas las smartcards...")
-        try:
-            # Usar fetch_all_smartcards directamente para forzar descarga completa
-            # timeout=None para deshabilitar timeout (puede tardar horas con muchos registros)
-            from .utils.panaccess.smartcard import fetch_all_smartcards
-            smartcards_result = fetch_all_smartcards(session_id=None, limit=100, timeout=None)
-            result['steps']['smartcards'] = {
-                'success': True,
-                'message': 'Smartcards descargadas correctamente',
-                'count': len(smartcards_result) if isinstance(smartcards_result, list) else 'N/A'
-            }
-            logger.info(f"✅ [INITIAL_SYNC] Smartcards descargadas: {result['steps']['smartcards']['count']}")
-        except Exception as e:
-            error_msg = f"Error descargando smartcards: {str(e)}"
-            logger.error(f"❌ [INITIAL_SYNC] {error_msg}", exc_info=True)
-            result['steps']['smartcards'] = {
-                'success': False,
-                'message': error_msg,
-                'count': 0
-            }
-            # Continuar con los siguientes pasos aunque este falle
-        
-        # ========================================================================
-        # PASO 3: SINCRONIZACIÓN DE CREDENCIALES DE LOGIN (FORZAR MODO FULL)
-        # ========================================================================
-        logger.info("📥 [INITIAL_SYNC] Paso 3/4: Descargando todas las credenciales de login...")
-        try:
-            # Usar fetch_all_logins_from_panaccess directamente para forzar descarga completa
-            from .utils.panaccess.login import fetch_all_logins_from_panaccess
-            logins_result = fetch_all_logins_from_panaccess(session_id=None)
-            result['steps']['subscriber_logins'] = {
-                'success': True,
-                'message': 'Credenciales de login descargadas correctamente',
-                'count': logins_result if isinstance(logins_result, int) else 'N/A'
-            }
-            logger.info(f"✅ [INITIAL_SYNC] Credenciales descargadas: {result['steps']['subscriber_logins']['count']}")
-        except Exception as e:
-            error_msg = f"Error descargando credenciales: {str(e)}"
-            logger.error(f"❌ [INITIAL_SYNC] {error_msg}", exc_info=True)
-            result['steps']['subscriber_logins'] = {
-                'success': False,
-                'message': error_msg,
-                'count': 0
-            }
-            # Continuar con el siguiente paso aunque este falle
-        
-        # ========================================================================
-        # PASO 4: MERGE EN SUBSCRIBERINFO (TABLA CONSOLIDADA)
-        # ========================================================================
-        logger.info("📥 [INITIAL_SYNC] Paso 4/4: Consolidando información en SubscriberInfo...")
-        try:
-            sync_merge_all_subscribers()
-            result['steps']['merge_subscribers'] = {
-                'success': True,
-                'message': 'Información consolidada correctamente',
-                'count': 'N/A'
-            }
-            logger.info("✅ [INITIAL_SYNC] Información consolidada en SubscriberInfo")
-        except Exception as e:
-            error_msg = f"Error consolidando información: {str(e)}"
-            logger.error(f"❌ [INITIAL_SYNC] {error_msg}", exc_info=True)
-            result['steps']['merge_subscribers'] = {
-                'success': False,
-                'message': error_msg,
-                'count': 0
-            }
-        
-        # ========================================================================
-        # VERIFICACIÓN FINAL
-        # ========================================================================
-        elapsed_time = time.time() - start_time
-        result['total_time_seconds'] = int(elapsed_time)
-        
-        # Verificar si todas las tareas se completaron exitosamente
-        all_success = all(step['success'] for step in result['steps'].values())
-        result['success'] = all_success
-        
-        if all_success:
-            result['message'] = f'Sincronización inicial completada exitosamente en {elapsed_time:.2f} segundos'
-            logger.info(f"✅ [INITIAL_SYNC] {result['message']}")
-        else:
-            failed_steps = [name for name, step in result['steps'].items() if not step['success']]
-            result['message'] = f'Sincronización inicial completada con errores en: {", ".join(failed_steps)}'
-            logger.warning(f"⚠️ [INITIAL_SYNC] {result['message']}")
-        
-        return result
-        
-    except PanaccessAuthenticationError as e:
-        # Error de autenticación - no reintentar automáticamente
-        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
-        logger.error(f"❌ [INITIAL_SYNC] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        raise PanaccessAuthenticationError(error_msg) from e
-        
-    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
-        # Errores de conexión/timeout - reintentar automáticamente
-        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
-        logger.error(f"❌ [INITIAL_SYNC] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        # Celery reintentará automáticamente gracias a autoretry_for
-        raise
-        
-    except PanaccessException as e:
-        # Otros errores de Panaccess
-        error_msg = f"Error de Panaccess: {str(e)}"
-        logger.error(f"❌ [INITIAL_SYNC] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        raise
-
-
-@shared_task(
-    bind=True,
-    name='udid.tasks.download_new_subscribers',
-    max_retries=3,
-    default_retry_delay=60,  # 1 minuto entre reintentos
-    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
-    retry_backoff=True,
-    retry_backoff_max=600,  # Máximo 10 minutos de delay
-    retry_jitter=True,
-)
-def download_new_subscribers(self):
-    """
-    Tarea que descarga solo los suscriptores nuevos desde Panaccess.
-    
-    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
-    en lugar de descargar solo nuevos suscriptores.
-    
-    Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
-    para mantener la base de datos actualizada con nuevos suscriptores.
-    
-    QUÉ HACE:
-    - Descarga SOLO los suscriptores nuevos (posteriores al último registrado)
-    - Descarga las credenciales de login de los nuevos suscriptores
-    - Crea los registros en las tablas:
-      * ListOfSubscriber (información del suscriptor)
-      * SubscriberLoginInfo (credenciales de login)
-    - Actualiza la tabla consolidada SubscriberInfo con los nuevos datos
-    - No descarga todos los suscriptores, solo los nuevos
-    
-    CÓMO LO HACE:
-    - Usa el singleton de Panaccess para autenticación automática
-    - Busca el último suscriptor registrado en la base de datos
-    - Descarga solo los suscriptores con código mayor al último registrado
-    - Almacena los nuevos registros en la base de datos
-    
-    IMPORTANTE:
-    - Si la base de datos está vacía, retorna sin descargar nada
-    - Se recomienda usar initial_sync_all_data primero si la BD está vacía
-    - Esta tarea es rápida (segundos/minutos) ya que solo descarga nuevos registros
-    
-    Returns:
-        dict: Resultado de la descarga con información detallada
-        
-    Raises:
-        PanaccessException: Si hay errores críticos de autenticación o conexión
-    """
-    logger.info("📥 [NEW_SUBSCRIBERS] Iniciando descarga de suscriptores nuevos desde Panaccess")
-    
-    # Verificar si las tablas base están vacías
-    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
-    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
-    from .utils.panaccess.login import DataBaseEmpty as logins_empty
-    
-    subscribers_is_empty = subscribers_empty()
-    smartcards_is_empty = smartcards_empty()
-    logins_is_empty = logins_empty()
-    
-    # Si alguna tabla base está vacía, ejecutar sincronización completa
-    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
-        logger.info(
-            f"📊 [NEW_SUBSCRIBERS] Tablas base vacías detectadas - "
-            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
-            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
-            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+    if acquired:
+        logger.info(f"🔒 [LOCK] Lock adquirido para tarea: {task_name}")
+        return True
+    else:
+        # Verificar qué tarea tiene el lock
+        current_task = cache.get(lock_key)
+        logger.warning(
+            f"⚠️ [LOCK] No se pudo adquirir lock para {task_name}. "
+            f"Tarea en ejecución: {current_task}"
         )
-        logger.info("🚀 [NEW_SUBSCRIBERS] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
-        
-        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
-        return initial_sync_all_data.apply().get()
+        return False
+
+
+def release_task_lock(task_name):
+    """
+    Libera el lock de una tarea.
     
-    # Si las tablas tienen datos, continuar con la lógica normal
-    logger.info("✅ [NEW_SUBSCRIBERS] Las tablas base tienen datos, continuando con descarga de nuevos suscriptores...")
-    
-    result = {
-        'success': False,
-        'message': '',
-        'subscribers_downloaded': 0,
-        'credentials_downloaded': 0,
-        'last_subscriber_code': None,
-        'total_time_seconds': 0,
-    }
-    
-    import time
-    start_time = time.time()
-    
-    try:
-        # Verificar si hay suscriptores en la base de datos
-        from .utils.panaccess.subscriber import LastSubscriber, download_subscribers_since_last
-        
-        last_subscriber = LastSubscriber()
-        if not last_subscriber:
-            result['message'] = 'No hay suscriptores registrados. Use initial_sync_all_data primero para descargar todos los suscriptores.'
-            result['success'] = False
-            logger.warning("⚠️ [NEW_SUBSCRIBERS] No hay suscriptores registrados. Se requiere descarga completa primero.")
-            return result
-        
-        last_code = last_subscriber.code
-        result['last_subscriber_code'] = last_code
-        logger.info(f"📥 [NEW_SUBSCRIBERS] Último suscriptor registrado: {last_code}")
-        
-        # ========================================================================
-        # PASO 1: DESCARGAR SUSCRIPTORES NUEVOS
-        # ========================================================================
-        logger.info("📥 [NEW_SUBSCRIBERS] Paso 1/2: Descargando suscriptores nuevos...")
-        try:
-            new_subscribers_result = download_subscribers_since_last(session_id=None, limit=100)
-            
-            # Contar cuántos suscriptores se descargaron
-            count = len(new_subscribers_result) if isinstance(new_subscribers_result, list) else 0
-            result['subscribers_downloaded'] = count
-            
-            if count > 0:
-                logger.info(f"✅ [NEW_SUBSCRIBERS] {count} suscriptores descargados correctamente")
-            else:
-                logger.info(f"ℹ️ [NEW_SUBSCRIBERS] No hay suscriptores nuevos para descargar")
-                
-        except Exception as e:
-            error_msg = f"Error descargando suscriptores nuevos: {str(e)}"
-            logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}", exc_info=True)
-            result['message'] = error_msg
-            result['success'] = False
-            # Continuar con el siguiente paso aunque este falle
-        
-        # ========================================================================
-        # PASO 2: DESCARGAR CREDENCIALES DE LOGIN DE LOS NUEVOS SUSCRIPTORES
-        # ========================================================================
-        logger.info("📥 [NEW_SUBSCRIBERS] Paso 2/3: Descargando credenciales de login de nuevos suscriptores...")
-        try:
-            from .utils.panaccess.login import fetch_new_logins_from_panaccess
-            credentials_count = fetch_new_logins_from_panaccess(session_id=None)
-            
-            result['credentials_downloaded'] = credentials_count if isinstance(credentials_count, int) else 0
-            
-            if result['credentials_downloaded'] > 0:
-                logger.info(f"✅ [NEW_SUBSCRIBERS] {result['credentials_downloaded']} credenciales descargadas correctamente")
-            else:
-                logger.info(f"ℹ️ [NEW_SUBSCRIBERS] No hay credenciales nuevas para descargar")
-                
-        except Exception as e:
-            error_msg = f"Error descargando credenciales: {str(e)}"
-            logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}", exc_info=True)
-            # No marcar como fallo total si solo falla la descarga de credenciales
-            result['credentials_downloaded'] = 0
-        
-        # ========================================================================
-        # PASO 3: ACTUALIZAR TABLA CONSOLIDADA (SUBSCRIBERINFO)
-        # ========================================================================
-        logger.info("📥 [NEW_SUBSCRIBERS] Paso 3/3: Actualizando tabla consolidada SubscriberInfo...")
-        try:
-            from .utils.panaccess.subscriberinfo import sync_merge_all_subscribers
-            sync_merge_all_subscribers()
-            logger.info("✅ [NEW_SUBSCRIBERS] Tabla consolidada actualizada correctamente")
-        except Exception as e:
-            error_msg = f"Error actualizando tabla consolidada: {str(e)}"
-            logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}", exc_info=True)
-            # No marcar como fallo total si solo falla la actualización de la tabla consolidada
-        
-        # ========================================================================
-        # VERIFICACIÓN FINAL
-        # ========================================================================
-        # Considerar éxito si se descargaron suscriptores (las credenciales son opcionales)
-        if result['subscribers_downloaded'] > 0:
-            result['success'] = True
-            result['message'] = f'Se descargaron {result["subscribers_downloaded"]} suscriptores nuevos'
-            if result['credentials_downloaded'] > 0:
-                result['message'] += f' y {result["credentials_downloaded"]} credenciales'
-            result['message'] += ' correctamente'
-        elif result['subscribers_downloaded'] == 0:
-            result['success'] = True
-            result['message'] = 'No hay suscriptores nuevos para descargar'
-        
-        # ========================================================================
-        # VERIFICACIÓN FINAL
-        # ========================================================================
-        elapsed_time = time.time() - start_time
-        result['total_time_seconds'] = int(elapsed_time)
-        
-        logger.info(f"✅ [NEW_SUBSCRIBERS] Descarga completada en {elapsed_time:.2f} segundos")
-        
-        return result
-        
-    except PanaccessAuthenticationError as e:
-        # Error de autenticación - no reintentar automáticamente
-        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
-        logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        raise PanaccessAuthenticationError(error_msg) from e
-        
-    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
-        # Errores de conexión/timeout - reintentar automáticamente
-        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
-        logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        # Celery reintentará automáticamente gracias a autoretry_for
-        raise
-        
-    except PanaccessException as e:
-        # Otros errores de Panaccess
-        error_msg = f"Error de Panaccess: {str(e)}"
-        logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        raise
-        
-    except Exception as e:
-        # Error inesperado
-        error_msg = f"Error inesperado durante descarga de suscriptores nuevos: {str(e)}"
-        logger.error(f"❌ [NEW_SUBSCRIBERS] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        raise
+    Args:
+        task_name: Nombre de la tarea que libera el lock
+    """
+    lock_key = f"{TASK_LOCK_KEY}:{task_name}"
+    cache.delete(lock_key)
+    logger.info(f"🔓 [LOCK] Lock liberado para tarea: {task_name}")
 
 
 @shared_task(
     bind=True,
-    name='udid.tasks.update_all_subscribers',
-    max_retries=3,
-    default_retry_delay=60,  # 1 minuto entre reintentos
-    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
-    retry_backoff=True,
-    retry_backoff_max=600,  # Máximo 10 minutos de delay
-    retry_jitter=True,
-)
-def update_all_subscribers(self):
-    """
-    Tarea que actualiza todos los suscriptores existentes y su información desde Panaccess.
-    
-    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
-    en lugar de actualizar suscriptores existentes.
-    
-    Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
-    para mantener la base de datos actualizada con los cambios en Panaccess.
-    
-    QUÉ HACE:
-    - Actualiza TODOS los suscriptores existentes (compara y actualiza campos que hayan cambiado)
-    - Actualiza TODAS las credenciales de login existentes
-    - Actualiza la información consolidada en SubscriberInfo (tabla consolidada)
-    - NO descarga nuevos registros, solo actualiza los existentes
-    
-    CÓMO LO HACE:
-    - Usa el singleton de Panaccess para autenticación automática
-    - Compara cada registro local con los datos remotos de Panaccess
-    - Solo actualiza campos que hayan cambiado (optimización)
-    - Procesa en 3 pasos:
-      1. Actualiza suscriptores en ListOfSubscriber
-      2. Actualiza credenciales en SubscriberLoginInfo
-      3. Actualiza información consolidada en SubscriberInfo
-    
-    IMPORTANTE:
-    - Esta tarea puede tomar tiempo si hay muchos suscriptores (ej: 10,000)
-    - Solo actualiza registros existentes, no crea nuevos
-    - Se recomienda ejecutarla periódicamente (ej: diariamente) para mantener datos actualizados
-    
-    Returns:
-        dict: Resultado de la actualización con información detallada de cada paso
-        
-    Raises:
-        PanaccessException: Si hay errores críticos de autenticación o conexión
-    """
-    logger.info("🔄 [UPDATE_ALL] Iniciando actualización de todos los suscriptores desde Panaccess")
-    
-    # Verificar si las tablas base están vacías
-    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
-    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
-    from .utils.panaccess.login import DataBaseEmpty as logins_empty
-    
-    subscribers_is_empty = subscribers_empty()
-    smartcards_is_empty = smartcards_empty()
-    logins_is_empty = logins_empty()
-    
-    # Si alguna tabla base está vacía, ejecutar sincronización completa
-    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
-        logger.info(
-            f"📊 [UPDATE_ALL] Tablas base vacías detectadas - "
-            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
-            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
-            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
-        )
-        logger.info("🚀 [UPDATE_ALL] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
-        
-        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
-        return initial_sync_all_data.apply().get()
-    
-    # Si las tablas tienen datos, continuar con la lógica normal
-    logger.info("✅ [UPDATE_ALL] Las tablas base tienen datos, continuando con actualización de suscriptores...")
-    
-    result = {
-        'success': False,
-        'message': '',
-        'steps': {
-            'subscribers': {'success': False, 'message': '', 'updated': 0},
-            'credentials': {'success': False, 'message': '', 'updated': 0},
-            'subscriber_info': {'success': False, 'message': '', 'updated': 0},
-        },
-        'total_time_seconds': 0,
-    }
-    
-    import time
-    start_time = time.time()
-    
-    try:
-        # ========================================================================
-        # PASO 1: ACTUALIZAR SUSCRIPTORES (ListOfSubscriber)
-        # ========================================================================
-        logger.info("🔄 [UPDATE_ALL] Paso 1/3: Actualizando suscriptores...")
-        try:
-            from .utils.panaccess.subscriber import compare_and_update_all_subscribers
-            compare_and_update_all_subscribers(session_id=None, limit=100)
-            # La función no retorna el conteo, pero registra en logs
-            result['steps']['subscribers'] = {
-                'success': True,
-                'message': 'Suscriptores actualizados correctamente',
-                'updated': 'N/A'  # La función no retorna conteo
-            }
-            logger.info("✅ [UPDATE_ALL] Suscriptores actualizados correctamente")
-        except Exception as e:
-            error_msg = f"Error actualizando suscriptores: {str(e)}"
-            logger.error(f"❌ [UPDATE_ALL] {error_msg}", exc_info=True)
-            result['steps']['subscribers'] = {
-                'success': False,
-                'message': error_msg,
-                'updated': 0
-            }
-            # Continuar con los siguientes pasos aunque este falle
-        
-        # ========================================================================
-        # PASO 2: ACTUALIZAR CREDENCIALES DE LOGIN (SubscriberLoginInfo)
-        # ========================================================================
-        logger.info("🔄 [UPDATE_ALL] Paso 2/3: Actualizando credenciales de login...")
-        try:
-            from .utils.panaccess.login import compare_and_update_all_existing
-            # La función retorna el total actualizado pero no lo expone directamente
-            compare_and_update_all_existing(session_id=None)
-            result['steps']['credentials'] = {
-                'success': True,
-                'message': 'Credenciales actualizadas correctamente',
-                'updated': 'N/A'  # La función registra en logs pero no retorna conteo
-            }
-            logger.info("✅ [UPDATE_ALL] Credenciales actualizadas correctamente")
-        except Exception as e:
-            error_msg = f"Error actualizando credenciales: {str(e)}"
-            logger.error(f"❌ [UPDATE_ALL] {error_msg}", exc_info=True)
-            result['steps']['credentials'] = {
-                'success': False,
-                'message': error_msg,
-                'updated': 0
-            }
-            # Continuar con el siguiente paso aunque este falle
-        
-        # ========================================================================
-        # PASO 3: ACTUALIZAR INFORMACIÓN CONSOLIDADA (SubscriberInfo)
-        # ========================================================================
-        logger.info("🔄 [UPDATE_ALL] Paso 3/3: Actualizando información consolidada...")
-        try:
-            from .utils.panaccess.subscriberinfo import sync_merge_all_subscribers
-            sync_merge_all_subscribers()
-            result['steps']['subscriber_info'] = {
-                'success': True,
-                'message': 'Información consolidada actualizada correctamente',
-                'updated': 'N/A'  # La función registra en logs pero no retorna conteo
-            }
-            logger.info("✅ [UPDATE_ALL] Información consolidada actualizada correctamente")
-        except Exception as e:
-            error_msg = f"Error actualizando información consolidada: {str(e)}"
-            logger.error(f"❌ [UPDATE_ALL] {error_msg}", exc_info=True)
-            result['steps']['subscriber_info'] = {
-                'success': False,
-                'message': error_msg,
-                'updated': 0
-            }
-        
-        # ========================================================================
-        # VERIFICACIÓN FINAL
-        # ========================================================================
-        elapsed_time = time.time() - start_time
-        result['total_time_seconds'] = int(elapsed_time)
-        
-        # Verificar si todas las tareas se completaron exitosamente
-        all_success = all(step['success'] for step in result['steps'].values())
-        result['success'] = all_success
-        
-        if all_success:
-            result['message'] = f'Actualización completada exitosamente en {elapsed_time:.2f} segundos'
-            logger.info(f"✅ [UPDATE_ALL] {result['message']}")
-        else:
-            failed_steps = [name for name, step in result['steps'].items() if not step['success']]
-            result['message'] = f'Actualización completada con errores en: {", ".join(failed_steps)}'
-            logger.warning(f"⚠️ [UPDATE_ALL] {result['message']}")
-        
-        return result
-        
-    except PanaccessAuthenticationError as e:
-        # Error de autenticación - no reintentar automáticamente
-        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
-        logger.error(f"❌ [UPDATE_ALL] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        raise PanaccessAuthenticationError(error_msg) from e
-        
-    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
-        # Errores de conexión/timeout - reintentar automáticamente
-        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
-        logger.error(f"❌ [UPDATE_ALL] {error_msg}")
-        result['message'] = error_msg
-        result['success'] = False
-        # Celery reintentará automáticamente gracias a autoretry_for
-        raise
-        
-    except PanaccessException as e:
-        # Otros errores de Panaccess
-        error_msg = f"Error de Panaccess: {str(e)}"
-        logger.error(f"❌ [UPDATE_ALL] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        raise
-        
-    except Exception as e:
-        # Error inesperado
-        error_msg = f"Error inesperado durante actualización de suscriptores: {str(e)}"
-        logger.error(f"❌ [UPDATE_ALL] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        raise
-
-
-@shared_task(
-    bind=True,
-    name='udid.tasks.update_smartcards_from_subscribers',
-    max_retries=3,
-    default_retry_delay=60,  # 1 minuto entre reintentos
-    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
-    retry_backoff=True,
-    retry_backoff_max=600,  # Máximo 10 minutos de delay
-    retry_jitter=True,
-)
-def update_smartcards_from_subscribers(self):
-    """
-    Tarea que actualiza el modelo de smartcards basándose en la información del modelo de suscriptores.
-    
-    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
-    en lugar de actualizar smartcards desde suscriptores.
-    
-    Esta tarea está diseñada para ejecutarse periódicamente o bajo demanda
-    para mantener la tabla ListOfSmartcards sincronizada con los datos de suscriptores.
-    
-    QUÉ HACE:
-    - Lee todos los suscriptores de la tabla ListOfSubscriber
-    - Extrae las SNs (Serial Numbers) del campo smartcards (JSON) de cada suscriptor
-    - Actualiza o crea registros en ListOfSmartcards con información del suscriptor:
-      * subscriberCode (código del suscriptor)
-      * lastName (apellido del suscriptor)
-      * firstName (nombre del suscriptor)
-      * hcId (ID del headend)
-    - Actualiza la tabla consolidada SubscriberInfo con los cambios realizados
-    - Solo actualiza campos que hayan cambiado (optimización)
-    
-    CÓMO LO HACE:
-    - Procesa todos los suscriptores en la base de datos
-    - Para cada suscriptor, extrae las SNs del campo JSON smartcards
-    - Para cada SN:
-      * Si la smartcard ya existe: actualiza solo los campos que cambiaron
-      * Si la smartcard no existe: crea un nuevo registro
-    - Usa transacciones para garantizar consistencia
-    
-    IMPORTANTE:
-    - Esta tarea NO requiere conexión a Panaccess (trabaja solo con datos locales)
-    - Puede tomar tiempo si hay muchos suscriptores (ej: 10,000)
-    - Solo actualiza campos básicos del suscriptor, no sobrescribe datos específicos de smartcard
-      como PIN, productos, paquetes, etc.
-    - Se recomienda ejecutarla después de actualizar suscriptores desde Panaccess
-    
-    Returns:
-        dict: Resultado de la actualización con estadísticas detalladas:
-            - total_subscribers_processed: Cantidad de suscriptores procesados
-            - total_sns_found: Total de SNs encontradas en todos los suscriptores
-            - total_smartcards_created: Cantidad de smartcards nuevas creadas
-            - total_smartcards_updated: Cantidad de smartcards existentes actualizadas
-            - total_errors: Cantidad de errores encontrados durante el proceso
-        
-    Raises:
-        Exception: Si hay errores críticos durante el proceso
-    """
-    logger.info("🔄 [UPDATE_SMARTCARDS] Iniciando actualización de smartcards desde suscriptores")
-    
-    # Verificar si las tablas base están vacías
-    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
-    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
-    from .utils.panaccess.login import DataBaseEmpty as logins_empty
-    
-    subscribers_is_empty = subscribers_empty()
-    smartcards_is_empty = smartcards_empty()
-    logins_is_empty = logins_empty()
-    
-    # Si alguna tabla base está vacía, ejecutar sincronización completa
-    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
-        logger.info(
-            f"📊 [UPDATE_SMARTCARDS] Tablas base vacías detectadas - "
-            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
-            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
-            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
-        )
-        logger.info("🚀 [UPDATE_SMARTCARDS] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
-        
-        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
-        return initial_sync_all_data.apply().get()
-    
-    # Si las tablas tienen datos, continuar con la lógica normal
-    logger.info("✅ [UPDATE_SMARTCARDS] Las tablas base tienen datos, continuando con actualización de smartcards...")
-    
-    result = {
-        'success': False,
-        'message': '',
-        'total_subscribers_processed': 0,
-        'total_sns_found': 0,
-        'total_smartcards_created': 0,
-        'total_smartcards_updated': 0,
-        'total_errors': 0,
-        'total_time_seconds': 0,
-    }
-    
-    import time
-    start_time = time.time()
-    
-    try:
-        # Llamar a la función que actualiza smartcards desde suscriptores
-        from .utils.panaccess.smartcard import update_smartcards_from_subscribers as update_function
-        
-        logger.info("🔄 [UPDATE_SMARTCARDS] Ejecutando actualización...")
-        update_result = update_function()
-        
-        # Copiar los resultados de la función
-        result['total_subscribers_processed'] = update_result.get('total_subscribers_processed', 0)
-        result['total_sns_found'] = update_result.get('total_sns_found', 0)
-        result['total_smartcards_created'] = update_result.get('total_smartcards_created', 0)
-        result['total_smartcards_updated'] = update_result.get('total_smartcards_updated', 0)
-        result['total_errors'] = update_result.get('total_errors', 0)
-        
-        # Determinar si fue exitoso
-        result['success'] = result['total_errors'] == 0
-        
-        # Crear mensaje descriptivo
-        if result['success']:
-            result['message'] = (
-                f'Actualización completada: {result["total_subscribers_processed"]} suscriptores procesados, '
-                f'{result["total_sns_found"]} SNs encontradas, '
-                f'{result["total_smartcards_created"]} smartcards creadas, '
-                f'{result["total_smartcards_updated"]} smartcards actualizadas'
-            )
-        else:
-            result['message'] = (
-                f'Actualización completada con {result["total_errors"]} errores: '
-                f'{result["total_subscribers_processed"]} suscriptores procesados, '
-                f'{result["total_smartcards_created"]} smartcards creadas, '
-                f'{result["total_smartcards_updated"]} smartcards actualizadas'
-            )
-        
-        logger.info(f"✅ [UPDATE_SMARTCARDS] {result['message']}")
-        
-        # ========================================================================
-        # PASO ADICIONAL: ACTUALIZAR TABLA CONSOLIDADA (SUBSCRIBERINFO)
-        # ========================================================================
-        logger.info("🔄 [UPDATE_SMARTCARDS] Actualizando tabla consolidada SubscriberInfo...")
-        try:
-            from .utils.panaccess.subscriberinfo import sync_merge_all_subscribers
-            sync_merge_all_subscribers()
-            logger.info("✅ [UPDATE_SMARTCARDS] Tabla consolidada actualizada correctamente")
-        except Exception as e:
-            error_msg = f"Error actualizando tabla consolidada: {str(e)}"
-            logger.error(f"❌ [UPDATE_SMARTCARDS] {error_msg}", exc_info=True)
-            # No marcar como fallo total si solo falla la actualización de la tabla consolidada
-        
-        # ========================================================================
-        # VERIFICACIÓN FINAL
-        # ========================================================================
-        elapsed_time = time.time() - start_time
-        result['total_time_seconds'] = int(elapsed_time)
-        
-        logger.info(f"✅ [UPDATE_SMARTCARDS] Proceso completado en {elapsed_time:.2f} segundos")
-        
-        return result
-        
-    except Exception as e:
-        # Error inesperado
-        error_msg = f"Error inesperado durante actualización de smartcards desde suscriptores: {str(e)}"
-        logger.error(f"❌ [UPDATE_SMARTCARDS] {error_msg}", exc_info=True)
-        result['message'] = error_msg
-        result['success'] = False
-        
-        # Calcular tiempo transcurrido antes de lanzar excepción
-        elapsed_time = time.time() - start_time
-        result['total_time_seconds'] = int(elapsed_time)
-        
-        raise
-
-
-@shared_task(
-    bind=True,
-    name='udid.tasks.validate_and_fix_all_data',
+    name='udid.tasks.sync_all_data_automatic',
     max_retries=3,
     default_retry_delay=300,  # 5 minutos entre reintentos
     autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
@@ -835,211 +106,161 @@ def update_smartcards_from_subscribers(self):
     retry_backoff_max=3600,  # Máximo 1 hora de delay
     retry_jitter=True,
 )
-def validate_and_fix_all_data(self):
+def sync_all_data_automatic(self):
     """
-    Tarea de validación y corrección completa que sincroniza y valida todos los datos desde Panaccess.
+    Tarea principal que sincroniza todos los datos desde Panaccess usando lógica automática.
     
-    CONDICIÓN: Si las tablas base están vacías, ejecuta initial_sync_all_data
-    en lugar de validar y corregir datos existentes.
+    Esta tarea está diseñada para ejecutarse UNA SOLA VEZ cuando se configura Celery en el servidor.
+    Después se pueden gestionar otras tareas según necesidad.
     
-    Esta tarea está diseñada para ejecutarse a una hora específica (configurada con Celery Beat)
-    para mantener la integridad y consistencia de todos los datos en la base de datos.
+    LÓGICA AUTOMÁTICA:
+    - Si BD vacía → descarga completa desde cero
+    - Si BD tiene registros → descarga nuevos desde último registro + actualiza existentes
+    - Si hay error/interrupción → los reintentos están implementados
+    - Si reintentos fallan → al llamar de nuevo, detecta registros y continúa desde último
     
     QUÉ HACE:
-    - Sincroniza TODOS los suscriptores desde Panaccess (descarga nuevos y actualiza existentes)
-    - Sincroniza TODAS las credenciales de login desde Panaccess
-    - Sincroniza TODAS las smartcards desde Panaccess
-    - Valida la consistencia de los datos entre todas las tablas
-    - Corrige errores encontrados:
-      * Actualiza smartcards con información de suscriptores
-      * Sincroniza la tabla consolidada SubscriberInfo
-      * Asegura que todos los datos estén actualizados
+    - Sincroniza suscriptores desde Panaccess (automático según estado de BD)
+    - Sincroniza smartcards desde Panaccess (automático según estado de BD)
+    - Sincroniza credenciales de login desde Panaccess (automático según estado de BD)
+    - Consolida información en SubscriberInfo (tabla consolidada)
     
     CÓMO LO HACE:
     - Usa el singleton de Panaccess para autenticación automática
-    - Ejecuta sincronizaciones completas desde Panaccess
-    - Valida y corrige inconsistencias entre tablas
-    - Procesa en 5 pasos:
-      1. Sincronizar suscriptores desde Panaccess
-      2. Sincronizar credenciales desde Panaccess
-      3. Sincronizar smartcards desde Panaccess
-      4. Actualizar smartcards con información de suscriptores (corrección)
-      5. Sincronizar tabla consolidada SubscriberInfo
+    - Ejecuta las sincronizaciones en orden usando funciones sync_*() que tienen lógica automática:
+      1. sync_subscribers() - Detecta si BD vacía o tiene registros
+      2. sync_smartcards() - Detecta si BD vacía o tiene registros
+      3. sync_subscriber_logins() - Detecta si BD vacía o tiene registros
+      4. sync_merge_all_subscribers() - Consolida información
     
     IMPORTANTE:
-    - Esta tarea puede tomar mucho tiempo si hay muchos registros (ej: 10,000+)
-    - Se recomienda ejecutarla en horarios de bajo tráfico (ej: 2:00 AM)
-    - Esta tarea es completa y exhaustiva, asegura que todos los datos estén correctos
-    - Detecta y corrige automáticamente inconsistencias entre tablas
+    - Esta tarea puede tomar varias horas si hay muchos registros (ej: 10,000+)
+    - Se recomienda ejecutarla cuando se configura Celery por primera vez
+    - Si se interrumpe, al ejecutarla de nuevo continuará desde donde se quedó
+    - Los reintentos automáticos están configurados para errores de conexión/timeout
     
     Returns:
-        dict: Resultado de la validación y corrección con información detallada de cada paso
+        dict: Resultado de la sincronización con información detallada de cada paso
         
     Raises:
         PanaccessException: Si hay errores críticos de autenticación o conexión
+    
+    PERIODICIDAD: Se ejecuta UNA VEZ cuando se levante el proyecto en la VM.
+    No es una tarea periódica, se ejecuta manualmente al iniciar el servidor.
     """
-    logger.info("🔍 [VALIDATE_FIX] Iniciando validación y corrección completa de datos desde Panaccess")
+    task_name = 'sync_all_data_automatic'
     
-    # Verificar si las tablas base están vacías
-    from .utils.panaccess.subscriber import DataBaseEmpty as subscribers_empty
-    from .utils.panaccess.smartcard import DataBaseEmpty as smartcards_empty
-    from .utils.panaccess.login import DataBaseEmpty as logins_empty
-    
-    subscribers_is_empty = subscribers_empty()
-    smartcards_is_empty = smartcards_empty()
-    logins_is_empty = logins_empty()
-    
-    # Si alguna tabla base está vacía, ejecutar sincronización completa
-    if subscribers_is_empty or smartcards_is_empty or logins_is_empty:
-        logger.info(
-            f"📊 [VALIDATE_FIX] Tablas base vacías detectadas - "
-            f"Suscriptores: {'VACÍA' if subscribers_is_empty else 'OK'}, "
-            f"Smartcards: {'VACÍA' if smartcards_is_empty else 'OK'}, "
-            f"Logins: {'VACÍA' if logins_is_empty else 'OK'}"
+    # Verificar si hay otra tarea en ejecución
+    if not acquire_task_lock(task_name):
+        logger.warning(
+            f"⚠️ [SYNC_ALL] Otra tarea está en ejecución. "
+            f"Esta tarea se cancelará para evitar conflictos."
         )
-        logger.info("🚀 [VALIDATE_FIX] Ejecutando sincronización inicial completa (initial_sync_all_data)...")
-        
-        # Ejecutar sincronización completa (usar apply para ejecutar síncronamente y get para obtener resultado)
-        return initial_sync_all_data.apply().get()
-    
-    # Si las tablas tienen datos, continuar con la lógica normal
-    logger.info("✅ [VALIDATE_FIX] Las tablas base tienen datos, continuando con validación y corrección...")
-    
-    result = {
-        'success': False,
-        'message': '',
-        'steps': {
-            'sync_subscribers': {'success': False, 'message': '', 'details': {}},
-            'sync_credentials': {'success': False, 'message': '', 'details': {}},
-            'sync_smartcards': {'success': False, 'message': '', 'details': {}},
-            'fix_smartcards_from_subscribers': {'success': False, 'message': '', 'details': {}},
-            'sync_consolidated': {'success': False, 'message': '', 'details': {}},
-        },
-        'total_time_seconds': 0,
-    }
-    
-    import time
-    start_time = time.time()
+        return {
+            'success': False,
+            'message': 'Otra tarea de sincronización está en ejecución. Esta tarea se canceló.',
+            'skipped': True
+        }
     
     try:
+        logger.info("🚀 [SYNC_ALL] Iniciando sincronización automática completa de datos desde Panaccess")
+        
+        result = {
+            'success': False,
+            'message': '',
+            'steps': {
+                'subscribers': {'success': False, 'message': '', 'result': None},
+                'smartcards': {'success': False, 'message': '', 'result': None},
+                'subscriber_logins': {'success': False, 'message': '', 'result': None},
+                'merge_subscribers': {'success': False, 'message': ''},
+            },
+            'total_time_seconds': 0,
+        }
+        
+        start_time = time.time()
         # ========================================================================
-        # PASO 1: SINCRONIZAR SUSCRIPTORES DESDE PANACCESS
+        # PASO 1: SINCRONIZACIÓN DE SUSCRIPTORES (LÓGICA AUTOMÁTICA)
         # ========================================================================
-        logger.info("🔍 [VALIDATE_FIX] Paso 1/5: Sincronizando suscriptores desde Panaccess...")
+        logger.info("📥 [SYNC_ALL] Paso 1/4: Sincronizando suscriptores...")
         try:
-            from .utils.panaccess.subscriber import sync_subscribers
-            sync_result = sync_subscribers(session_id=None, limit=100)
-            result['steps']['sync_subscribers'] = {
+            subscribers_result = sync_subscribers(session_id=None, limit=100)
+            result['steps']['subscribers'] = {
                 'success': True,
                 'message': 'Suscriptores sincronizados correctamente',
-                'details': {'result': str(sync_result) if sync_result else 'N/A'}
+                'result': subscribers_result
             }
-            logger.info("✅ [VALIDATE_FIX] Suscriptores sincronizados correctamente")
+            logger.info("✅ [SYNC_ALL] Suscriptores sincronizados correctamente")
         except Exception as e:
             error_msg = f"Error sincronizando suscriptores: {str(e)}"
-            logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
-            result['steps']['sync_subscribers'] = {
+            logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
+            result['steps']['subscribers'] = {
                 'success': False,
                 'message': error_msg,
-                'details': {}
+                'result': None
             }
             # Continuar con los siguientes pasos aunque este falle
         
         # ========================================================================
-        # PASO 2: SINCRONIZAR CREDENCIALES DESDE PANACCESS
+        # PASO 2: SINCRONIZACIÓN DE SMARTCARDS (LÓGICA AUTOMÁTICA)
         # ========================================================================
-        logger.info("🔍 [VALIDATE_FIX] Paso 2/5: Sincronizando credenciales desde Panaccess...")
+        logger.info("📥 [SYNC_ALL] Paso 2/4: Sincronizando smartcards...")
         try:
-            from .utils.panaccess.login import sync_subscriber_logins
-            credentials_result = sync_subscriber_logins(session_id=None)
-            result['steps']['sync_credentials'] = {
-                'success': True,
-                'message': 'Credenciales sincronizadas correctamente',
-                'details': {'result': str(credentials_result) if credentials_result else 'N/A'}
-            }
-            logger.info("✅ [VALIDATE_FIX] Credenciales sincronizadas correctamente")
-        except Exception as e:
-            error_msg = f"Error sincronizando credenciales: {str(e)}"
-            logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
-            result['steps']['sync_credentials'] = {
-                'success': False,
-                'message': error_msg,
-                'details': {}
-            }
-            # Continuar con los siguientes pasos aunque este falle
-        
-        # ========================================================================
-        # PASO 3: SINCRONIZAR SMARTCARDS DESDE PANACCESS
-        # ========================================================================
-        logger.info("🔍 [VALIDATE_FIX] Paso 3/5: Sincronizando smartcards desde Panaccess...")
-        try:
-            from .utils.panaccess.smartcard import sync_smartcards
             smartcards_result = sync_smartcards(session_id=None, limit=100)
-            result['steps']['sync_smartcards'] = {
+            result['steps']['smartcards'] = {
                 'success': True,
                 'message': 'Smartcards sincronizadas correctamente',
-                'details': {'result': str(smartcards_result) if smartcards_result else 'N/A'}
+                'result': smartcards_result
             }
-            logger.info("✅ [VALIDATE_FIX] Smartcards sincronizadas correctamente")
+            logger.info("✅ [SYNC_ALL] Smartcards sincronizadas correctamente")
         except Exception as e:
             error_msg = f"Error sincronizando smartcards: {str(e)}"
-            logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
-            result['steps']['sync_smartcards'] = {
+            logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
+            result['steps']['smartcards'] = {
                 'success': False,
                 'message': error_msg,
-                'details': {}
+                'result': None
             }
             # Continuar con los siguientes pasos aunque este falle
         
         # ========================================================================
-        # PASO 4: CORREGIR SMARTCARDS CON INFORMACIÓN DE SUSCRIPTORES
+        # PASO 3: SINCRONIZACIÓN DE CREDENCIALES DE LOGIN (LÓGICA AUTOMÁTICA)
         # ========================================================================
-        logger.info("🔍 [VALIDATE_FIX] Paso 4/5: Corrigiendo smartcards con información de suscriptores...")
+        logger.info("📥 [SYNC_ALL] Paso 3/4: Sincronizando credenciales de login...")
         try:
-            from .utils.panaccess.smartcard import update_smartcards_from_subscribers
-            fix_result = update_smartcards_from_subscribers()
-            result['steps']['fix_smartcards_from_subscribers'] = {
+            logins_result = sync_subscriber_logins(session_id=None)
+            result['steps']['subscriber_logins'] = {
                 'success': True,
-                'message': 'Smartcards corregidas correctamente',
-                'details': {
-                    'subscribers_processed': fix_result.get('total_subscribers_processed', 0),
-                    'sns_found': fix_result.get('total_sns_found', 0),
-                    'smartcards_created': fix_result.get('total_smartcards_created', 0),
-                    'smartcards_updated': fix_result.get('total_smartcards_updated', 0),
-                    'errors': fix_result.get('total_errors', 0),
-                }
+                'message': 'Credenciales de login sincronizadas correctamente',
+                'result': logins_result
             }
-            logger.info("✅ [VALIDATE_FIX] Smartcards corregidas correctamente")
+            logger.info("✅ [SYNC_ALL] Credenciales de login sincronizadas correctamente")
         except Exception as e:
-            error_msg = f"Error corrigiendo smartcards: {str(e)}"
-            logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
-            result['steps']['fix_smartcards_from_subscribers'] = {
+            error_msg = f"Error sincronizando credenciales: {str(e)}"
+            logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
+            result['steps']['subscriber_logins'] = {
                 'success': False,
                 'message': error_msg,
-                'details': {}
+                'result': None
             }
             # Continuar con el siguiente paso aunque este falle
         
         # ========================================================================
-        # PASO 5: SINCRONIZAR TABLA CONSOLIDADA (SUBSCRIBERINFO)
+        # PASO 4: CONSOLIDACIÓN EN SUBSCRIBERINFO (TABLA CONSOLIDADA)
         # ========================================================================
-        logger.info("🔍 [VALIDATE_FIX] Paso 5/5: Sincronizando tabla consolidada...")
+        logger.info("📥 [SYNC_ALL] Paso 4/4: Consolidando información en SubscriberInfo...")
         try:
-            from .utils.panaccess.subscriberinfo import sync_merge_all_subscribers
             sync_merge_all_subscribers()
-            result['steps']['sync_consolidated'] = {
+            result['steps']['merge_subscribers'] = {
                 'success': True,
-                'message': 'Tabla consolidada sincronizada correctamente',
-                'details': {}
+                'message': 'Información consolidada correctamente'
             }
-            logger.info("✅ [VALIDATE_FIX] Tabla consolidada sincronizada correctamente")
+            logger.info("✅ [SYNC_ALL] Información consolidada en SubscriberInfo")
         except Exception as e:
-            error_msg = f"Error sincronizando tabla consolidada: {str(e)}"
-            logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
-            result['steps']['sync_consolidated'] = {
+            error_msg = f"Error consolidando información: {str(e)}"
+            logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
+            result['steps']['merge_subscribers'] = {
                 'success': False,
-                'message': error_msg,
-                'details': {}
+                'message': error_msg
             }
         
         # ========================================================================
@@ -1053,44 +274,932 @@ def validate_and_fix_all_data(self):
         result['success'] = all_success
         
         if all_success:
-            result['message'] = f'Validación y corrección completada exitosamente en {elapsed_time:.2f} segundos'
-            logger.info(f"✅ [VALIDATE_FIX] {result['message']}")
+            result['message'] = f'Sincronización automática completada exitosamente en {elapsed_time:.2f} segundos'
+            logger.info(f"✅ [SYNC_ALL] {result['message']}")
         else:
             failed_steps = [name for name, step in result['steps'].items() if not step['success']]
-            result['message'] = f'Validación y corrección completada con errores en: {", ".join(failed_steps)}'
-            logger.warning(f"⚠️ [VALIDATE_FIX] {result['message']}")
+            result['message'] = f'Sincronización completada con errores en: {", ".join(failed_steps)}'
+            logger.warning(f"⚠️ [SYNC_ALL] {result['message']}")
         
         return result
         
     except PanaccessAuthenticationError as e:
         # Error de autenticación - no reintentar automáticamente
         error_msg = f"Error de autenticación con Panaccess: {str(e)}"
-        logger.error(f"❌ [VALIDATE_FIX] {error_msg}")
+        logger.error(f"❌ [SYNC_ALL] {error_msg}")
         result['message'] = error_msg
         result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
         raise PanaccessAuthenticationError(error_msg) from e
         
     except (PanaccessConnectionError, PanaccessTimeoutError) as e:
         # Errores de conexión/timeout - reintentar automáticamente
         error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
-        logger.error(f"❌ [VALIDATE_FIX] {error_msg}")
+        logger.error(f"❌ [SYNC_ALL] {error_msg}")
         result['message'] = error_msg
         result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
         # Celery reintentará automáticamente gracias a autoretry_for
         raise
         
     except PanaccessException as e:
         # Otros errores de Panaccess
         error_msg = f"Error de Panaccess: {str(e)}"
-        logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
+        logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
         result['message'] = error_msg
         result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
         raise
         
     except Exception as e:
         # Error inesperado
-        error_msg = f"Error inesperado durante validación y corrección: {str(e)}"
-        logger.error(f"❌ [VALIDATE_FIX] {error_msg}", exc_info=True)
+        error_msg = f"Error inesperado durante sincronización: {str(e)}"
+        logger.error(f"❌ [SYNC_ALL] {error_msg}", exc_info=True)
         result['message'] = error_msg
         result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+    finally:
+        # Liberar el lock siempre, incluso si hay error
+        release_task_lock(task_name)
+
+
+@shared_task(
+    bind=True,
+    name='udid.tasks.check_and_sync_smartcards_monthly',
+    max_retries=3,
+    default_retry_delay=300,  # 5 minutos entre reintentos
+    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=3600,  # Máximo 1 hora de delay
+    retry_jitter=True,
+)
+def check_and_sync_smartcards_monthly(self):
+    """
+    Tarea mensual que verifica la cantidad de smartcards en Panaccess vs base de datos.
+    
+    Si existen más smartcards en Panaccess que en la base de datos, descarga las nuevas
+    desde la última smartcard registrada en BD.
+    
+    PERIODICIDAD: Día 28 de cada mes a las 3:00 AM (configurar en Celery Beat).
+    Ejemplo: crontab(day_of_month='28', hour=3, minute=0)
+    
+    QUÉ HACE:
+    1. Obtiene el total de smartcards en Panaccess (haciendo una llamada a la API)
+    2. Obtiene el total de smartcards en la base de datos local
+    3. Compara ambos totales
+    4. Si Panaccess tiene más smartcards:
+       - Ejecuta sync_smartcards() que automáticamente descarga desde la última registrada
+       - La función sync_smartcards() detecta el último SN en BD y descarga solo los nuevos
+    
+    LÓGICA AUTOMÁTICA:
+    - sync_smartcards() detecta automáticamente si hay registros en BD
+    - Si hay registros, descarga solo los nuevos desde el último SN
+    - Si no hay registros, descarga todo desde cero
+    
+    IMPORTANTE:
+    - Esta tarea puede tomar tiempo si hay muchas smartcards nuevas (ej: miles)
+    - Se recomienda ejecutarla en horarios de bajo tráfico (madrugada: 2:00 AM - 4:00 AM)
+    - Los reintentos automáticos están configurados para errores de conexión/timeout
+    - Si se interrumpe, al ejecutarla de nuevo continuará desde donde se quedó
+    
+    Returns:
+        dict: Resultado de la verificación y sincronización con información detallada:
+            - panaccess_total: Total de smartcards en Panaccess
+            - database_total: Total de smartcards en BD local
+            - difference: Diferencia entre Panaccess y BD
+            - sync_executed: Si se ejecutó la sincronización
+            - sync_result: Resultado de la sincronización (si se ejecutó)
+            - success: Si la tarea se completó exitosamente
+        
+    Raises:
+        PanaccessException: Si hay errores críticos de autenticación o conexión
+    """
+    task_name = 'check_and_sync_smartcards_monthly'
+    
+    # Verificar si hay otra tarea en ejecución
+    if not acquire_task_lock(task_name):
+        logger.warning(
+            f"⚠️ [CHECK_SMARTCARDS] Otra tarea está en ejecución. "
+            f"Esta tarea se cancelará para evitar conflictos."
+        )
+        return {
+            'success': False,
+            'message': 'Otra tarea de sincronización está en ejecución. Esta tarea se canceló.',
+            'skipped': True
+        }
+    
+    try:
+        logger.info("🔍 [CHECK_SMARTCARDS] Iniciando verificación mensual de smartcards")
+        
+        result = {
+            'success': False,
+            'message': '',
+            'panaccess_total': 0,
+            'database_total': 0,
+            'difference': 0,
+            'sync_executed': False,
+            'sync_result': None,
+            'total_time_seconds': 0,
+        }
+        
+        start_time = time.time()
+        # ========================================================================
+        # PASO 1: OBTENER TOTAL DE SMARTCARDS EN PANACCESS
+        # ========================================================================
+        logger.info("📊 [CHECK_SMARTCARDS] Obteniendo total de smartcards en Panaccess...")
+        try:
+            # Hacer una llamada con offset=0, limit=1 solo para obtener el count total
+            panaccess_response = CallListSmartcards(session_id=None, offset=0, limit=1, timeout=30)
+            panaccess_total = panaccess_response.get('count', 0)
+            result['panaccess_total'] = panaccess_total
+            logger.info(f"✅ [CHECK_SMARTCARDS] Total en Panaccess: {panaccess_total} smartcards")
+        except Exception as e:
+            error_msg = f"Error obteniendo total de Panaccess: {str(e)}"
+            logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}", exc_info=True)
+            result['message'] = error_msg
+            result['success'] = False
+            elapsed_time = time.time() - start_time
+            result['total_time_seconds'] = int(elapsed_time)
+            raise
+        
+        # ========================================================================
+        # PASO 2: OBTENER TOTAL DE SMARTCARDS EN BASE DE DATOS LOCAL
+        # ========================================================================
+        logger.info("📊 [CHECK_SMARTCARDS] Obteniendo total de smartcards en base de datos local...")
+        try:
+            database_total = ListOfSmartcards.objects.count()
+            result['database_total'] = database_total
+            logger.info(f"✅ [CHECK_SMARTCARDS] Total en BD local: {database_total} smartcards")
+        except Exception as e:
+            error_msg = f"Error obteniendo total de BD local: {str(e)}"
+            logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}", exc_info=True)
+            result['message'] = error_msg
+            result['success'] = False
+            elapsed_time = time.time() - start_time
+            result['total_time_seconds'] = int(elapsed_time)
+            raise
+        
+        # ========================================================================
+        # PASO 3: COMPARAR Y DECIDIR SI SINCRONIZAR
+        # ========================================================================
+        difference = panaccess_total - database_total
+        result['difference'] = difference
+        
+        logger.info(
+            f"📊 [CHECK_SMARTCARDS] Comparación: "
+            f"Panaccess={panaccess_total}, BD={database_total}, Diferencia={difference}"
+        )
+        
+        if difference > 0:
+            logger.info(
+                f"🔄 [CHECK_SMARTCARDS] Se detectaron {difference} smartcards nuevas en Panaccess. "
+                f"Iniciando sincronización desde la última smartcard registrada..."
+            )
+            
+            # ========================================================================
+            # PASO 4: SINCRONIZAR SMARTCARDS (DESCARGA AUTOMÁTICA DESDE ÚLTIMA)
+            # ========================================================================
+            try:
+                # sync_smartcards() automáticamente detecta si hay registros en BD
+                # y descarga solo los nuevos desde el último SN registrado
+                sync_result = sync_smartcards(session_id=None, limit=100)
+                result['sync_executed'] = True
+                result['sync_result'] = sync_result
+                
+                logger.info(
+                    f"✅ [CHECK_SMARTCARDS] Sincronización completada. "
+                    f"Se descargaron smartcards nuevas desde la última registrada."
+                )
+            except Exception as e:
+                error_msg = f"Error durante sincronización de smartcards: {str(e)}"
+                logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}", exc_info=True)
+                result['sync_executed'] = True
+                result['sync_result'] = {'error': error_msg}
+                # No marcar como fallo total, la verificación fue exitosa
+        else:
+            logger.info(
+                f"✅ [CHECK_SMARTCARDS] No hay smartcards nuevas. "
+                f"BD local está actualizada ({database_total} smartcards)."
+            )
+            result['sync_executed'] = False
+        
+        # ========================================================================
+        # VERIFICACIÓN FINAL
+        # ========================================================================
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        result['success'] = True
+        
+        if difference > 0 and result['sync_executed']:
+            result['message'] = (
+                f'Verificación completada. Se encontraron {difference} smartcards nuevas. '
+                f'Sincronización ejecutada correctamente en {elapsed_time:.2f} segundos'
+            )
+        elif difference > 0:
+            result['message'] = (
+                f'Verificación completada. Se encontraron {difference} smartcards nuevas, '
+                f'pero hubo un error durante la sincronización'
+            )
+        else:
+            result['message'] = (
+                f'Verificación completada. No hay smartcards nuevas. '
+                f'BD local está actualizada ({database_total} smartcards)'
+            )
+        
+        logger.info(f"✅ [CHECK_SMARTCARDS] {result['message']}")
+        
+        return result
+        
+    except PanaccessAuthenticationError as e:
+        # Error de autenticación - no reintentar automáticamente
+        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise PanaccessAuthenticationError(error_msg) from e
+        
+    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
+        # Errores de conexión/timeout - reintentar automáticamente
+        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        # Celery reintentará automáticamente gracias a autoretry_for
+        raise
+        
+    except PanaccessException as e:
+        # Otros errores de Panaccess
+        error_msg = f"Error de Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+        
+    except Exception as e:
+        # Error inesperado
+        error_msg = f"Error inesperado durante verificación de smartcards: {str(e)}"
+        logger.error(f"❌ [CHECK_SMARTCARDS] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+
+
+@shared_task(
+    bind=True,
+    name='udid.tasks.check_and_sync_subscribers_periodic',
+    max_retries=2,
+    default_retry_delay=60,  # 1 minuto entre reintentos
+    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=300,  # Máximo 5 minutos de delay
+    retry_jitter=True,
+)
+def check_and_sync_subscribers_periodic(self):
+    """
+    Tarea periódica que verifica y sincroniza suscriptores cada 5 minutos.
+    
+    Si existen más suscriptores en Panaccess que en la base de datos, descarga los nuevos
+    desde el último suscriptor registrado. Al terminar, obtiene las credenciales de login
+    de esos suscriptores nuevos y las almacena en la base de datos.
+    
+    PERIODICIDAD: Cada 5 minutos (configurar en Celery Beat).
+    Ejemplo: schedule=300.0 (300 segundos = 5 minutos)
+    
+    QUÉ HACE:
+    1. Obtiene el total de suscriptores en la base de datos local
+    2. Verifica si hay nuevos suscriptores en Panaccess (usando sync_subscribers)
+    3. Si hay nuevos suscriptores:
+       - Descarga los nuevos desde el último código registrado (automático)
+       - Almacena los nuevos suscriptores en ListOfSubscriber
+    4. Obtiene las credenciales de login de los nuevos suscriptores
+       - Almacena las credenciales en SubscriberLoginInfo
+    
+    LÓGICA AUTOMÁTICA:
+    - sync_subscribers() detecta automáticamente si hay registros en BD
+    - Si hay registros, descarga solo los nuevos desde el último código
+    - fetch_new_logins_from_panaccess() obtiene credenciales solo de nuevos suscriptores
+    
+    IMPORTANTE:
+    - Esta tarea se ejecuta frecuentemente (cada 5 minutos)
+    - Es rápida ya que solo procesa nuevos registros
+    - Los reintentos automáticos están configurados para errores de conexión/timeout
+    - Si se interrumpe, al ejecutarse de nuevo continuará desde donde se quedó
+    
+    Returns:
+        dict: Resultado de la verificación y sincronización con información detallada:
+            - database_total_before: Total de suscriptores en BD local antes de sincronizar
+            - database_total_after: Total de suscriptores en BD local después de sincronizar
+            - sync_executed: Si se ejecutó la sincronización
+            - sync_result: Resultado de sync_subscribers() (si se ejecutó)
+            - credentials_downloaded: Cantidad de credenciales descargadas y almacenadas
+            - success: Si la tarea se completó exitosamente
+        
+    Raises:
+        PanaccessException: Si hay errores críticos de autenticación o conexión
+    """
+    task_name = 'check_and_sync_subscribers_periodic'
+    
+    # Verificar si hay otra tarea en ejecución
+    if not acquire_task_lock(task_name):
+        logger.warning(
+            f"⚠️ [CHECK_SUBSCRIBERS] Otra tarea está en ejecución. "
+            f"Esta tarea se cancelará para evitar conflictos."
+        )
+        return {
+            'success': False,
+            'message': 'Otra tarea de sincronización está en ejecución. Esta tarea se canceló.',
+            'skipped': True
+        }
+    
+    try:
+        logger.info("🔄 [CHECK_SUBSCRIBERS] Iniciando verificación periódica de suscriptores")
+        
+        result = {
+            'success': False,
+            'message': '',
+            'database_total_before': 0,
+            'database_total_after': 0,
+            'sync_executed': False,
+            'sync_result': None,
+            'credentials_downloaded': 0,
+            'smartcards_updated': None,
+            'merge_executed': False,
+            'total_time_seconds': 0,
+        }
+        
+        start_time = time.time()
+        # ========================================================================
+        # PASO 1: VALIDAR Y DESCARGAR NUEVOS SUSCRIPTORES
+        # ========================================================================
+        logger.info("📊 [CHECK_SUBSCRIBERS] Validando si existen nuevos suscriptores...")
+        try:
+            from .utils.panaccess.subscriber import LastSubscriber
+            
+            # Obtener último suscriptor antes de sincronizar
+            last_subscriber_before = LastSubscriber()
+            last_code_before = last_subscriber_before.code if last_subscriber_before else None
+            database_total_before = ListOfSubscriber.objects.count()
+            result['database_total_before'] = database_total_before
+            
+            logger.info(
+                f"✅ [CHECK_SUBSCRIBERS] Estado actual: {database_total_before} suscriptores, "
+                f"último código: {last_code_before}"
+            )
+            
+            # sync_subscribers() automáticamente detecta si hay registros en BD
+            # y descarga solo los nuevos desde el último código registrado
+            logger.info("🔄 [CHECK_SUBSCRIBERS] Sincronizando suscriptores desde Panaccess...")
+            sync_result = sync_subscribers(session_id=None, limit=100)
+            result['sync_executed'] = True
+            result['sync_result'] = sync_result
+            
+            # Obtener total después de sincronizar
+            database_total_after = ListOfSubscriber.objects.count()
+            result['database_total_after'] = database_total_after
+            new_subscribers_count = database_total_after - database_total_before
+            
+            if new_subscribers_count > 0:
+                logger.info(
+                    f"✅ [CHECK_SUBSCRIBERS] Se encontraron y descargaron {new_subscribers_count} nuevos suscriptores"
+                )
+            else:
+                logger.info(
+                    f"ℹ️ [CHECK_SUBSCRIBERS] No hay nuevos suscriptores. BD está actualizada."
+                )
+                # Si no hay nuevos, terminar aquí
+                result['success'] = True
+                result['message'] = 'No hay nuevos suscriptores. BD está actualizada.'
+                result['total_time_seconds'] = int(time.time() - start_time)
+                return result
+                
+            # Guardar last_code_before para usar en pasos siguientes
+            result['last_code_before'] = last_code_before
+                
+        except Exception as e:
+            error_msg = f"Error durante sincronización de suscriptores: {str(e)}"
+            logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+            result['sync_executed'] = True
+            result['sync_result'] = {'error': error_msg}
+            database_total_after = ListOfSubscriber.objects.count()
+            result['database_total_after'] = database_total_after
+            # Continuar con el siguiente paso aunque este falle
+        
+        # ========================================================================
+        # PASO 3: OBTENER CREDENCIALES DE LOGIN DE NUEVOS SUSCRIPTORES
+        # ========================================================================
+        logger.info("🔑 [CHECK_SUBSCRIBERS] Obteniendo credenciales de login de nuevos suscriptores...")
+        try:
+            # fetch_new_logins_from_panaccess() obtiene credenciales solo de nuevos suscriptores
+            # que no están aún en SubscriberLoginInfo y las almacena en la BD
+            credentials_count = fetch_new_logins_from_panaccess(session_id=None)
+            result['credentials_downloaded'] = credentials_count if isinstance(credentials_count, int) else 0
+            
+            if result['credentials_downloaded'] > 0:
+                logger.info(
+                    f"✅ [CHECK_SUBSCRIBERS] {result['credentials_downloaded']} credenciales "
+                    f"de nuevos suscriptores descargadas y almacenadas en BD"
+                )
+            else:
+                logger.info(
+                    f"ℹ️ [CHECK_SUBSCRIBERS] No hay credenciales nuevas para descargar"
+                )
+        except Exception as e:
+            error_msg = f"Error obteniendo credenciales de nuevos suscriptores: {str(e)}"
+            logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+            result['credentials_downloaded'] = 0
+            # No marcar como fallo total si solo falla la descarga de credenciales
+        
+        # ========================================================================
+        # PASO 4: ACTUALIZAR SMARTCARDS EXISTENTES CON INFORMACIÓN DE NUEVOS SUSCRIPTORES
+        # ========================================================================
+        logger.info("📱 [CHECK_SUBSCRIBERS] Revisando smartcards de nuevos suscriptores y asociándolas...")
+        try:
+            from .utils.panaccess.smartcard import extract_sns_from_smartcards_field
+            
+            # Obtener último código antes de sincronizar (guardado en resultado)
+            last_code_before = result.get('last_code_before')
+            
+            # Obtener solo los nuevos suscriptores (código mayor al último que había antes)
+            if last_code_before:
+                new_subscribers = ListOfSubscriber.objects.filter(code__gt=last_code_before).order_by('code')
+            else:
+                # Si no había suscriptores antes, todos son nuevos
+                new_subscribers = ListOfSubscriber.objects.all().order_by('code')
+            
+            new_subscribers_count = new_subscribers.count()
+            smartcards_updated_count = 0
+            smartcards_found_count = 0
+            
+            if new_subscribers_count > 0:
+                # Obtener todas las smartcards existentes en memoria para actualización rápida
+                existing_smartcards = {
+                    obj.sn: obj for obj in ListOfSmartcards.objects.all() if obj.sn
+                }
+                
+                logger.info(
+                    f"📱 [CHECK_SUBSCRIBERS] Procesando {new_subscribers_count} nuevos suscriptores "
+                    f"para asociar sus smartcards"
+                )
+                
+                for subscriber in new_subscribers:
+                    if not subscriber.code:
+                        continue
+                    
+                    try:
+                        # Extraer SNs del campo smartcards (JSON) del suscriptor
+                        smartcards_data = subscriber.smartcards
+                        sns = extract_sns_from_smartcards_field(smartcards_data)
+                        
+                        if not sns:
+                            logger.debug(
+                                f"[CHECK_SUBSCRIBERS] Suscriptor {subscriber.code} no tiene smartcards asociadas"
+                            )
+                            continue
+                        
+                        smartcards_found_count += len(sns)
+                        
+                        # Buscar y actualizar cada smartcard existente con información del suscriptor
+                        for sn in sns:
+                            if sn in existing_smartcards:
+                                smartcard = existing_smartcards[sn]
+                                changed_fields = []
+                                
+                                # Actualizar campos del suscriptor si han cambiado
+                                if str(smartcard.subscriberCode) != str(subscriber.code):
+                                    smartcard.subscriberCode = subscriber.code
+                                    changed_fields.append('subscriberCode')
+                                
+                                if str(smartcard.lastName) != str(subscriber.lastName):
+                                    smartcard.lastName = subscriber.lastName
+                                    changed_fields.append('lastName')
+                                
+                                if str(smartcard.firstName) != str(subscriber.firstName):
+                                    smartcard.firstName = subscriber.firstName
+                                    changed_fields.append('firstName')
+                                
+                                if str(smartcard.hcId) != str(subscriber.hcId):
+                                    smartcard.hcId = subscriber.hcId
+                                    changed_fields.append('hcId')
+                                
+                                # Guardar solo si hay cambios
+                                if changed_fields:
+                                    smartcard.save(update_fields=changed_fields)
+                                    smartcards_updated_count += 1
+                                    logger.debug(
+                                        f"[CHECK_SUBSCRIBERS] Smartcard {sn} asociada al suscriptor {subscriber.code}. "
+                                        f"Campos actualizados: {changed_fields}"
+                                    )
+                            else:
+                                logger.warning(
+                                    f"⚠️ [CHECK_SUBSCRIBERS] Smartcard {sn} del suscriptor {subscriber.code} "
+                                    f"no existe en ListOfSmartcards. Debería existir."
+                                )
+                    
+                    except Exception as e:
+                        logger.error(
+                            f"❌ [CHECK_SUBSCRIBERS] Error procesando smartcards del suscriptor "
+                            f"{subscriber.code}: {str(e)}", exc_info=True
+                        )
+                
+                result['smartcards_updated'] = {
+                    'new_subscribers_processed': new_subscribers_count,
+                    'sns_found': smartcards_found_count,
+                    'smartcards_updated': smartcards_updated_count,
+                }
+                
+                logger.info(
+                    f"✅ [CHECK_SUBSCRIBERS] Smartcards asociadas: "
+                    f"{smartcards_updated_count} smartcards existentes asociadas a {new_subscribers_count} nuevos suscriptores"
+                )
+            else:
+                result['smartcards_updated'] = {
+                    'new_subscribers_processed': 0,
+                    'sns_found': 0,
+                    'smartcards_updated': 0,
+                }
+                logger.info(
+                    f"ℹ️ [CHECK_SUBSCRIBERS] No hay nuevos suscriptores, no se actualizan smartcards"
+                )
+        except Exception as e:
+            error_msg = f"Error actualizando smartcards desde nuevos suscriptores: {str(e)}"
+            logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+            result['smartcards_updated'] = {'error': error_msg}
+            # No marcar como fallo total si solo falla la actualización de smartcards
+        
+        # ========================================================================
+        # PASO 5: HACER MERGE DE NUEVOS SUSCRIPTORES EN SUBSCRIBERINFO
+        # ========================================================================
+        logger.info("🔄 [CHECK_SUBSCRIBERS] Haciendo merge de nuevos suscriptores en SubscriberInfo...")
+        try:
+            # sync_merge_all_subscribers() detecta automáticamente los nuevos suscriptores
+            # (mayores al último código en SubscriberInfo) y hace merge de sus datos
+            sync_merge_all_subscribers()
+            result['merge_executed'] = True
+            logger.info(
+                f"✅ [CHECK_SUBSCRIBERS] Merge completado. "
+                f"Nuevos suscriptores consolidados en SubscriberInfo"
+            )
+        except Exception as e:
+            error_msg = f"Error haciendo merge en SubscriberInfo: {str(e)}"
+            logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+            result['merge_executed'] = False
+            result['merge_error'] = error_msg
+            # No marcar como fallo total si solo falla el merge
+        
+        # ========================================================================
+        # VERIFICACIÓN FINAL
+        # ========================================================================
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        result['success'] = True
+        
+        new_subscribers = result['database_total_after'] - result['database_total_before']
+        
+        if new_subscribers > 0:
+            message_parts = [
+                f'Se descargaron {new_subscribers} nuevos suscriptores',
+                f'{result["credentials_downloaded"]} credenciales almacenadas'
+            ]
+            
+            if result.get('smartcards_updated') and not result['smartcards_updated'].get('error'):
+                sc_info = result['smartcards_updated']
+                message_parts.append(
+                    f'{sc_info.get("smartcards_created", 0)} smartcards creadas'
+                )
+            
+            if result.get('merge_executed'):
+                message_parts.append('merge en SubscriberInfo completado')
+            
+            result['message'] = (
+                f'Verificación completada. {", ".join(message_parts)} '
+                f'en {elapsed_time:.2f} segundos'
+            )
+        else:
+            result['message'] = (
+                f'Verificación completada. No hay nuevos suscriptores. '
+                f'BD local está actualizada ({result["database_total_after"]} suscriptores)'
+            )
+        
+        logger.info(f"✅ [CHECK_SUBSCRIBERS] {result['message']}")
+        
+        return result
+        
+    except PanaccessAuthenticationError as e:
+        # Error de autenticación - no reintentar automáticamente
+        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise PanaccessAuthenticationError(error_msg) from e
+        
+    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
+        # Errores de conexión/timeout - reintentar automáticamente
+        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        # Celery reintentará automáticamente gracias a autoretry_for
+        raise
+        
+    except PanaccessException as e:
+        # Otros errores de Panaccess
+        error_msg = f"Error de Panaccess: {str(e)}"
+        logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+        
+    except Exception as e:
+        # Error inesperado
+        error_msg = f"Error inesperado durante verificación de suscriptores: {str(e)}"
+        logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+    finally:
+        # Liberar el lock siempre, incluso si hay error
+        release_task_lock(task_name)
+
+
+@shared_task(
+    bind=True,
+    name='udid.tasks.validate_and_sync_all_data_daily',
+    max_retries=2,
+    default_retry_delay=600,  # 10 minutos entre reintentos
+    autoretry_for=(PanaccessConnectionError, PanaccessTimeoutError),
+    retry_backoff=True,
+    retry_backoff_max=7200,  # Máximo 2 horas de delay
+    retry_jitter=True,
+)
+def validate_and_sync_all_data_daily(self):
+    """
+    Tarea diaria de validación y corrección de todos los datos existentes.
+    
+    Esta tarea está diseñada para ejecutarse UNA VEZ AL DÍA, preferiblemente de noche o madrugada
+    (ej: 2:00 AM - 4:00 AM) cuando hay bajo tráfico.
+    
+    IMPORTANTE: Esta tarea asume que la base de datos ya tiene datos. No descarga nuevos registros,
+    solo compara y actualiza los existentes con la información de Panaccess.
+    
+    QUÉ HACE:
+    1. Compara y actualiza suscriptores existentes con datos de Panaccess
+    2. Compara y actualiza smartcards existentes con datos de Panaccess
+    3. Compara y actualiza credenciales existentes con datos de Panaccess
+    4. Valida y ajusta SubscriberInfo comparando con datos de las otras tablas
+    
+    PROCESAMIENTO POR LOTES:
+    - Todas las funciones procesan por lotes (limit) para no sobrecargar memoria
+    - Se agregan pausas entre lotes para dar tiempo al sistema
+    - Las funciones ya implementan procesamiento eficiente
+    
+    IMPORTANTE:
+    - Esta tarea puede tomar varias horas si hay muchos registros (ej: 400,000+)
+    - Se recomienda ejecutarla en horarios de bajo tráfico (madrugada: 2:00 AM - 4:00 AM)
+    - Los reintentos automáticos están configurados para errores de conexión/timeout
+    - Solo actualiza registros existentes, NO descarga nuevos
+    
+    Returns:
+        dict: Resultado de la validación y corrección con información detallada de cada paso:
+            - steps: Diccionario con el resultado de cada paso
+            - success: Si la tarea se completó exitosamente
+            - total_time_seconds: Tiempo total de ejecución
+        
+    Raises:
+        PanaccessException: Si hay errores críticos de autenticación o conexión
+    """
+    logger.info("🔍 [VALIDATE_DAILY] Iniciando validación y corrección diaria de datos existentes")
+    
+    result = {
+        'success': False,
+        'message': '',
+        'steps': {
+            'subscribers': {'success': False, 'message': '', 'updated': 0},
+            'smartcards': {'success': False, 'message': '', 'updated': 0},
+            'credentials': {'success': False, 'message': '', 'updated': 0},
+            'subscriber_info': {'success': False, 'message': '', 'updated': 0},
+        },
+        'total_time_seconds': 0,
+    }
+    
+    start_time = time.time()
+    batch_delay = 2  # Pausa de 2 segundos entre lotes para no sobrecargar
+    
+    try:
+        # ========================================================================
+        # PASO 1: COMPARAR Y ACTUALIZAR SUSCRIPTORES EXISTENTES
+        # ========================================================================
+        logger.info("📥 [VALIDATE_DAILY] Paso 1/4: Comparando y actualizando suscriptores existentes...")
+        try:
+            # compare_and_update_all_subscribers() procesa por lotes (limit)
+            # Compara cada suscriptor existente con Panaccess y actualiza solo si hay diferencias
+            compare_and_update_all_subscribers(session_id=None, limit=100, timeout=30)
+            result['steps']['subscribers'] = {
+                'success': True,
+                'message': 'Suscriptores comparados y actualizados correctamente',
+                'updated': 'N/A'  # La función no retorna el conteo directamente
+            }
+            logger.info("✅ [VALIDATE_DAILY] Suscriptores comparados y actualizados correctamente")
+            time.sleep(batch_delay)  # Pausa entre pasos
+        except Exception as e:
+            error_msg = f"Error comparando suscriptores: {str(e)}"
+            logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+            result['steps']['subscribers'] = {
+                'success': False,
+                'message': error_msg,
+                'updated': 0
+            }
+            # Continuar con los siguientes pasos aunque este falle
+        
+        # ========================================================================
+        # PASO 2: COMPARAR Y ACTUALIZAR SMARTCARDS EXISTENTES
+        # ========================================================================
+        logger.info("📥 [VALIDATE_DAILY] Paso 2/4: Comparando y actualizando smartcards existentes...")
+        try:
+            # compare_and_update_all_smartcards() procesa por lotes (limit)
+            # Compara cada smartcard existente con Panaccess y actualiza solo si hay diferencias
+            compare_and_update_all_smartcards(session_id=None, limit=100, timeout=30)
+            result['steps']['smartcards'] = {
+                'success': True,
+                'message': 'Smartcards comparadas y actualizadas correctamente',
+                'updated': 'N/A'  # La función no retorna el conteo directamente
+            }
+            logger.info("✅ [VALIDATE_DAILY] Smartcards comparadas y actualizadas correctamente")
+            time.sleep(batch_delay)  # Pausa entre pasos
+        except Exception as e:
+            error_msg = f"Error comparando smartcards: {str(e)}"
+            logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+            result['steps']['smartcards'] = {
+                'success': False,
+                'message': error_msg,
+                'updated': 0
+            }
+            # Continuar con los siguientes pasos aunque este falle
+        
+        # ========================================================================
+        # PASO 3: COMPARAR Y ACTUALIZAR CREDENCIALES EXISTENTES
+        # ========================================================================
+        logger.info("📥 [VALIDATE_DAILY] Paso 3/4: Comparando y actualizando credenciales existentes...")
+        try:
+            # compare_and_update_all_existing() procesa uno por uno
+            # Compara cada credencial existente con Panaccess y actualiza solo si hay diferencias
+            credentials_updated = compare_and_update_all_existing(session_id=None)
+            result['steps']['credentials'] = {
+                'success': True,
+                'message': 'Credenciales comparadas y actualizadas correctamente',
+                'updated': credentials_updated if isinstance(credentials_updated, int) else 'N/A'
+            }
+            logger.info(
+                f"✅ [VALIDATE_DAILY] Credenciales comparadas y actualizadas: "
+                f"{credentials_updated} registros actualizados"
+            )
+            time.sleep(batch_delay)  # Pausa entre pasos
+        except Exception as e:
+            error_msg = f"Error comparando credenciales: {str(e)}"
+            logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+            result['steps']['credentials'] = {
+                'success': False,
+                'message': error_msg,
+                'updated': 0
+            }
+            # Continuar con el siguiente paso aunque este falle
+        
+        # ========================================================================
+        # PASO 4: VALIDAR Y AJUSTAR SUBSCRIBERINFO
+        # ========================================================================
+        logger.info("🔄 [VALIDATE_DAILY] Paso 4/4: Validando y ajustando SubscriberInfo...")
+        try:
+            # Obtener todos los códigos de suscriptores y procesar por lotes
+            all_codes = sorted(get_all_subscriber_codes())
+            total_codes = len(all_codes)
+            batch_size = 100  # Procesar 100 suscriptores por lote
+            total_updated = 0
+            
+            logger.info(f"📊 [VALIDATE_DAILY] Procesando {total_codes} suscriptores en lotes de {batch_size}...")
+            
+            for i in range(0, total_codes, batch_size):
+                batch_codes = all_codes[i:i + batch_size]
+                batch_updated = 0
+                
+                for code in batch_codes:
+                    try:
+                        updated = compare_and_update_subscriber_data(code)
+                        if updated:
+                            batch_updated += updated
+                            total_updated += updated
+                    except Exception as e:
+                        logger.warning(f"⚠️ [VALIDATE_DAILY] Error procesando suscriptor {code}: {str(e)}")
+                        continue
+                
+                logger.info(
+                    f"📊 [VALIDATE_DAILY] Lote {i//batch_size + 1}/{(total_codes-1)//batch_size + 1}: "
+                    f"{batch_updated} registros actualizados en SubscriberInfo"
+                )
+                
+                # Pausa entre lotes para no sobrecargar memoria
+                if i + batch_size < total_codes:
+                    time.sleep(batch_delay)
+            
+            result['steps']['subscriber_info'] = {
+                'success': True,
+                'message': 'SubscriberInfo validado y ajustado correctamente',
+                'updated': total_updated
+            }
+            logger.info(
+                f"✅ [VALIDATE_DAILY] SubscriberInfo validado: {total_updated} registros actualizados"
+            )
+        except Exception as e:
+            error_msg = f"Error validando SubscriberInfo: {str(e)}"
+            logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+            result['steps']['subscriber_info'] = {
+                'success': False,
+                'message': error_msg,
+                'updated': 0
+            }
+        
+        # ========================================================================
+        # VERIFICACIÓN FINAL
+        # ========================================================================
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        
+        # Verificar si todas las tareas se completaron exitosamente
+        all_success = all(step['success'] for step in result['steps'].values())
+        result['success'] = all_success
+        
+        if all_success:
+            result['message'] = (
+                f'Validación y corrección diaria completada exitosamente en {elapsed_time:.2f} segundos. '
+                f'Todos los registros existentes fueron comparados y actualizados con Panaccess.'
+            )
+            logger.info(f"✅ [VALIDATE_DAILY] {result['message']}")
+        else:
+            failed_steps = [name for name, step in result['steps'].items() if not step['success']]
+            result['message'] = (
+                f'Validación completada con errores en: {", ".join(failed_steps)}. '
+                f'Tiempo: {elapsed_time:.2f} segundos'
+            )
+            logger.warning(f"⚠️ [VALIDATE_DAILY] {result['message']}")
+        
+        return result
+        
+    except PanaccessAuthenticationError as e:
+        # Error de autenticación - no reintentar automáticamente
+        error_msg = f"Error de autenticación con Panaccess: {str(e)}"
+        logger.error(f"❌ [VALIDATE_DAILY] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise PanaccessAuthenticationError(error_msg) from e
+        
+    except (PanaccessConnectionError, PanaccessTimeoutError) as e:
+        # Errores de conexión/timeout - reintentar automáticamente
+        error_msg = f"Error de conexión/timeout con Panaccess: {str(e)}"
+        logger.error(f"❌ [VALIDATE_DAILY] {error_msg}")
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        # Celery reintentará automáticamente gracias a autoretry_for
+        raise
+        
+    except PanaccessException as e:
+        # Otros errores de Panaccess
+        error_msg = f"Error de Panaccess: {str(e)}"
+        logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
+        raise
+        
+    except Exception as e:
+        # Error inesperado
+        error_msg = f"Error inesperado durante validación diaria: {str(e)}"
+        logger.error(f"❌ [VALIDATE_DAILY] {error_msg}", exc_info=True)
+        result['message'] = error_msg
+        result['success'] = False
+        elapsed_time = time.time() - start_time
+        result['total_time_seconds'] = int(elapsed_time)
         raise
