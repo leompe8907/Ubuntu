@@ -165,12 +165,41 @@ class PanaccessClient:
             # Parsear respuesta JSON
             try:
                 json_response = response.json()
-                logger.info(f"📦 [call] Respuesta JSON completa para '{func_name}': {json_response}")
+                # NO loguear la respuesta completa - puede ser enorme (varios MB)
+                # En su lugar, loguear solo un resumen
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Solo en modo DEBUG loguear un resumen truncado
+                    json_str = str(json_response)
+                    if len(json_str) > 500:
+                        json_summary = json_str[:500] + "... [truncado]"
+                    else:
+                        json_summary = json_str
+                    logger.debug(f"📦 [call] Respuesta JSON (resumen) para '{func_name}': {json_summary}")
+                else:
+                    # En modo INFO, solo loguear tamaño y estructura
+                    answer = json_response.get("answer", {})
+                    if isinstance(answer, dict):
+                        count = answer.get("count", 0)
+                        entries_key = None
+                        for key in answer.keys():
+                            if "entries" in key.lower() or "list" in key.lower():
+                                entries_key = key
+                                break
+                        if entries_key:
+                            entries = answer.get(entries_key, [])
+                            entries_count = len(entries) if isinstance(entries, list) else 0
+                            logger.info(f"📦 [call] Respuesta JSON para '{func_name}': {entries_count} registros (total: {count})")
+                        else:
+                            logger.info(f"📦 [call] Respuesta JSON para '{func_name}': recibida exitosamente")
+                    else:
+                        logger.info(f"📦 [call] Respuesta JSON para '{func_name}': recibida exitosamente")
             except ValueError as e:
                 logger.error(f"❌ [call] Error al parsear JSON para '{func_name}': {str(e)}")
-                logger.error(f"❌ [call] Respuesta raw: {response.text}")
+                # Truncar respuesta raw para evitar logs enormes
+                response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+                logger.error(f"❌ [call] Respuesta raw (primeros 1000 chars): {response_text}")
                 raise PanaccessAPIError(
-                    f"Respuesta inválida del servidor Panaccess: {response.text}",
+                    f"Respuesta inválida del servidor Panaccess: {response.text[:500]}...",
                     status_code=response.status_code
                 )
             
@@ -182,7 +211,13 @@ class PanaccessClient:
                 error_message = json_response.get("errorMessage", "Error desconocido")
                 answer = json_response.get("answer")
                 logger.error(f"❌ [call] Llamada a '{func_name}' falló - Error: {error_message}")
-                logger.error(f"❌ [call] Campo 'answer' para '{func_name}': {answer}")
+                # Solo loguear un resumen del answer si es muy grande
+                if answer:
+                    answer_str = str(answer)
+                    if len(answer_str) > 200:
+                        logger.error(f"❌ [call] Campo 'answer' para '{func_name}': {answer_str[:200]}... [truncado]")
+                    else:
+                        logger.error(f"❌ [call] Campo 'answer' para '{func_name}': {answer}")
                 
                 # Si el error es de sesión, limpiar sessionId y timestamp
                 if "session" in error_message.lower() or "logged" in error_message.lower():
@@ -201,7 +236,23 @@ class PanaccessClient:
             # Log del resultado exitoso
             answer = json_response.get("answer")
             logger.info(f"✅ [call] Llamada a '{func_name}' exitosa")
-            logger.info(f"📋 [call] Campo 'answer' para '{func_name}': {answer} (tipo: {type(answer).__name__})")
+            # NO loguear el answer completo - puede ser enorme
+            if isinstance(answer, dict):
+                # Loguear solo un resumen
+                count = answer.get("count", 0)
+                entries_key = None
+                for key in answer.keys():
+                    if "entries" in key.lower() or "list" in key.lower():
+                        entries_key = key
+                        break
+                if entries_key:
+                    entries = answer.get(entries_key, [])
+                    entries_count = len(entries) if isinstance(entries, list) else 0
+                    logger.info(f"📋 [call] Campo 'answer' para '{func_name}': {entries_count} registros (total: {count})")
+                else:
+                    logger.info(f"📋 [call] Campo 'answer' para '{func_name}': recibido (tipo: {type(answer).__name__})")
+            else:
+                logger.info(f"📋 [call] Campo 'answer' para '{func_name}': recibido (tipo: {type(answer).__name__})")
             
             return json_response
             
@@ -221,7 +272,9 @@ class PanaccessClient:
             status_code = response.status_code if 'response' in locals() else None
             logger.error(f"❌ [call] Error HTTP al llamar a '{func_name}': {str(e)} (Status: {status_code})")
             if 'response' in locals():
-                logger.error(f"❌ [call] Respuesta completa: {response.text}")
+                # Truncar respuesta para evitar logs enormes
+                response_text = response.text[:1000] if len(response.text) > 1000 else response.text
+                logger.error(f"❌ [call] Respuesta (primeros 1000 chars): {response_text}")
             raise PanaccessAPIError(
                 f"Error HTTP al llamar a {func_name}: {str(e)}",
                 status_code=status_code

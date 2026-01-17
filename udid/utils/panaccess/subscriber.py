@@ -1,6 +1,7 @@
 import logging
 import time
-from django.db import transaction
+from django.db import transaction, connection
+from django.db.utils import OperationalError, DatabaseError
 from typing import Optional
 from .singleton import get_panaccess
 from .exceptions import (
@@ -9,9 +10,9 @@ from .exceptions import (
     PanaccessTimeoutError,
     PanaccessSessionError
 )
-from .checkpoint import save_checkpoint, get_last_processed_offset, clear_checkpoint
-from ...models import ListOfSubscriber
+from udid.models import ListOfSubscriber
 from ...serializers import ListOfSubscriberSerializer
+from ...utils.db_utils import is_connection_error, reconnect_database
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,6 @@ def DataBaseEmpty():
     logger.info("Verificando si la base de datos de suscriptores está vacía...")
     return not ListOfSubscriber.objects.exists()
 
-
 def LastSubscriber():
     """
     Retorna el último suscriptor registrado en la base de datos según el campo 'code'.
@@ -39,7 +39,6 @@ def LastSubscriber():
     except ListOfSubscriber.DoesNotExist:
         logger.warning("No se encontró ningún suscriptor en la base de datos.")
         return None
-
 
 def store_or_update_subscribers(data_batch):
     """
@@ -89,8 +88,7 @@ def store_or_update_subscribers(data_batch):
     logger.info(f"Suscriptores procesados: nuevos={total_new}, inválidos={total_invalid}")
     return total_new, total_invalid
 
-
-def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, resume=False):
+def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Descarga todos los suscriptores desde Panaccess y los almacena en la base de datos.
     
@@ -101,21 +99,14 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
         timeout: Timeout en segundos para cada llamada (default: 30)
-        resume: Si True, reanuda desde el último checkpoint guardado
     
     Returns:
         Dict con estadísticas de la descarga
     """
-    logger.info(f"🔄 Iniciando descarga completa de suscriptores (timeout: {timeout}s, resume: {resume})...")
+    logger.info(f"🔄 Iniciando descarga completa de suscriptores (timeout: {timeout}s)...")
     
-    # Obtener offset inicial (desde checkpoint si resume=True)
-    if resume:
-        offset = get_last_processed_offset('subscribers')
-        if offset > 0:
-            logger.info(f"📌 Reanudando desde offset {offset}")
-    else:
-        offset = 0
-        clear_checkpoint('subscribers')
+    # Siempre comenzar desde offset 0
+    offset = 0
     
     total_saved = 0
     consecutive_errors = 0
@@ -133,18 +124,11 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
                 
                 if not rows:
                     logger.info("✅ No hay más suscriptores. Descarga completada.")
-                    clear_checkpoint('subscribers')
                     break
                 
                 # Procesar y guardar INMEDIATAMENTE en BD
                 saved_count = store_subscribers_batch(rows)
                 total_saved += saved_count
-                
-                # Guardar checkpoint
-                save_checkpoint('subscribers', offset + limit, {
-                    'total_saved': total_saved,
-                    'last_batch_size': len(rows)
-                })
                 
                 offset += limit
                 consecutive_errors = 0
@@ -173,6 +157,24 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
                 time.sleep(1)
                 # No incrementar retry_count para errores de sesión
                 
+            except (OperationalError, DatabaseError) as e:
+                if is_connection_error(e):
+                    logger.warning(f"🔌 Conexión a BD perdida en offset {offset}. Reconectando...")
+                    reconnect_database()
+                    time.sleep(2)
+                    # No incrementar retry_count, reintentar inmediatamente
+                    continue
+                else:
+                    retry_count += 1
+                    consecutive_errors += 1
+                    
+                    if retry_count >= MAX_RETRIES:
+                        logger.error(f"❌ Error de BD después de {MAX_RETRIES} reintentos: {str(e)}")
+                        raise
+                    
+                    logger.warning(f"⚠️ Error de BD en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
+                    time.sleep(RETRY_DELAY * retry_count)
+                    
             except PanaccessException as e:
                 retry_count += 1
                 consecutive_errors += 1
@@ -195,7 +197,6 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT, r
             break
     
     logger.info(f"✅ Descarga completada. Total guardados: {total_saved} suscriptores")
-    clear_checkpoint('subscribers')
     
     return {
         'total_saved': total_saved,
@@ -217,14 +218,15 @@ def store_all_subscribers_in_chunks(data_batch, chunk_size=100):
         except Exception as e:
             logger.error(f"Error insertando chunk desde {i} hasta {i+chunk_size}: {str(e)}")
 
-
-def store_subscribers_batch(rows, chunk_size=100):
+def store_subscribers_batch(rows, chunk_size=100, max_db_retries=3):
     """
     Guarda un lote de suscriptores inmediatamente en la base de datos.
+    Maneja reconexión automática en caso de pérdida de conexión.
     
     Args:
         rows: Lista de filas de suscriptores desde la API
         chunk_size: Tamaño del chunk para bulk_create
+        max_db_retries: Número máximo de reintentos por errores de BD
     
     Returns:
         Número de suscriptores guardados exitosamente
@@ -233,56 +235,74 @@ def store_subscribers_batch(rows, chunk_size=100):
         return 0
     
     total_saved = 0
+    db_retry_count = 0
     
-    try:
-        with transaction.atomic():
-            # Validar y preparar registros
-            registros = []
-            for row in rows:
-                # Validar estructura
-                if not isinstance(row.get("cell"), list) or len(row.get("cell", [])) < 12:
-                    logger.warning(f"Fila inválida omitida: {row.get('id', 'unknown')}")
-                    continue
+    while db_retry_count < max_db_retries:
+        try:
+            with transaction.atomic():
+                # Validar y preparar registros
+                registros = []
+                for row in rows:
+                    # Validar estructura
+                    if not isinstance(row.get("cell"), list) or len(row.get("cell", [])) < 12:
+                        logger.warning(f"Fila inválida omitida: {row.get('id', 'unknown')}")
+                        continue
+                    
+                    cell = row["cell"]
+                    try:
+                        subscriber_data = {
+                            "id": str(row.get("id")),
+                            "code": cell[0] if len(cell) > 0 and cell[0] else None,
+                            "lastName": cell[1] if len(cell) > 1 and cell[1] else None,
+                            "firstName": cell[2] if len(cell) > 2 and cell[2] else None,
+                            "smartcards": cell[3] if len(cell) > 3 and cell[3] else [],
+                            "hcId": cell[4] if len(cell) > 4 and cell[4] else None,
+                            "hcName": cell[5] if len(cell) > 5 and cell[5] else None,
+                            "country": cell[6] if len(cell) > 6 and cell[6] else None,
+                            "city": cell[7] if len(cell) > 7 and cell[7] else None,
+                            "zip": cell[8] if len(cell) > 8 and cell[8] else None,
+                            "address": cell[9] if len(cell) > 9 and cell[9] else None,
+                            "created": cell[10] if len(cell) > 10 and cell[10] else None,
+                            "modified": cell[11] if len(cell) > 11 and cell[11] else None,
+                        }
+                        registros.append(ListOfSubscriber(**subscriber_data))
+                    except Exception as e:
+                        logger.warning(f"Error creando objeto para código {cell[0] if len(cell) > 0 else 'unknown'}: {str(e)}")
+                        continue
                 
-                cell = row["cell"]
-                try:
-                    subscriber_data = {
-                        "id": str(row.get("id")),
-                        "code": cell[0] if len(cell) > 0 and cell[0] else None,
-                        "lastName": cell[1] if len(cell) > 1 and cell[1] else None,
-                        "firstName": cell[2] if len(cell) > 2 and cell[2] else None,
-                        "smartcards": cell[3] if len(cell) > 3 and cell[3] else [],
-                        "hcId": cell[4] if len(cell) > 4 and cell[4] else None,
-                        "hcName": cell[5] if len(cell) > 5 and cell[5] else None,
-                        "country": cell[6] if len(cell) > 6 and cell[6] else None,
-                        "city": cell[7] if len(cell) > 7 and cell[7] else None,
-                        "zip": cell[8] if len(cell) > 8 and cell[8] else None,
-                        "address": cell[9] if len(cell) > 9 and cell[9] else None,
-                        "created": cell[10] if len(cell) > 10 and cell[10] else None,
-                        "modified": cell[11] if len(cell) > 11 and cell[11] else None,
-                    }
-                    registros.append(ListOfSubscriber(**subscriber_data))
-                except Exception as e:
-                    logger.warning(f"Error creando objeto para código {cell[0] if len(cell) > 0 else 'unknown'}: {str(e)}")
+                if not registros:
+                    return 0
+                
+                # Guardar en chunks
+                for i in range(0, len(registros), chunk_size):
+                    chunk = registros[i:i + chunk_size]
+                    ListOfSubscriber.objects.bulk_create(chunk, ignore_conflicts=True)
+                    total_saved += len(chunk)
+                
+                logger.debug(f"💾 Guardados {total_saved} suscriptores en BD")
+                return total_saved  # Éxito, salir del loop de reintentos
+                
+        except (OperationalError, DatabaseError) as e:
+            if is_connection_error(e):
+                db_retry_count += 1
+                logger.warning(f"🔌 Conexión a BD perdida (intento {db_retry_count}/{max_db_retries}). Reconectando...")
+                reconnect_database()
+                
+                if db_retry_count < max_db_retries:
+                    time.sleep(2 * db_retry_count)  # Backoff exponencial
                     continue
-            
-            if not registros:
-                return 0
-            
-            # Guardar en chunks
-            for i in range(0, len(registros), chunk_size):
-                chunk = registros[i:i + chunk_size]
-                ListOfSubscriber.objects.bulk_create(chunk, ignore_conflicts=True)
-                total_saved += len(chunk)
-            
-            logger.debug(f"💾 Guardados {total_saved} suscriptores en BD")
-            
-    except Exception as e:
-        logger.error(f"❌ Error guardando lote de suscriptores: {str(e)}")
-        raise
+                else:
+                    logger.error(f"❌ No se pudo reconectar a la BD después de {max_db_retries} intentos")
+                    raise DatabaseError(f"No se pudo reconectar a la BD después de {max_db_retries} intentos: {str(e)}")
+            else:
+                logger.error(f"❌ Error de base de datos: {str(e)}")
+                raise
+                
+        except Exception as e:
+            logger.error(f"❌ Error guardando lote de suscriptores: {str(e)}")
+            raise
     
-    return total_saved
-
+    raise DatabaseError(f"No se pudo guardar el lote después de {max_db_retries} intentos de reconexión")
 
 def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
@@ -370,7 +390,6 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
     logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos")
     return {'total_saved': total_saved}
 
-
 def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
     Compara todos los suscriptores de Panaccess con los de la base local y actualiza si hay diferencias.
@@ -443,7 +462,6 @@ def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAU
         logger.info(f"Procesados {offset} registros, {total_updated} actualizados hasta ahora...")
     logger.info(f"Actualización completa. Total modificados: {total_updated}")
 
-
 def sync_subscribers(session_id=None, limit=100):
     """
     Ejecuta el proceso de sincronización de suscriptores:
@@ -490,7 +508,6 @@ def sync_subscribers(session_id=None, limit=100):
     except Exception as e:
         logger.error(f"Error inesperado: {str(e)}", exc_info=True)
         raise
-
 
 def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TIMEOUT):
     """

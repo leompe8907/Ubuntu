@@ -669,41 +669,41 @@ CELERY_BEAT_SCHEDULE = {
     # ========================================================================
     # TAREAS PERIÓDICAS AUTOMÁTICAS
     # ========================================================================
+    # NOTA: sync_all_data_automatic NO está aquí porque se ejecuta UNA VEZ
+    # manualmente cuando se levanta el proyecto en la VM.
+    # ========================================================================
     
-    # 1. Descargar nuevos suscriptores cada 5 minutos
-    # Mantiene la base de datos actualizada con nuevos suscriptores y sus credenciales
-    # Frecuencia alta para detectar nuevos registros rápidamente
-    'download-new-subscribers-every-5-minutes': {
-        'task': 'udid.tasks.download_new_subscribers',
-        'schedule': 50.0,  # 300 segundos = 5 minutos
-        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
+    # 1. Verificar y sincronizar smartcards mensualmente
+    # Se ejecuta el día 28 de cada mes a las 3:00 AM
+    # Compara la cantidad de smartcards en Panaccess vs BD local
+    # Si hay más en Panaccess, descarga las nuevas desde el último registro
+    'check-and-sync-smartcards-monthly': {
+        'task': 'udid.tasks.check_and_sync_smartcards_monthly',
+        'schedule': crontab(day_of_month='28', hour=3, minute=0),  # Día 28 de cada mes a las 3:00 AM
+        'options': {'expires': 7200},  # Expira después de 2 horas si no se ejecuta
     },
     
-    # 2. Actualizar todos los suscriptores cada 5 minutos
-    # Actualiza datos existentes de suscriptores, credenciales e información consolidada
+    # 2. Verificar y sincronizar suscriptores cada 5 minutos
+    # Detecta nuevos suscriptores, descarga sus credenciales,
+    # actualiza smartcards existentes y consolida en SubscriberInfo
     # Frecuencia alta para mantener datos actualizados en tiempo casi real
-    'update-all-subscribers-every-5-minutes': {
-        'task': 'udid.tasks.update_all_subscribers',
+    'check-and-sync-subscribers-periodic': {
+        'task': 'udid.tasks.check_and_sync_subscribers_periodic',
         'schedule': 300.0,  # 300 segundos = 5 minutos
         'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
     },
     
-    # 3. Actualizar smartcards desde suscriptores cada 5 minutos
-    # Corrige inconsistencias entre ListOfSubscriber y ListOfSmartcards
-    # Frecuencia alta para mantener consistencia entre tablas
-    'update-smartcards-from-subscribers-every-5-minutes': {
-        'task': 'udid.tasks.update_smartcards_from_subscribers',
-        'schedule': 300.0,  # 300 segundos = 5 minutos
-        'options': {'expires': 600},  # Expira después de 10 minutos si no se ejecuta
-    },
-    
-    # 4. Validación y corrección completa diaria a las 2:00 AM
-    # Esta tarea sincroniza y valida todos los datos desde Panaccess
-    # Es la tarea más completa y exhaustiva, se ejecuta en horario de bajo tráfico
-    'validate-and-fix-all-data-daily': {
-        'task': 'udid.tasks.validate_and_fix_all_data',
-        'schedule': crontab(hour=2, minute=0),  # 2:00 AM todos los días
-        'options': {'expires': 3600},  # Expira después de 1 hora si no se ejecuta
+    # 3. Validación y corrección completa diaria a las 22:00 (10:00 PM)
+    # Compara y actualiza todos los registros existentes con datos de Panaccess:
+    # - Suscriptores existentes
+    # - Smartcards existentes
+    # - Credenciales existentes
+    # - SubscriberInfo (valida y ajusta campos)
+    # Esta tarea NO descarga nuevos registros, solo actualiza existentes
+    'validate-and-sync-all-data-daily': {
+        'task': 'udid.tasks.validate_and_sync_all_data_daily',
+        'schedule': crontab(hour=22, minute=0),  # 22:00 (10:00 PM) todos los días
+        'options': {'expires': 10800},  # Expira después de 3 horas si no se ejecuta
     },
 }
 

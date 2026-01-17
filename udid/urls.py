@@ -7,11 +7,7 @@ from .views import (
     DisassociateUDIDView, ValidateStatusUDIDView, ListSubscribersWithUDIDView, 
     MetricsDashboardView, ManualSyncView
 )
-from .panaccess_views import (
-    panaccess_login,
-    panaccess_logged_in,
-    panaccess_singleton
-)
+
 from .sync_views import (
     sync_subscribers_view,
     sync_smartcards_view,
@@ -51,11 +47,6 @@ urlpatterns = [
     
     #* Sincronización manual
     path('manual/', ManualSyncView.as_view(), name='manual-sync'),
-    
-    #* Panaccess endpoints (para testing, debugging y monitoreo)
-    path('panaccess/login/', panaccess_login, name='panaccess-login'),
-    path('panaccess/logged-in/', panaccess_logged_in, name='panaccess-logged-in'),
-    path('panaccess/singleton/', panaccess_singleton, name='panaccess-singleton'),
     
     #* Sincronización de datos desde PanAccess
     path('sync/subscribers/', sync_subscribers_view, name='sync-subscribers'),
