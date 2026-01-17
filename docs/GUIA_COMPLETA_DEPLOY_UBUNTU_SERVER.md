@@ -770,6 +770,10 @@ supervised systemd
 
 # Configurar memoria máxima (ajustar según tu RAM disponible)
 # Para 8GB RAM, usar 2GB para Redis
+# Para 16GB RAM, usar 4GB para Redis
+# Para 32GB RAM, usar 8GB para Redis
+# Para 64GB RAM / 32 cores, usar 16GB para Redis
+# Para 120GB RAM / 64 cores, usar 30GB para Redis
 maxmemory 2gb
 
 # Política de evicción cuando se llena la memoria
@@ -1108,6 +1112,118 @@ ls -la /opt/udid/.env
 # Debe mostrar: -rw------- 1 udid udid
 ```
 
+### 7.4 Variables de Entorno según Configuración de Hardware
+
+Según tu configuración de hardware, ajusta estas variables en el archivo `.env`:
+
+#### Configuración 1: 32 GB RAM / 32 cores / 1 TB SSD
+
+```env
+# ============================================================================
+# CONFIGURACIÓN OPTIMIZADA PARA 32GB RAM / 32 CORES / 1TB SSD
+# ============================================================================
+
+# Redis - Conexiones y capacidad
+REDIS_MAX_CONNECTIONS=300
+REDIS_SOCKET_CONNECT_TIMEOUT=5
+REDIS_SOCKET_TIMEOUT=5
+REDIS_RETRY_ON_TIMEOUT=True
+
+# Channel Layers (WebSockets)
+CHANNEL_LAYERS_CAPACITY=5000
+CHANNEL_LAYERS_EXPIRY=10
+CHANNEL_LAYERS_GROUP_EXPIRY=1800
+
+# Concurrencia y colas
+GLOBAL_SEMAPHORE_SLOTS=3000
+REQUEST_QUEUE_MAX_SIZE=5000
+REQUEST_QUEUE_MAX_WAIT_TIME=10
+
+# Cache
+CACHE_SOCKET_CONNECT_TIMEOUT=5
+CACHE_SOCKET_TIMEOUT=5
+CACHE_MAX_CONNECTIONS=50
+CACHE_KEY_PREFIX=udid_prod
+CACHE_TIMEOUT=300
+
+# Celery Workers
+CELERY_WORKER_PREFETCH_MULTIPLIER=8
+CELERY_WORKER_CONCURRENCY=16
+CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
+```
+
+#### Configuración 2: 64 GB RAM / 32 cores / 1 TB SSD
+
+```env
+# ============================================================================
+# CONFIGURACIÓN OPTIMIZADA PARA 64GB RAM / 32 CORES / 1TB SSD
+# ============================================================================
+
+# Redis - Conexiones y capacidad
+REDIS_MAX_CONNECTIONS=400
+REDIS_SOCKET_CONNECT_TIMEOUT=5
+REDIS_SOCKET_TIMEOUT=5
+REDIS_RETRY_ON_TIMEOUT=True
+
+# Channel Layers (WebSockets)
+CHANNEL_LAYERS_CAPACITY=10000
+CHANNEL_LAYERS_EXPIRY=10
+CHANNEL_LAYERS_GROUP_EXPIRY=1800
+
+# Concurrencia y colas
+GLOBAL_SEMAPHORE_SLOTS=5000
+REQUEST_QUEUE_MAX_SIZE=10000
+REQUEST_QUEUE_MAX_WAIT_TIME=10
+
+# Cache
+CACHE_SOCKET_CONNECT_TIMEOUT=5
+CACHE_SOCKET_TIMEOUT=5
+CACHE_MAX_CONNECTIONS=100
+CACHE_KEY_PREFIX=udid_prod
+CACHE_TIMEOUT=300
+
+# Celery Workers
+CELERY_WORKER_PREFETCH_MULTIPLIER=10
+CELERY_WORKER_CONCURRENCY=24
+CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
+```
+
+#### Configuración 3: 124 GB RAM / 64 cores / 1 TB SSD
+
+```env
+# ============================================================================
+# CONFIGURACIÓN OPTIMIZADA PARA 124GB RAM / 64 CORES / 1TB SSD
+# ============================================================================
+
+# Redis - Conexiones y capacidad
+REDIS_MAX_CONNECTIONS=600
+REDIS_SOCKET_CONNECT_TIMEOUT=5
+REDIS_SOCKET_TIMEOUT=5
+REDIS_RETRY_ON_TIMEOUT=True
+
+# Channel Layers (WebSockets)
+CHANNEL_LAYERS_CAPACITY=20000
+CHANNEL_LAYERS_EXPIRY=10
+CHANNEL_LAYERS_GROUP_EXPIRY=1800
+
+# Concurrencia y colas
+GLOBAL_SEMAPHORE_SLOTS=10000
+REQUEST_QUEUE_MAX_SIZE=20000
+REQUEST_QUEUE_MAX_WAIT_TIME=10
+
+# Cache
+CACHE_SOCKET_CONNECT_TIMEOUT=5
+CACHE_SOCKET_TIMEOUT=5
+CACHE_MAX_CONNECTIONS=150
+CACHE_KEY_PREFIX=udid_prod
+CACHE_TIMEOUT=300
+
+# Celery Workers
+CELERY_WORKER_PREFETCH_MULTIPLIER=16
+CELERY_WORKER_CONCURRENCY=48
+CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
+```
+
 ---
 
 ## 8. Migraciones y Configuración Inicial
@@ -1248,13 +1364,24 @@ upstream udid_backend {
     ip_hash;
     
     # Instancias de Daphne (ajustar según número de workers)
+    # Configuración estándar: 4 instancias
     server 127.0.0.1:8000;
     server 127.0.0.1:8001;
     server 127.0.0.1:8002;
     server 127.0.0.1:8003;
     
-    # Mantener conexiones abiertas
-    keepalive 32;
+    # Configuración optimizada para 64-120GB RAM / 32-64 cores: 40-60 instancias
+    # Descomentar estas líneas y comentar las 4 anteriores si usas la configuración optimizada:
+    # Para 64GB RAM / 32 cores: usar 40 instancias (puertos 8000-8039)
+    # Para 120GB RAM / 64 cores: usar 60 instancias (puertos 8000-8059)
+    # server 127.0.0.1:8000;
+    # server 127.0.0.1:8001;
+    # ... (continuar hasta 8039 para 40 instancias o 8059 para 60 instancias)
+    # server 127.0.0.1:8039;  # Para 40 instancias
+    # server 127.0.0.1:8059;  # Para 60 instancias
+    
+    # Mantener conexiones abiertas (aumentado para alta carga)
+    keepalive 128;
 }
 
 # Redirigir HTTP a HTTPS
@@ -1505,20 +1632,18 @@ EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Daphne
 # El puerto se calcula: 8000 + %i (instancia)
-ExecStart=/opt/udid/env/bin/daphne \
-    -b 127.0.0.1 \
-    -p 800%i \
-    --access-log - \
-    --proxy-headers \
-    -t 60 \
-    --websocket_timeout 300 \
-    ubuntu.asgi:application
+# Para instancias 0-9: puertos 8000-8009
+# Para instancias 10-19: puertos 8010-8019
+# Usar script wrapper para calcular puerto correctamente
+ExecStart=/bin/bash -c 'PORT=$((8000 + %i)); exec /opt/udid/env/bin/daphne -b 127.0.0.1 -p $PORT --access-log - --proxy-headers -t 60 --websocket_timeout 300 ubuntu.asgi:application'
 
 # Reinicio automático
 Restart=always
 RestartSec=3
 
 # Limitar recursos (ajustar según necesidad)
+# Configuración estándar: 1GB por instancia
+# Configuración optimizada para 64-120GB RAM: 512MB-1GB por instancia (más instancias)
 MemoryMax=1G
 CPUQuota=100%
 
@@ -1546,15 +1671,35 @@ Copiar el siguiente contenido:
 #!/bin/bash
 # Script para manejar múltiples instancias de Daphne
 
-# Número de instancias (ajustar según CPU cores)
+# Número de instancias (ajustar según CPU cores y carga esperada)
+# Configuración estándar: 4 instancias (hasta 1000 requests simultáneos)
+# Configuración optimizada para 64GB RAM / 32 cores: 40 instancias
+# Configuración optimizada para 120GB RAM / 64 cores: 60 instancias
 INSTANCES=4
+
+# Para configuración optimizada de 64GB RAM / 32 cores, cambiar a:
+# INSTANCES=40
+
+# Para configuración optimizada de 120GB RAM / 64 cores, cambiar a:
+# INSTANCES=60
+
+# Función para obtener el puerto según el número de instancia
+get_port() {
+    local instance=$1
+    if [ $instance -lt 10 ]; then
+        echo "800$instance"
+    else
+        echo "80$instance"
+    fi
+}
 
 case "$1" in
     start)
         echo "Iniciando $INSTANCES instancias de UDID..."
         for i in $(seq 0 $((INSTANCES-1))); do
             sudo systemctl start udid@$i
-            echo "  Instancia $i iniciada (puerto 800$i)"
+            PORT=$(get_port $i)
+            echo "  Instancia $i iniciada (puerto $PORT)"
         done
         ;;
     stop)
@@ -1574,7 +1719,8 @@ case "$1" in
     status)
         echo "Estado de instancias de UDID:"
         for i in $(seq 0 $((INSTANCES-1))); do
-            echo "--- Instancia $i (puerto 800$i) ---"
+            PORT=$(get_port $i)
+            echo "--- Instancia $i (puerto $PORT) ---"
             sudo systemctl status udid@$i --no-pager | head -5
         done
         ;;
@@ -1710,10 +1856,15 @@ Environment="PATH=/opt/udid/env/bin"
 EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Celery Worker
+# Configuración estándar: --concurrency auto
+# Configuración optimizada para 32GB RAM / 32 cores: --concurrency 16
+# Configuración optimizada para 64GB RAM / 32 cores: --concurrency 24
+# Configuración optimizada para 124GB RAM / 64 cores: --concurrency 48
 ExecStart=/opt/udid/env/bin/celery -A ubuntu worker \
     --loglevel=info \
     --logfile=/var/log/udid/celery-worker.log \
-    --pidfile=/var/run/udid/celery-worker.pid
+    --pidfile=/var/run/udid/celery-worker.pid \
+    --concurrency=${CELERY_WORKER_CONCURRENCY:-auto}
 
 # Comando para detener
 ExecStop=/bin/kill -s TERM $MAINPID
@@ -1723,7 +1874,11 @@ PIDFile=/var/run/udid/celery-worker.pid
 Restart=always
 RestartSec=3
 
-# Limitar recursos
+# Limitar recursos según configuración
+# Configuración estándar: 2GB
+# Configuración optimizada para 32GB RAM / 32 cores: 2GB
+# Configuración optimizada para 64GB RAM / 32 cores: 4GB
+# Configuración optimizada para 124GB RAM / 64 cores: 4GB
 MemoryMax=2G
 CPUQuota=100%
 
@@ -2804,6 +2959,124 @@ sudo systemctl status nginx
 | **Redis Memory** | 4+ GB |
 | **PostgreSQL Connections** | 200+ |
 
+#### 🚀 Carga Muy Alta Optimizada (64-120GB RAM / 32-64 cores / 3000+ requests simultáneos)
+
+Esta configuración está optimizada específicamente para un servidor de **alta gama** con **64-120GB RAM**, **32-64 cores de CPU** que necesita soportar **~3000+ requests casi simultáneos** y **1TB de almacenamiento**.
+
+| Recurso | Especificación Optimizada |
+|---------|---------------------------|
+| **CPU** | 32-64 cores |
+| **RAM** | 64-120 GB |
+| **Disco** | 1 TB SSD/NVMe |
+| **Workers Daphne** | 40-60 instancias (según cores disponibles) |
+| **Redis Memory** | 16-30 GB (25% de RAM) |
+| **PostgreSQL Connections** | 1000-1500 |
+| **Nginx Worker Connections** | 16384 |
+| **Conexiones Simultáneas** | ~5000-10000+ |
+
+**Distribución de Memoria (ejemplo con 64GB RAM):**
+- PostgreSQL: ~20GB (shared_buffers + work_mem + otros)
+- Redis: 16GB (25% de RAM)
+- Daphne Workers: ~20GB (40 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~2GB
+- Celery: ~4GB
+- Buffer/Cache: ~2GB
+
+**Distribución de Memoria (ejemplo con 120GB RAM):**
+- PostgreSQL: ~40GB (shared_buffers + work_mem + otros)
+- Redis: 30GB (25% de RAM)
+- Daphne Workers: ~30GB (60 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~2GB
+- Celery: ~4GB
+- Buffer/Cache: ~10GB
+
+#### 🎯 Configuraciones Específicas por Hardware (32GB, 64GB, 124GB RAM / 32-64 cores / 1TB)
+
+##### Configuración 1: 32 GB RAM / 32 cores / 1 TB SSD
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 32 cores |
+| **RAM** | 32 GB |
+| **Disco** | 1 TB SSD/NVMe |
+| **Workers Daphne** | 32 instancias (puertos 8000-8031) |
+| **Redis Memory** | 8 GB (25% de RAM) |
+| **PostgreSQL Connections** | 800 |
+| **Nginx Worker Connections** | 8192 |
+| **Conexiones Simultáneas** | ~3000-4000 |
+
+**Distribución de Memoria (32GB RAM):**
+- PostgreSQL: ~10GB (shared_buffers + work_mem + otros)
+- Redis: 8GB (25% de RAM)
+- Daphne Workers: ~16GB (32 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~1GB
+- Celery: ~2GB
+- Buffer/Cache: ~1GB
+
+##### Configuración 2: 64 GB RAM / 32 cores / 1 TB SSD
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 32 cores |
+| **RAM** | 64 GB |
+| **Disco** | 1 TB SSD/NVMe |
+| **Workers Daphne** | 40 instancias (puertos 8000-8039) |
+| **Redis Memory** | 16 GB (25% de RAM) |
+| **PostgreSQL Connections** | 1000 |
+| **Nginx Worker Connections** | 16384 |
+| **Conexiones Simultáneas** | ~5000-7000 |
+
+**Distribución de Memoria (64GB RAM):**
+- PostgreSQL: ~20GB (shared_buffers + work_mem + otros)
+- Redis: 16GB (25% de RAM)
+- Daphne Workers: ~20GB (40 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~2GB
+- Celery: ~4GB
+- Buffer/Cache: ~2GB
+
+##### Configuración 3: 124 GB RAM / 64 cores / 1 TB SSD
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 64 cores |
+| **RAM** | 124 GB |
+| **Disco** | 1 TB SSD/NVMe |
+| **Workers Daphne** | 60 instancias (puertos 8000-8059) |
+| **Redis Memory** | 31 GB (25% de RAM) |
+| **PostgreSQL Connections** | 1500 |
+| **Nginx Worker Connections** | 16384 |
+| **Conexiones Simultáneas** | ~10000-15000+ |
+
+**Distribución de Memoria (124GB RAM):**
+- PostgreSQL: ~40GB (shared_buffers + work_mem + otros)
+- Redis: 31GB (25% de RAM)
+- Daphne Workers: ~30GB (60 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~2GB
+- Celery: ~4GB
+- Buffer/Cache: ~13GB
+
+### 16.1.1 Tabla de Configuraciones por Hardware
+
+| Configuración | RAM | CPU | Disco | Redis Max Connections | Channel Layers Capacity | Semaphore Slots | Queue Max Size | Celery Concurrency | Celery Prefetch |
+|---------------|-----|-----|-------|----------------------|------------------------|-----------------|----------------|-------------------|-----------------|
+| **Estándar** | 8-16 GB | 4-8 cores | 80 GB | 100 | 2000 | 1000 | 1000 | auto | 4 |
+| **32GB/32cores** | 32 GB | 32 cores | 1 TB | 300 | 5000 | 3000 | 5000 | 16 | 8 |
+| **64GB/32cores** | 64 GB | 32 cores | 1 TB | 400 | 10000 | 5000 | 10000 | 24 | 10 |
+| **124GB/64cores** | 124 GB | 64 cores | 1 TB | 600 | 20000 | 10000 | 20000 | 48 | 16 |
+
+**Notas:**
+- **Redis Max Connections**: Pool de conexiones simultáneas a Redis
+- **Channel Layers Capacity**: Mensajes máximos por canal WebSocket antes de bloquear
+- **Semaphore Slots**: Requests simultáneos permitidos globalmente
+- **Queue Max Size**: Tamaño máximo de la cola de requests pendientes
+- **Celery Concurrency**: Número de procesos/threads por worker de Celery
+- **Celery Prefetch**: Multiplicador de tareas pre-cargadas por worker
+
 ### 16.2 Ajustes de Rendimiento
 
 #### Para PostgreSQL (alta carga):
@@ -2827,6 +3100,221 @@ wal_buffers = 64MB
 checkpoint_completion_target = 0.9
 ```
 
+#### Para PostgreSQL (32GB RAM / 32 cores / 1TB SSD / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+```conf
+# Ajustes de memoria optimizados para 32GB RAM
+shared_buffers = 8GB              # 25% de 32GB RAM
+effective_cache_size = 24GB       # 75% de 32GB RAM
+work_mem = 128MB                  # Ajustado para más conexiones simultáneas
+maintenance_work_mem = 2GB        # Aumentado para operaciones de mantenimiento
+temp_buffers = 32MB
+hash_mem_multiplier = 2.0
+
+# Conexiones - aumentado para 3000+ requests simultáneos
+max_connections = 800             # Soporta ~3000-4000 requests con pooling
+superuser_reserved_connections = 15
+
+# WAL (Write-Ahead Logging) optimizado
+wal_buffers = 128MB               # Aumentado para mejor rendimiento
+checkpoint_completion_target = 0.9
+wal_writer_delay = 200ms
+commit_delay = 100
+commit_siblings = 10
+max_wal_size = 2GB                # Aumentado para reducir checkpoints
+min_wal_size = 512MB
+
+# Query Planner
+random_page_cost = 1.1            # Para SSD/NVMe
+effective_io_concurrency = 200    # Para SSD con múltiples operaciones
+parallel_tuple_cost = 0.1
+parallel_setup_cost = 1000.0
+
+# Parallel Query (aprovechar múltiples cores - 32 cores)
+max_parallel_workers_per_gather = 8  # Para 32 cores
+max_parallel_workers = 32        # Número de workers paralelos
+max_worker_processes = 64        # Total de procesos worker
+
+# Autovacuum optimizado para alta carga
+autovacuum_max_workers = 8       # Aumentado para más cores
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+# Logging (opcional, desactivar en producción para mejor rendimiento)
+logging_collector = on
+log_min_duration_statement = 1000  # Solo log queries > 1 segundo
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart postgresql
+```
+
+#### Para PostgreSQL (64GB RAM / 32 cores / 1TB SSD / 5000+ requests simultáneos):
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+**Para servidor con 64GB RAM:**
+```conf
+# Ajustes de memoria optimizados para 64GB RAM
+shared_buffers = 16GB             # 25% de 64GB RAM
+effective_cache_size = 48GB       # 75% de 64GB RAM
+work_mem = 128MB                   # Ajustado para más conexiones simultáneas
+maintenance_work_mem = 4GB         # Aumentado para operaciones de mantenimiento
+temp_buffers = 32MB
+hash_mem_multiplier = 2.0
+
+# Conexiones - aumentado para 5000+ requests simultáneos
+max_connections = 1000             # Soporta ~5000-7000 requests con pooling
+superuser_reserved_connections = 20
+
+# WAL (Write-Ahead Logging) optimizado
+wal_buffers = 256MB               # Aumentado para mejor rendimiento
+checkpoint_completion_target = 0.9
+wal_writer_delay = 200ms
+commit_delay = 100
+commit_siblings = 10
+max_wal_size = 4GB                # Aumentado para reducir checkpoints
+min_wal_size = 1GB
+
+# Query Planner
+random_page_cost = 1.1            # Para SSD/NVMe
+effective_io_concurrency = 200    # Para SSD con múltiples operaciones
+parallel_tuple_cost = 0.1
+parallel_setup_cost = 1000.0
+
+# Parallel Query (aprovechar múltiples cores)
+max_parallel_workers_per_gather = 8  # Para 32+ cores
+max_parallel_workers = 32        # Número de workers paralelos
+max_worker_processes = 64        # Total de procesos worker
+
+# Autovacuum optimizado para alta carga
+autovacuum_max_workers = 8       # Aumentado para más cores
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+# Logging (opcional, desactivar en producción para mejor rendimiento)
+logging_collector = on
+log_min_duration_statement = 1000  # Solo log queries > 1 segundo
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+```
+
+**Para servidor con 120GB RAM:**
+```conf
+# Ajustes de memoria optimizados para 120GB RAM
+shared_buffers = 30GB             # 25% de 120GB RAM
+effective_cache_size = 90GB       # 75% de 120GB RAM
+work_mem = 128MB                   # Ajustado para más conexiones simultáneos
+maintenance_work_mem = 8GB         # Aumentado para operaciones de mantenimiento
+temp_buffers = 64MB
+hash_mem_multiplier = 2.0
+
+# Conexiones - aumentado para 10000+ requests simultáneos
+max_connections = 1500            # Soporta ~10000+ requests con pooling
+superuser_reserved_connections = 30
+
+# WAL (Write-Ahead Logging) optimizado
+wal_buffers = 512MB               # Aumentado para mejor rendimiento
+checkpoint_completion_target = 0.9
+wal_writer_delay = 200ms
+commit_delay = 100
+commit_siblings = 10
+max_wal_size = 8GB                # Aumentado para reducir checkpoints
+min_wal_size = 2GB
+
+# Query Planner
+random_page_cost = 1.1            # Para SSD/NVMe
+effective_io_concurrency = 200    # Para SSD con múltiples operaciones
+parallel_tuple_cost = 0.1
+parallel_setup_cost = 1000.0
+
+# Parallel Query (aprovechar múltiples cores - 64 cores)
+max_parallel_workers_per_gather = 16  # Para 64 cores
+max_parallel_workers = 64        # Número de workers paralelos
+max_worker_processes = 128       # Total de procesos worker
+
+# Autovacuum optimizado para alta carga
+autovacuum_max_workers = 16      # Aumentado para más cores
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+# Logging (opcional, desactivar en producción para mejor rendimiento)
+logging_collector = on
+log_min_duration_statement = 1000  # Solo log queries > 1 segundo
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart postgresql
+```
+
+#### Para PostgreSQL (124GB RAM / 64 cores / 1TB SSD / 10000+ requests simultáneos):
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+```conf
+# Ajustes de memoria optimizados para 124GB RAM
+shared_buffers = 31GB            # 25% de 124GB RAM
+effective_cache_size = 93GB      # 75% de 124GB RAM
+work_mem = 128MB                 # Ajustado para más conexiones simultáneas
+maintenance_work_mem = 8GB       # Aumentado para operaciones de mantenimiento
+temp_buffers = 64MB
+hash_mem_multiplier = 2.0
+
+# Conexiones - aumentado para 10000+ requests simultáneos
+max_connections = 1500           # Soporta ~10000-15000+ requests con pooling
+superuser_reserved_connections = 30
+
+# WAL (Write-Ahead Logging) optimizado
+wal_buffers = 512MB              # Aumentado para mejor rendimiento
+checkpoint_completion_target = 0.9
+wal_writer_delay = 200ms
+commit_delay = 100
+commit_siblings = 10
+max_wal_size = 8GB               # Aumentado para reducir checkpoints
+min_wal_size = 2GB
+
+# Query Planner
+random_page_cost = 1.1           # Para SSD/NVMe
+effective_io_concurrency = 200   # Para SSD con múltiples operaciones
+parallel_tuple_cost = 0.1
+parallel_setup_cost = 1000.0
+
+# Parallel Query (aprovechar múltiples cores - 64 cores)
+max_parallel_workers_per_gather = 16  # Para 64 cores
+max_parallel_workers = 64       # Número de workers paralelos
+max_worker_processes = 128       # Total de procesos worker
+
+# Autovacuum optimizado para alta carga
+autovacuum_max_workers = 16      # Aumentado para más cores
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+# Logging (opcional, desactivar en producción para mejor rendimiento)
+logging_collector = on
+log_min_duration_statement = 1000  # Solo log queries > 1 segundo
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart postgresql
+```
+
 #### Para Redis (alta carga):
 
 ```bash
@@ -2838,6 +3326,189 @@ maxmemory 4gb
 maxmemory-policy allkeys-lru
 tcp-keepalive 300
 timeout 0
+```
+
+#### Para Redis (32GB RAM / 32 cores / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+```conf
+# Memoria optimizada para 32GB RAM
+maxmemory 8gb                     # 25% de 32GB RAM
+maxmemory-policy allkeys-lru      # Eliminar claves menos usadas cuando se llena
+
+# Conexiones y timeouts
+tcp-keepalive 300
+timeout 0                         # Sin timeout (conexiones persistentes)
+tcp-backlog 1024                  # Aumentado para más conexiones simultáneas
+maxclients 8000                   # Máximo de clientes simultáneos
+
+# Persistencia (ajustar según necesidades)
+# Para mejor rendimiento, desactivar persistencia si no es crítica:
+save ""                           # Desactivar snapshots automáticos
+# O usar AOF con fsync cada segundo:
+appendonly yes
+appendfsync everysec
+no-appendfsync-on-rewrite yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Optimizaciones de rendimiento
+hz 10                             # Frecuencia de tareas en background
+dynamic-hz yes                    # Ajustar dinámicamente según carga
+lazyfree-lazy-eviction yes        # Liberación asíncrona de memoria
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+
+# Threading (Redis 6+ con múltiples cores)
+io-threads 8                      # Para 32 cores, usar 8 threads de I/O
+io-threads-do-reads yes
+
+# Logging
+loglevel notice                   # Reducir logging en producción
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart redis-server
+```
+
+#### Para Redis (64GB RAM / 32 cores / 5000+ requests simultáneos):
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+**Para servidor con 64GB RAM:**
+```conf
+# Memoria optimizada para 64GB RAM
+maxmemory 16gb                    # 25% de 64GB RAM
+maxmemory-policy allkeys-lru      # Eliminar claves menos usadas cuando se llena
+
+# Conexiones y timeouts
+tcp-keepalive 300
+timeout 0                         # Sin timeout (conexiones persistentes)
+tcp-backlog 1024                  # Aumentado para más conexiones simultáneas
+maxclients 10000                  # Máximo de clientes simultáneos
+
+# Persistencia (ajustar según necesidades)
+# Para mejor rendimiento, desactivar persistencia si no es crítica:
+save ""                           # Desactivar snapshots automáticos
+# O usar AOF con fsync cada segundo:
+appendonly yes
+appendfsync everysec
+no-appendfsync-on-rewrite yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Optimizaciones de rendimiento
+hz 10                             # Frecuencia de tareas en background
+dynamic-hz yes                    # Ajustar dinámicamente según carga
+lazyfree-lazy-eviction yes        # Liberación asíncrona de memoria
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+
+# Threading (Redis 6+ con múltiples cores)
+io-threads 8                      # Para 32+ cores, usar 8 threads de I/O
+io-threads-do-reads yes
+
+# Logging
+loglevel notice                   # Reducir logging en producción
+```
+
+**Para servidor con 120GB RAM:**
+```conf
+# Memoria optimizada para 120GB RAM
+maxmemory 30gb                    # 25% de 120GB RAM
+maxmemory-policy allkeys-lru      # Eliminar claves menos usadas cuando se llena
+
+# Conexiones y timeouts
+tcp-keepalive 300
+timeout 0                         # Sin timeout (conexiones persistentes)
+tcp-backlog 2048                  # Aumentado para más conexiones simultáneas
+maxclients 20000                  # Máximo de clientes simultáneos
+
+# Persistencia (ajustar según necesidades)
+# Para mejor rendimiento, desactivar persistencia si no es crítica:
+save ""                           # Desactivar snapshots automáticos
+# O usar AOF con fsync cada segundo:
+appendonly yes
+appendfsync everysec
+no-appendfsync-on-rewrite yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Optimizaciones de rendimiento
+hz 10                             # Frecuencia de tareas en background
+dynamic-hz yes                    # Ajustar dinámicamente según carga
+lazyfree-lazy-eviction yes        # Liberación asíncrona de memoria
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+
+# Threading (Redis 6+ con múltiples cores)
+io-threads 16                     # Para 64 cores, usar 16 threads de I/O
+io-threads-do-reads yes
+
+# Logging
+loglevel notice                   # Reducir logging en producción
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart redis-server
+```
+
+#### Para Redis (124GB RAM / 64 cores / 10000+ requests simultáneos):
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+```conf
+# Memoria optimizada para 124GB RAM
+maxmemory 31gb                    # 25% de 124GB RAM
+maxmemory-policy allkeys-lru     # Eliminar claves menos usadas cuando se llena
+
+# Conexiones y timeouts
+tcp-keepalive 300
+timeout 0                         # Sin timeout (conexiones persistentes)
+tcp-backlog 2048                  # Aumentado para más conexiones simultáneas
+maxclients 20000                  # Máximo de clientes simultáneos
+
+# Persistencia (ajustar según necesidades)
+# Para mejor rendimiento, desactivar persistencia si no es crítica:
+save ""                           # Desactivar snapshots automáticos
+# O usar AOF con fsync cada segundo:
+appendonly yes
+appendfsync everysec
+no-appendfsync-on-rewrite yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Optimizaciones de rendimiento
+hz 10                             # Frecuencia de tareas en background
+dynamic-hz yes                    # Ajustar dinámicamente según carga
+lazyfree-lazy-eviction yes        # Liberación asíncrona de memoria
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+
+# Threading (Redis 6+ con múltiples cores)
+io-threads 16                     # Para 64 cores, usar 16 threads de I/O
+io-threads-do-reads yes
+
+# Logging
+loglevel notice                   # Reducir logging en producción
+```
+
+**Aplicar cambios:**
+```bash
+sudo systemctl restart redis-server
 ```
 
 #### Para Nginx (alta carga):
@@ -2853,7 +3524,270 @@ multi_accept on;
 use epoll;
 ```
 
-### 16.3 Monitoreo de Recursos
+#### Para Nginx (32GB RAM / 32 cores / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+```nginx
+# Worker processes - usar todos los cores disponibles (32 cores)
+worker_processes auto;
+worker_rlimit_nofile 65536;       # Aumentado para más archivos abiertos (32 cores)
+
+events {
+    # Conexiones por worker - aumentado para 3000+ requests simultáneos
+    worker_connections 8192;      # 8192 × número de workers = capacidad total
+    use epoll;                     # Mejor para Linux
+    multi_accept on;              # Aceptar múltiples conexiones a la vez
+    accept_mutex off;             # Desactivar mutex para mejor rendimiento con muchos cores
+}
+
+http {
+    # Buffers optimizados para alta carga
+    client_body_buffer_size 256k;
+    client_max_body_size 20m;
+    client_header_buffer_size 2k;
+    large_client_header_buffers 8 32k;
+    
+    # Timeouts optimizados
+    keepalive_timeout 75;          # Mantener conexiones abiertas más tiempo
+    keepalive_requests 2000;       # Más requests por conexión
+    send_timeout 60s;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+    sendfile on;                   # Usar sendfile para mejor rendimiento
+    tcp_nopush on;                 # Optimizar envío de paquetes
+    tcp_nodelay on;                # Desactivar Nagle algorithm
+    
+    # Compresión
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript application/x-javascript text/x-js;
+    gzip_disable "msie6";
+    
+    # Cache de archivos abiertos (aumentado para alta carga)
+    open_file_cache max=250000 inactive=30s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # Logging optimizado (reducir en producción)
+    access_log off;                 # Desactivar para mejor rendimiento
+    # O usar logging asíncrono con buffer grande:
+    # access_log /var/log/nginx/access.log buffer=64k flush=10s;
+    error_log /var/log/nginx/error.log warn;
+    
+    # Rate limiting (protección DDoS) - aumentado para alta carga
+    limit_req_zone $binary_remote_addr zone=api_limit:20m rate=150r/s;
+    limit_req_zone $binary_remote_addr zone=ws_limit:20m rate=80r/s;
+    
+    # Connection limiting
+    limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:20m;
+    limit_conn conn_limit_per_ip 50;
+    
+    # Incluir configuración del sitio
+    include /etc/nginx/sites-enabled/*;
+}
+```
+
+**Aplicar cambios:**
+```bash
+sudo nginx -t                    # Verificar configuración
+sudo systemctl restart nginx
+```
+
+#### Para Nginx (64GB RAM / 32 cores / 5000+ requests simultáneos):
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+```nginx
+# Worker processes - usar todos los cores disponibles (32 cores)
+worker_processes auto;
+worker_rlimit_nofile 131072;      # Aumentado para más archivos abiertos (32-64 cores)
+
+events {
+    # Conexiones por worker - aumentado para 5000+ requests simultáneos
+    worker_connections 16384;      # 16384 × número de workers = capacidad total
+    use epoll;                     # Mejor para Linux
+    multi_accept on;               # Aceptar múltiples conexiones a la vez
+    accept_mutex off;              # Desactivar mutex para mejor rendimiento con muchos cores
+}
+
+http {
+    # Buffers optimizados para alta carga
+    client_body_buffer_size 256k;
+    client_max_body_size 20m;
+    client_header_buffer_size 2k;
+    large_client_header_buffers 8 32k;
+    
+    # Timeouts optimizados
+    keepalive_timeout 75;          # Mantener conexiones abiertas más tiempo
+    keepalive_requests 2000;       # Más requests por conexión
+    send_timeout 60s;
+    client_body_timeout 60s;
+    client_header_timeout 60s;
+    sendfile on;                    # Usar sendfile para mejor rendimiento
+    tcp_nopush on;                  # Optimizar envío de paquetes
+    tcp_nodelay on;                 # Desactivar Nagle algorithm
+    
+    # Compresión
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1000;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript application/x-javascript text/x-js;
+    gzip_disable "msie6";
+    
+    # Cache de archivos abiertos (aumentado para alta carga)
+    open_file_cache max=500000 inactive=30s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+    
+    # Logging optimizado (reducir en producción)
+    access_log off;                 # Desactivar para mejor rendimiento
+    # O usar logging asíncrono con buffer grande:
+    # access_log /var/log/nginx/access.log buffer=64k flush=10s;
+    error_log /var/log/nginx/error.log warn;
+    
+    # Rate limiting (protección DDoS) - aumentado para alta carga
+    limit_req_zone $binary_remote_addr zone=api_limit:20m rate=200r/s;
+    limit_req_zone $binary_remote_addr zone=ws_limit:20m rate=100r/s;
+    
+    # Connection limiting
+    limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:20m;
+    limit_conn conn_limit_per_ip 50;
+    
+    # Incluir configuración del sitio
+    include /etc/nginx/sites-enabled/*;
+}
+```
+
+**Aplicar cambios:**
+```bash
+sudo nginx -t                    # Verificar configuración
+sudo systemctl restart nginx
+```
+
+### 16.3 Aplicar Optimizaciones para 64-120GB RAM / 32-64 cores / 5000+ Requests
+
+Si tienes un servidor de **alta gama** con **64-120GB RAM**, **32-64 cores de CPU** y necesitas soportar **~5000-10000+ requests simultáneos**, sigue estos pasos:
+
+#### Paso 1: Actualizar Configuración de PostgreSQL
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+Aplicar los valores de la sección "Para PostgreSQL (64-120GB RAM / 32-64 cores / 5000+ requests simultáneos)" arriba:
+- **Para 64GB RAM**: usar configuración con `shared_buffers = 16GB`, `max_connections = 1000`
+- **Para 120GB RAM**: usar configuración con `shared_buffers = 30GB`, `max_connections = 1500`
+
+#### Paso 2: Actualizar Configuración de Redis
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+Aplicar los valores de la sección "Para Redis (64-120GB RAM / 5000+ requests simultáneos)" arriba:
+- **Para 64GB RAM**: cambiar `maxmemory` a `16gb`, `io-threads 8`
+- **Para 120GB RAM**: cambiar `maxmemory` a `30gb`, `io-threads 16`
+
+#### Paso 3: Actualizar Configuración de Nginx
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+Aplicar los valores de la sección "Para Nginx (64-120GB RAM / 32-64 cores / 5000+ requests simultáneos)" arriba.
+
+#### Paso 4: Actualizar Nginx Site Configuration
+
+```bash
+sudo nano /etc/nginx/sites-available/udid
+```
+
+Descomentar las instancias de Daphne en el bloque `upstream udid_backend` (ver sección 9.2):
+- **Para 64GB RAM / 32 cores**: configurar 40 instancias (puertos 8000-8039)
+- **Para 120GB RAM / 64 cores**: configurar 60 instancias (puertos 8000-8059)
+
+#### Paso 5: Actualizar Script de Control
+
+```bash
+sudo nano /opt/udid/manage_services.sh
+```
+
+Cambiar `INSTANCES=4` a:
+- **Para 64GB RAM / 32 cores**: `INSTANCES=40`
+- **Para 120GB RAM / 64 cores**: `INSTANCES=60`
+
+#### Paso 6: Actualizar Variables de Entorno
+
+```bash
+sudo nano /opt/udid/.env
+```
+
+Agregar o actualizar estas variables:
+
+```env
+# Optimizaciones para 64-120GB RAM / 32-64 cores / 5000+ requests simultáneos
+# Para 64GB RAM / 32 cores:
+REDIS_MAX_CONNECTIONS=400
+GLOBAL_SEMAPHORE_SLOTS=5000
+REQUEST_QUEUE_MAX_SIZE=10000
+CHANNEL_LAYERS_CAPACITY=10000
+
+# Para 120GB RAM / 64 cores (valores aún más altos):
+# REDIS_MAX_CONNECTIONS=600
+# GLOBAL_SEMAPHORE_SLOTS=10000
+# REQUEST_QUEUE_MAX_SIZE=20000
+# CHANNEL_LAYERS_CAPACITY=20000
+```
+
+#### Paso 7: Reiniciar Servicios
+
+```bash
+# Reiniciar PostgreSQL
+sudo systemctl restart postgresql
+
+# Reiniciar Redis
+sudo systemctl restart redis-server
+
+# Reiniciar Nginx
+sudo nginx -t                    # Verificar configuración primero
+sudo systemctl restart nginx
+
+# Reiniciar instancias de Daphne
+sudo /opt/udid/manage_services.sh restart
+```
+
+#### Paso 8: Verificar
+
+```bash
+# Verificar que todas las instancias están corriendo
+sudo /opt/udid/manage_services.sh status
+
+# Verificar puertos
+sudo ss -tlnp | grep 800
+
+# Verificar uso de memoria
+free -h
+
+# Verificar conexiones PostgreSQL
+sudo -u postgres psql -c "SHOW max_connections;"
+
+# Verificar memoria Redis
+redis-cli INFO memory | grep maxmemory
+```
+
+### 16.4 Monitoreo de Recursos
 
 Instalar herramientas de monitoreo:
 
@@ -2866,6 +3800,29 @@ sudo apt install -y iotop
 
 # Netdata para dashboard web de monitoreo (opcional)
 bash <(curl -Ss https://my-netdata.io/kickstart.sh)
+```
+
+**Comandos útiles de monitoreo para alta carga:**
+
+```bash
+# Ver uso de recursos en tiempo real
+htop
+
+# Ver conexiones activas por puerto
+sudo ss -tlnp | grep -E '(800|5432|6379|443)'
+
+# Ver conexiones PostgreSQL activas
+sudo -u postgres psql -c "SELECT count(*) FROM pg_stat_activity;"
+
+# Ver memoria Redis
+redis-cli INFO memory
+
+# Ver estadísticas de Nginx
+curl http://localhost/nginx_status  # Si está habilitado
+
+# Ver logs en tiempo real
+sudo journalctl -u udid@0 -f
+sudo tail -f /var/log/nginx/udid_access.log
 ```
 
 ---

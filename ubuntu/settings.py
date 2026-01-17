@@ -107,7 +107,10 @@ REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
 REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == "true"
 
 # REDIS_MAX_CONNECTIONS: Número máximo de conexiones simultáneas al pool de conexiones de Redis
-# Aumentado a 100 para mejor manejo de carga (50 para rate limiting + 50 para WebSockets)
+# Configuración estándar: 100 (50 para rate limiting + 50 para WebSockets)
+# Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 300
+# Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 400
+# Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 600
 # Más conexiones = mejor rendimiento bajo carga, pero más recursos del servidor Redis
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
 
@@ -161,7 +164,10 @@ if REDIS_SENTINEL:
                 }],
                 # capacity: Número máximo de mensajes que se pueden almacenar en un canal antes de bloquear
                 # Si un canal alcanza este límite, los nuevos mensajes esperan hasta que haya espacio
-                # Aumentado a 2000 para manejar picos de tráfico (default: 100)
+                # Configuración estándar: 2000 mensajes (default: 100)
+                # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 mensajes
+                # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 mensajes
+                # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 mensajes
                 "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
                 # expiry: Tiempo de expiración de mensajes en segundos
                 # Los mensajes no leídos se eliminan automáticamente después de este tiempo
@@ -170,6 +176,7 @@ if REDIS_SENTINEL:
                 # group_expiry: Tiempo en segundos antes de que un grupo de WebSocket expire
                 # Los grupos permiten enviar mensajes a múltiples consumidores WebSocket simultáneamente
                 # 900 segundos = 15 minutos de persistencia del grupo
+                # Configuración optimizada para alta carga: aumentar a 1800 (30 minutos)
                 "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
             },
         }
@@ -186,10 +193,14 @@ else:
                 # Con conexión directa, se especifica la URL completa del servidor Redis
                 "hosts": [host_cfg],
                 # capacity: Número máximo de mensajes por canal antes de bloquear (2000 mensajes)
+                # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 mensajes
+                # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 mensajes
+                # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 mensajes
                 "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
                 # expiry: Tiempo de expiración de mensajes no leídos (10 segundos)
                 "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
                 # group_expiry: Tiempo de persistencia de grupos WebSocket (900 segundos = 15 minutos)
+                # Configuración optimizada para alta carga: aumentar a 1800 (30 minutos)
                 "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
             },
         }
@@ -215,6 +226,10 @@ UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "5"))  # Defa
 UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
 
 # Configuración del semáforo global de concurrencia
+# Configuración estándar: 1000 slots simultáneos
+# Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 3000 slots
+# Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 5000 slots
+# Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 10000 slots
 GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "1000"))  # Máximo de slots simultáneos
 
 # Límites de WebSocket reducidos para reducir carga del servidor
@@ -231,6 +246,10 @@ REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "
 # ============================================================================
 
 # Configuración de la cola de requests
+# Configuración estándar: 1000 requests en cola
+# Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 requests
+# Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 requests
+# Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 requests
 REQUEST_QUEUE_MAX_SIZE = int(os.getenv("REQUEST_QUEUE_MAX_SIZE", "1000"))
 REQUEST_QUEUE_MAX_WAIT_TIME = int(os.getenv("REQUEST_QUEUE_MAX_WAIT_TIME", "10"))  # Segundos
 
@@ -604,11 +623,23 @@ CELERY_TASK_ALWAYS_EAGER = False  # False = ejecutar en background, True = ejecu
 CELERY_TASK_EAGER_PROPAGATES = True  # Propagar excepciones en modo eager
 
 # Configuración de workers
-CELERY_WORKER_PREFETCH_MULTIPLIER = CeleryConfig.WORKER_PREFETCH_MULTIPLIER
+# Configuración estándar: prefetch_multiplier = 4
+# Configuración optimizada para 32GB RAM / 32 cores: prefetch_multiplier = 8
+# Configuración optimizada para 64GB RAM / 32 cores: prefetch_multiplier = 10
+# Configuración optimizada para 124GB RAM / 64 cores: prefetch_multiplier = 16
+CELERY_WORKER_PREFETCH_MULTIPLIER = int(os.getenv("CELERY_WORKER_PREFETCH_MULTIPLIER", str(CeleryConfig.WORKER_PREFETCH_MULTIPLIER)))
 CELERY_WORKER_MAX_TASKS_PER_CHILD = CeleryConfig.WORKER_MAX_TASKS_PER_CHILD
 CELERY_WORKER_DISABLE_RATE_LIMITS = CeleryConfig.WORKER_DISABLE_RATE_LIMITS
 CELERY_WORKER_SEND_TASK_EVENTS = True  # Enviar eventos de tareas (necesario para Flower)
 CELERY_WORKER_DIRECT = False  # Usar AMQP direct (False para Redis)
+
+# Configuración de concurrencia de workers (número de procesos/threads por worker)
+# Configuración estándar: auto (detecta automáticamente)
+# Configuración optimizada para 32GB RAM / 32 cores: 8-16 workers
+# Configuración optimizada para 64GB RAM / 32 cores: 16-24 workers
+# Configuración optimizada para 124GB RAM / 64 cores: 32-48 workers
+# Nota: Esto se configura al iniciar el worker con: celery -A ubuntu worker --concurrency=N
+CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", "0"))  # 0 = auto
 
 # Configuración de reintentos
 CELERY_TASK_DEFAULT_RETRY_DELAY = CeleryConfig.TASK_DEFAULT_RETRY_DELAY
@@ -698,6 +729,15 @@ if REDIS_URL:
                     'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
                     'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                    # Configuración de pool de conexiones para cache
+                    # Configuración estándar: pool por defecto
+                    # Configuración optimizada para 32GB RAM / 32 cores: max_connections = 50
+                    # Configuración optimizada para 64GB RAM / 32 cores: max_connections = 100
+                    # Configuración optimizada para 124GB RAM / 64 cores: max_connections = 150
+                    'CONNECTION_POOL_KWARGS': {
+                        'max_connections': int(os.getenv("CACHE_MAX_CONNECTIONS", "50")),
+                        'retry_on_timeout': True,
+                    },
                 },
                 'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
                 'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
@@ -713,6 +753,15 @@ if REDIS_URL:
                     'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
                     'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
+                    # Configuración de pool de conexiones para cache
+                    # Configuración estándar: pool por defecto
+                    # Configuración optimizada para 32GB RAM / 32 cores: max_connections = 50
+                    # Configuración optimizada para 64GB RAM / 32 cores: max_connections = 100
+                    # Configuración optimizada para 124GB RAM / 64 cores: max_connections = 150
+                    'CONNECTION_POOL_KWARGS': {
+                        'max_connections': int(os.getenv("CACHE_MAX_CONNECTIONS", "50")),
+                        'retry_on_timeout': True,
+                    },
                 },
                 'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
                 'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
