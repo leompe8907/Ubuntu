@@ -16,13 +16,25 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urlparse
 
-from config import DjangoConfig, CeleryConfig
+from config import DjangoConfig,CeleryConfig, RedisConfig, ChannelLayersConfig, UdidConfig, BackpressureConfig, DatabaseConfig, CacheConfig
+
 
 # Validar configuración cargada desde DjangoConfig
 DjangoConfig.validate()
 # Validar configuración de Celery (no es estricto, solo advertencias)
 CeleryConfig.validate()
-
+# Validar configuración de Redis
+RedisConfig.validate()
+# Validar configuración de Channel Layers
+ChannelLayersConfig.validate()
+# Validar configuración de Udid
+UdidConfig.validate()
+# Validar configuración de Backpressure
+BackpressureConfig.validate()
+# Validar configuración de Database
+DatabaseConfig.validate()
+# Validar configuración de Cache
+CacheConfig.validate()
 
 # ============================================================================
 # PATHS Y CONFIGURACIÓN BASE
@@ -73,38 +85,29 @@ ASGI_APPLICATION = 'ubuntu.asgi.application'
 
 # REDIS_URL: URL de conexión a Redis (usado como backend para Channel Layers y cache)
 # Por defecto, usar localhost:6379 si no está configurado (desarrollo local)
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = RedisConfig.REDIS_URL
 
 # REDIS_SENTINEL: Configuración de Redis Sentinel para alta disponibilidad y failover automático
 # Formato: "host1:puerto1,host2:puerto2,host3:puerto3" (múltiples instancias Sentinel)
 # Si está configurado, se usa Sentinel en lugar de conexión directa a Redis
 # None = no usar Sentinel (conexión directa)
-REDIS_SENTINEL = os.getenv("REDIS_SENTINEL", None)
+REDIS_SENTINEL = RedisConfig.get_sentinel_list()
 
 # REDIS_SENTINEL_MASTER: Nombre del master de Redis que Sentinel debe monitorear
 # Este es el nombre del servicio master configurado en la configuración de Sentinel
-REDIS_SENTINEL_MASTER = os.getenv("REDIS_SENTINEL_MASTER", "mymaster")
-
-# Parsear REDIS_SENTINEL: Convierte el string de configuración en lista de tuplas (host, puerto)
-# Ejemplo: "192.168.1.1:26379,192.168.1.2:26379" -> [("192.168.1.1", 26379), ("192.168.1.2", 26379)]
-if REDIS_SENTINEL:
-    REDIS_SENTINEL = [
-        (h, int(p)) for h, p in (hp.split(":") for hp in REDIS_SENTINEL.split(","))
-    ]
-else:
-    REDIS_SENTINEL = None
+REDIS_SENTINEL_MASTER = RedisConfig.REDIS_SENTINEL_MASTER
 
 # REDIS_SOCKET_CONNECT_TIMEOUT: Tiempo máximo (segundos) para establecer conexión con Redis
 # Si Redis no responde en este tiempo, se considera fallo de conexión
-REDIS_SOCKET_CONNECT_TIMEOUT = int(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", "5"))
+REDIS_SOCKET_CONNECT_TIMEOUT = RedisConfig.REDIS_SOCKET_CONNECT_TIMEOUT
 
 # REDIS_SOCKET_TIMEOUT: Tiempo máximo (segundos) para esperar respuesta de Redis en operaciones
 # Si Redis no responde en este tiempo, se considera timeout de operación
-REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", "5"))
+REDIS_SOCKET_TIMEOUT = RedisConfig.REDIS_SOCKET_TIMEOUT
 
 # REDIS_RETRY_ON_TIMEOUT: Si es True, reintenta automáticamente operaciones que fallan por timeout
 # Útil para manejar picos de carga temporal donde Redis puede tardar más en responder
-REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == "true"
+REDIS_RETRY_ON_TIMEOUT = RedisConfig.REDIS_RETRY_ON_TIMEOUT
 
 # REDIS_MAX_CONNECTIONS: Número máximo de conexiones simultáneas al pool de conexiones de Redis
 # Configuración estándar: 100 (50 para rate limiting + 50 para WebSockets)
@@ -112,7 +115,7 @@ REDIS_RETRY_ON_TIMEOUT = os.getenv("REDIS_RETRY_ON_TIMEOUT", "True").lower() == 
 # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 400
 # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 600
 # Más conexiones = mejor rendimiento bajo carga, pero más recursos del servidor Redis
-REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
+REDIS_MAX_CONNECTIONS = RedisConfig.REDIS_MAX_CONNECTIONS
 
 
 # ============================================================================
@@ -122,12 +125,12 @@ REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "100"))
 # REDIS_CHANNEL_LAYER_URL: URL específica de Redis para Channel Layers (WebSockets y mensajería asíncrona)
 # Permite separar el Redis de WebSockets del Redis de cache/rate limiting si es necesario
 # Si no está configurado, se usa REDIS_URL por defecto
-REDIS_CHANNEL_LAYER_URL = os.getenv("REDIS_CHANNEL_LAYER_URL", REDIS_URL)
+REDIS_CHANNEL_LAYER_URL = RedisConfig.REDIS_CHANNEL_LAYER_URL
 
 # REDIS_RATE_LIMIT_URL: URL específica de Redis para rate limiting (control de frecuencia de peticiones)
 # Permite usar un Redis separado para rate limiting si necesitas escalar independientemente
 # Default: mismo que REDIS_URL (comparte Redis con Channel Layers)
-REDIS_RATE_LIMIT_URL = os.getenv("REDIS_RATE_LIMIT_URL", REDIS_URL)
+REDIS_RATE_LIMIT_URL = RedisConfig.REDIS_RATE_LIMIT_URL
 
 # host_cfg: Diccionario de configuración para la conexión a Redis en Channel Layers
 # Contiene la dirección y opcionalmente configuración SSL si se usa rediss:// (Redis con TLS)
@@ -168,16 +171,16 @@ if REDIS_SENTINEL:
                 # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 mensajes
                 # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 mensajes
                 # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 mensajes
-                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
+                "capacity": ChannelLayersConfig.CAPACITY,
                 # expiry: Tiempo de expiración de mensajes en segundos
                 # Los mensajes no leídos se eliminan automáticamente después de este tiempo
                 # Previene acumulación infinita de mensajes en canales abandonados
-                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
+                "expiry": ChannelLayersConfig.EXPIRY,
                 # group_expiry: Tiempo en segundos antes de que un grupo de WebSocket expire
                 # Los grupos permiten enviar mensajes a múltiples consumidores WebSocket simultáneamente
                 # 900 segundos = 15 minutos de persistencia del grupo
                 # Configuración optimizada para alta carga: aumentar a 1800 (30 minutos)
-                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
+                "group_expiry": ChannelLayersConfig.GROUP_EXPIRY,
             },
         }
     }
@@ -196,12 +199,12 @@ else:
                 # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 mensajes
                 # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 mensajes
                 # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 mensajes
-                "capacity": int(os.getenv("CHANNEL_LAYERS_CAPACITY", "2000")),
+                "capacity": ChannelLayersConfig.CAPACITY,
                 # expiry: Tiempo de expiración de mensajes no leídos (10 segundos)
-                "expiry": int(os.getenv("CHANNEL_LAYERS_EXPIRY", "10")),
+                "expiry": ChannelLayersConfig.EXPIRY,
                 # group_expiry: Tiempo de persistencia de grupos WebSocket (900 segundos = 15 minutos)
                 # Configuración optimizada para alta carga: aumentar a 1800 (30 minutos)
-                "group_expiry": int(os.getenv("CHANNEL_LAYERS_GROUP_EXPIRY", "900")),
+                "group_expiry": ChannelLayersConfig.GROUP_EXPIRY,
             },
         }
     }
@@ -212,33 +215,33 @@ else:
 # ============================================================================
 
 # Tiempo máximo de espera del WS antes de responder "timeout" (segundos)
-UDID_WAIT_TIMEOUT_AUTOMATIC = int(os.getenv("UDID_WAIT_TIMEOUT_AUTOMATIC", "180"))  # Validación automática: 90s
-UDID_WAIT_TIMEOUT_MANUAL = int(os.getenv("UDID_WAIT_TIMEOUT_MANUAL", "180"))  # Validación manual: 180s
+UDID_WAIT_TIMEOUT_AUTOMATIC = UdidConfig.WAIT_TIMEOUT_AUTOMATIC  # Validación automática: 90s
+UDID_WAIT_TIMEOUT_MANUAL = UdidConfig.WAIT_TIMEOUT_MANUAL  # Validación manual: 180s
 
 # Compatibilidad hacia atrás
-UDID_WAIT_TIMEOUT = int(os.getenv("UDID_WAIT_TIMEOUT", str(UDID_WAIT_TIMEOUT_AUTOMATIC)))
+UDID_WAIT_TIMEOUT = UdidConfig.WAIT_TIMEOUT if UdidConfig.WAIT_TIMEOUT is not None else UdidConfig.WAIT_TIMEOUT_AUTOMATIC
 # Si querés habilitar un polling de respaldo (además del evento push)
-UDID_ENABLE_POLLING = os.getenv("UDID_ENABLE_POLLING", "0") == "1"
-UDID_POLL_INTERVAL = int(os.getenv("UDID_POLL_INTERVAL", "2"))
+UDID_ENABLE_POLLING = UdidConfig.ENABLE_POLLING
+UDID_POLL_INTERVAL = UdidConfig.POLL_INTERVAL
 
 # Configuración para pruebas de carga (aumentar límites temporalmente)
-UDID_EXPIRATION_MINUTES = int(os.getenv("UDID_EXPIRATION_MINUTES", "5"))  # Default: 15 min, para pruebas: 60 min
-UDID_MAX_ATTEMPTS = int(os.getenv("UDID_MAX_ATTEMPTS", "5"))  # Default: 5 intentos, para pruebas: 10 intentos
+UDID_EXPIRATION_MINUTES = UdidConfig.EXPIRATION_MINUTES  # Default: 15 min, para pruebas: 60 min
+UDID_MAX_ATTEMPTS = UdidConfig.MAX_ATTEMPTS  # Default: 5 intentos, para pruebas: 10 intentos
 
 # Configuración del semáforo global de concurrencia
 # Configuración estándar: 1000 slots simultáneos
 # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 3000 slots
 # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 5000 slots
 # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 10000 slots
-GLOBAL_SEMAPHORE_SLOTS = int(os.getenv("GLOBAL_SEMAPHORE_SLOTS", "1000"))  # Máximo de slots simultáneos
+GLOBAL_SEMAPHORE_SLOTS = UdidConfig.GLOBAL_SEMAPHORE_SLOTS  # Máximo de slots simultáneos
 
 # Límites de WebSocket reducidos para reducir carga del servidor
-UDID_WS_MAX_PER_TOKEN = int(os.getenv("UDID_WS_MAX_PER_TOKEN", "1"))  # Reducido de 3 a 1 conexiones por dispositivo/UDID
+UDID_WS_MAX_PER_TOKEN = UdidConfig.WS_MAX_PER_TOKEN  # Reducido de 3 a 1 conexiones por dispositivo/UDID
 
 # Circuit breaker para Redis
 # Aumentado threshold a 10 para ser menos sensible durante picos de carga
-REDIS_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("REDIS_CIRCUIT_BREAKER_THRESHOLD", "10"))  # Fallos consecutivos
-REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "30"))  # Segundos (reducido para recuperación más rápida)
+REDIS_CIRCUIT_BREAKER_THRESHOLD = RedisConfig.REDIS_CIRCUIT_BREAKER_THRESHOLD  # Fallos consecutivos
+REDIS_CIRCUIT_BREAKER_TIMEOUT = RedisConfig.REDIS_CIRCUIT_BREAKER_TIMEOUT  # Segundos (reducido para recuperación más rápida)
 
 
 # ============================================================================
@@ -250,14 +253,14 @@ REDIS_CIRCUIT_BREAKER_TIMEOUT = int(os.getenv("REDIS_CIRCUIT_BREAKER_TIMEOUT", "
 # Configuración optimizada para 32GB RAM / 32 cores / 3000 requests: 5000 requests
 # Configuración optimizada para 64GB RAM / 32 cores / 5000-7000 requests: 10000 requests
 # Configuración optimizada para 124GB RAM / 64 cores / 10000-15000 requests: 20000 requests
-REQUEST_QUEUE_MAX_SIZE = int(os.getenv("REQUEST_QUEUE_MAX_SIZE", "1000"))
-REQUEST_QUEUE_MAX_WAIT_TIME = int(os.getenv("REQUEST_QUEUE_MAX_WAIT_TIME", "10"))  # Segundos
+REQUEST_QUEUE_MAX_SIZE = BackpressureConfig.REQUEST_QUEUE_MAX_SIZE
+REQUEST_QUEUE_MAX_WAIT_TIME = BackpressureConfig.REQUEST_QUEUE_MAX_WAIT_TIME  # Segundos
 
 # Configuración de degradación elegante
-DEGRADATION_BASELINE_LOAD = int(os.getenv("DEGRADATION_BASELINE_LOAD", "100"))  # Carga base (concurrentes)
-DEGRADATION_MEDIUM_THRESHOLD = float(os.getenv("DEGRADATION_MEDIUM_THRESHOLD", "1.5"))  # 1.5x carga base
-DEGRADATION_HIGH_THRESHOLD = float(os.getenv("DEGRADATION_HIGH_THRESHOLD", "2.0"))  # 2.0x carga base
-DEGRADATION_CRITICAL_THRESHOLD = float(os.getenv("DEGRADATION_CRITICAL_THRESHOLD", "3.0"))  # 3.0x carga base
+DEGRADATION_BASELINE_LOAD = BackpressureConfig.DEGRADATION_BASELINE_LOAD  # Carga base (concurrentes)
+DEGRADATION_MEDIUM_THRESHOLD = BackpressureConfig.DEGRADATION_MEDIUM_THRESHOLD  # 1.5x carga base
+DEGRADATION_HIGH_THRESHOLD = BackpressureConfig.DEGRADATION_HIGH_THRESHOLD  # 2.0x carga base
+DEGRADATION_CRITICAL_THRESHOLD = BackpressureConfig.DEGRADATION_CRITICAL_THRESHOLD  # 3.0x carga base
 
 
 
@@ -338,8 +341,8 @@ DATABASES = {
         'NAME': 'udid',
         'USER': 'root',
         'PASSWORD': '',
-        'HOST': os.getenv("MYSQL_HOST", "127.0.0.1"),  # cambia a "db" si usas docker-compose
-        'PORT': os.getenv("MYSQL_PORT", "3307"),
+        'HOST': DatabaseConfig.MYSQL_HOST,  # cambia a "db" si usas docker-compose
+        'PORT': DatabaseConfig.MYSQL_PORT,
         'OPTIONS': {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
@@ -384,11 +387,7 @@ CORS_ALLOW_CREDENTIALS = True
 
 # DjangoConfig.CORS_ORIGIN_WHITELIST
 # Usar la configuración de DjangoConfig que viene de CORS_ALLOWED_ORIGINS en .env
-# Si CORS_ORIGIN_WHITELIST está en .env, se usa esa, sino se usa DjangoConfig.CORS_ORIGIN_WHITELIST
-_cors_whitelist_env = os.getenv("CORS_ORIGIN_WHITELIST")
-if _cors_whitelist_env:
-    CORS_ORIGIN_WHITELIST = [origin.strip() for origin in _cors_whitelist_env.split(",") if origin.strip()]
-elif DjangoConfig.CORS_ORIGIN_WHITELIST:
+if DjangoConfig.CORS_ORIGIN_WHITELIST:
     # Usar la configuración de DjangoConfig (viene de CORS_ALLOWED_ORIGINS en .env)
     CORS_ORIGIN_WHITELIST = DjangoConfig.CORS_ORIGIN_WHITELIST
 else:
@@ -438,9 +437,8 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Configuración específica para APIs móviles
 # Si CSRF_TRUSTED_ORIGINS está en .env, se usa esa, sino se usa la lista por defecto
-_csrf_trusted_env = os.getenv("CSRF_TRUSTED_ORIGINS")
-if _csrf_trusted_env:
-    CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_trusted_env.split(",") if origin.strip()]
+if DjangoConfig.CSRF_TRUSTED_ORIGINS:
+    CSRF_TRUSTED_ORIGINS = DjangoConfig.CSRF_TRUSTED_ORIGINS
 else:
     # Lista por defecto si no está en .env
     CSRF_TRUSTED_ORIGINS = [
@@ -488,7 +486,7 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': int(os.getenv("REST_FRAMEWORK_PAGE_SIZE", "100")),
+    'PAGE_SIZE': DjangoConfig.REST_FRAMEWORK_PAGE_SIZE,
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -497,10 +495,10 @@ REST_FRAMEWORK = {
 
 #* Configuración de JWT
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv("JWT_ACCESS_TOKEN_LIFETIME_MINUTES", "15"))),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv("JWT_REFRESH_TOKEN_LIFETIME_DAYS", "1"))),
-    'ROTATE_REFRESH_TOKENS': os.getenv("JWT_ROTATE_REFRESH_TOKENS", "True").lower() == "true",
-    'BLACKLIST_AFTER_ROTATION': os.getenv("JWT_BLACKLIST_AFTER_ROTATION", "True").lower() == "true",
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=DjangoConfig.JWT_ACCESS_TOKEN_LIFETIME_MINUTES),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=DjangoConfig.JWT_REFRESH_TOKEN_LIFETIME_DAYS),
+    'ROTATE_REFRESH_TOKENS': DjangoConfig.JWT_ROTATE_REFRESH_TOKENS,
+    'BLACKLIST_AFTER_ROTATION': DjangoConfig.JWT_BLACKLIST_AFTER_ROTATION,
 }
 
 # ============================================================================
@@ -627,8 +625,8 @@ CELERY_TASK_EAGER_PROPAGATES = True  # Propagar excepciones en modo eager
 # Configuración optimizada para 32GB RAM / 32 cores: prefetch_multiplier = 8
 # Configuración optimizada para 64GB RAM / 32 cores: prefetch_multiplier = 10
 # Configuración optimizada para 124GB RAM / 64 cores: prefetch_multiplier = 16
-CELERY_WORKER_PREFETCH_MULTIPLIER = int(os.getenv("CELERY_WORKER_PREFETCH_MULTIPLIER", str(CeleryConfig.WORKER_PREFETCH_MULTIPLIER)))
-CELERY_WORKER_MAX_TASKS_PER_CHILD = CeleryConfig.WORKER_MAX_TASKS_PER_CHILD
+CELERY_WORKER_PREFETCH_MULTIPLIER = CeleryConfig.WORKER_PREFETCH_MULTIPLIER
+CELERY_WORKER_MAX_TASKS_PER_CHILD = int(CeleryConfig.WORKER_MAX_TASKS_PER_CHILD)
 CELERY_WORKER_DISABLE_RATE_LIMITS = CeleryConfig.WORKER_DISABLE_RATE_LIMITS
 CELERY_WORKER_SEND_TASK_EVENTS = True  # Enviar eventos de tareas (necesario para Flower)
 CELERY_WORKER_DIRECT = False  # Usar AMQP direct (False para Redis)
@@ -639,7 +637,7 @@ CELERY_WORKER_DIRECT = False  # Usar AMQP direct (False para Redis)
 # Configuración optimizada para 64GB RAM / 32 cores: 16-24 workers
 # Configuración optimizada para 124GB RAM / 64 cores: 32-48 workers
 # Nota: Esto se configura al iniciar el worker con: celery -A ubuntu worker --concurrency=N
-CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", "0"))  # 0 = auto
+CELERY_WORKER_CONCURRENCY = int(CeleryConfig.WORKER_CONCURRENCY)
 
 # Configuración de reintentos
 CELERY_TASK_DEFAULT_RETRY_DELAY = CeleryConfig.TASK_DEFAULT_RETRY_DELAY
@@ -653,7 +651,7 @@ CELERY_TASK_DEFAULT_ROUTING_KEY = CeleryConfig.TASK_DEFAULT_ROUTING_KEY
 # Configuración de beat (tareas periódicas)
 # Ruta completa para el archivo de schedule de Beat (se guarda en /var/run/udid/)
 CELERY_BEAT_SCHEDULE_FILENAME = os.path.join(
-    os.getenv("CELERY_BEAT_SCHEDULE_DIR", "/var/run/udid"),
+    CeleryConfig.BEAT_SCHEDULE_DIR,
     CeleryConfig.BEAT_SCHEDULE_FILENAME
 )
 
@@ -725,8 +723,8 @@ if REDIS_URL:
                 'LOCATION': REDIS_URL,
                 'OPTIONS': {
                     'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
-                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
+                    'SOCKET_CONNECT_TIMEOUT': CacheConfig.SOCKET_CONNECT_TIMEOUT,
+                    'SOCKET_TIMEOUT': CacheConfig.SOCKET_TIMEOUT,
                     'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
                     # Configuración de pool de conexiones para cache
@@ -735,12 +733,12 @@ if REDIS_URL:
                     # Configuración optimizada para 64GB RAM / 32 cores: max_connections = 100
                     # Configuración optimizada para 124GB RAM / 64 cores: max_connections = 150
                     'CONNECTION_POOL_KWARGS': {
-                        'max_connections': int(os.getenv("CACHE_MAX_CONNECTIONS", "50")),
+                        'max_connections': CacheConfig.MAX_CONNECTIONS,
                         'retry_on_timeout': True,
                     },
                 },
-                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
-                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
+                'KEY_PREFIX': CacheConfig.KEY_PREFIX,
+                'TIMEOUT': CacheConfig.TIMEOUT,  # 5 minutos por defecto
             }
         }
     except ImportError:
@@ -750,8 +748,8 @@ if REDIS_URL:
                 'BACKEND': 'django.core.cache.backends.redis.RedisCache',
                 'LOCATION': REDIS_URL,
                 'OPTIONS': {
-                    'SOCKET_CONNECT_TIMEOUT': int(os.getenv("CACHE_SOCKET_CONNECT_TIMEOUT", "5")),
-                    'SOCKET_TIMEOUT': int(os.getenv("CACHE_SOCKET_TIMEOUT", "5")),
+                    'SOCKET_CONNECT_TIMEOUT': CacheConfig.SOCKET_CONNECT_TIMEOUT,
+                    'SOCKET_TIMEOUT': CacheConfig.SOCKET_TIMEOUT,
                     'IGNORE_EXCEPTIONS': True,  # Continuar si Redis falla (fallback a BD)
                     # Configuración de pool de conexiones para cache
                     # Configuración estándar: pool por defecto
@@ -759,12 +757,12 @@ if REDIS_URL:
                     # Configuración optimizada para 64GB RAM / 32 cores: max_connections = 100
                     # Configuración optimizada para 124GB RAM / 64 cores: max_connections = 150
                     'CONNECTION_POOL_KWARGS': {
-                        'max_connections': int(os.getenv("CACHE_MAX_CONNECTIONS", "50")),
+                        'max_connections': CacheConfig.MAX_CONNECTIONS,
                         'retry_on_timeout': True,
                     },
                 },
-                'KEY_PREFIX': os.getenv("CACHE_KEY_PREFIX", "udid_cache"),
-                'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),  # 5 minutos por defecto
+                'KEY_PREFIX': CacheConfig.KEY_PREFIX,
+                'TIMEOUT': CacheConfig.TIMEOUT,  # 5 minutos por defecto
             }
         }
 else:
@@ -775,7 +773,7 @@ else:
         'default': {
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
             'LOCATION': 'unique-snowflake',
-            'TIMEOUT': int(os.getenv("CACHE_TIMEOUT", "300")),
+            'TIMEOUT': CacheConfig.TIMEOUT,
             'OPTIONS': {
                 'MAX_ENTRIES': 1000,
                 'CULL_FREQUENCY': 3,
