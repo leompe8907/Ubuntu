@@ -1792,21 +1792,39 @@ sudo journalctl -u udid@0 -f
 
 ### 📋 Información sobre las Tareas de Celery
 
-El proyecto usa **Celery** para ejecutar tareas en background de forma asíncrona y escalable. **Las tareas se ejecutan automáticamente según su periodicidad configurada**, y también puedes ejecutarlas manualmente cuando lo necesites.
+El proyecto usa **Celery** para ejecutar tareas periódicas en background de forma asíncrona y escalable. **Las tareas periódicas se ejecutan automáticamente según su periodicidad configurada**, y también puedes ejecutarlas manualmente cuando lo necesites.
+
+### 🔄 Flujo Completo de Configuración (Resumen)
+
+**Orden de ejecución obligatorio:**
+
+1. **PASO 1**: Crear y configurar el script `ejecutar_sync_tasks.py` (sección 12.6.1)
+2. **PASO 2**: Ejecutar `execute_sync_tasks()` UNA SOLA VEZ con el script de cron (sección 12.6.2)
+   - Esta sincronización descarga TODA la información inicial desde Panaccess
+   - Se ejecuta de forma síncrona (puedes ver el progreso)
+   - El script verifica si ya se ejecutó para evitar duplicados
+3. **PASO 3**: Iniciar Celery Worker (sección 12.5, Paso 2)
+   - Necesario para ejecutar las tareas periódicas de Celery
+4. **PASO 4**: Activar Celery Beat (sección 12.5, Paso 3 y 12.7)
+   - Solo después de que `execute_sync_tasks()` se haya completado exitosamente
+   - Beat ejecutará las tareas periódicas automáticamente
+
+**⚠️ IMPORTANTE**: NO activar Celery Beat hasta que `execute_sync_tasks()` se haya completado. Las tareas periódicas necesitan datos base en la BD.
 
 **Tareas configuradas:**
 
-| Tarea                                | Periodicidad                     | Propósito                                  | Prioridad |
-|--------------------------------------|----------------------------------|--------------------------------------------|-----------|
-| `sync_all_data_automatic`            | **MANUAL - UNA VEZ** (al iniciar) | **OBLIGATORIA**: Sincronización inicial completa. Debe ejecutarse PRIMERO antes de activar las demás tareas | 🔴 CRÍTICA |
-| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Verifica y descarga nuevas smartcards desde Panaccess | 🟡 Automática |
-| `check_and_sync_subscribers_periodic`| Cada 5 minutos                   | Detecta nuevos suscriptores, descarga credenciales y actualiza smartcards | 🟡 Automática |
-| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 (10:00 PM)  | Valida y corrige todos los registros existentes comparándolos con Panaccess | 🟡 Automática |
+| Tarea                                | Periodicidad                     | Propósito                                  | Prioridad | Método |
+|--------------------------------------|----------------------------------|--------------------------------------------|-----------|--------|
+| `execute_sync_tasks()` (cron.py)     | **MANUAL - UNA VEZ** (al iniciar) | **OBLIGATORIA**: Sincronización inicial completa. Se ejecuta con script de cron ANTES de activar Celery Beat | 🔴 CRÍTICA | Cron script |
+| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Verifica y descarga nuevas smartcards desde Panaccess | 🟡 Automática | Celery Beat |
+| `check_and_sync_subscribers_periodic`| Cada 5 minutos                   | Detecta nuevos suscriptores, descarga credenciales y actualiza smartcards | 🟡 Automática | Celery Beat |
+| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 (10:00 PM)  | Valida y corrige todos los registros existentes comparándolos con Panaccess | 🟡 Automática | Celery Beat |
 
 **⚠️ IMPORTANTE - Orden de Ejecución:**
-1. **PRIMERO**: Ejecutar `sync_all_data_automatic` manualmente UNA VEZ cuando se despliega el sistema por primera vez
-2. **DESPUÉS**: Activar Celery Beat para que las demás tareas se ejecuten automáticamente según su periodicidad
-3. Las tareas automáticas dependen de que `sync_all_data_automatic` se haya ejecutado primero para tener datos base
+1. **PRIMERO**: Ejecutar `execute_sync_tasks()` usando el script de cron (`ejecutar_sync_tasks.py`) UNA VEZ cuando se despliega el sistema por primera vez
+2. **SEGUNDO**: Iniciar Celery Worker (necesario para las tareas periódicas)
+3. **TERCERO**: Activar Celery Beat para que las tareas periódicas se ejecuten automáticamente según su periodicidad
+4. Las tareas automáticas de Celery dependen de que `execute_sync_tasks()` se haya ejecutado primero para tener datos base
 
 **Componentes de Celery:**
 - **Celery Worker**: Ejecuta las tareas en background (SIEMPRE debe estar activo)
@@ -1814,9 +1832,10 @@ El proyecto usa **Celery** para ejecutar tareas en background de forma asíncron
 - **Flower** (opcional): Interfaz web para monitorear tareas
 
 **¿Cómo funciona?**
-- **Tareas automáticas**: Celery Beat programa y ejecuta las tareas según su periodicidad configurada
-- **Tareas manuales**: Puedes ejecutar cualquier tarea manualmente cuando lo necesites
-- Las tareas se envían a Redis (broker)
+- **Sincronización inicial**: Se ejecuta con script de cron (`ejecutar_sync_tasks.py`) que llama a `execute_sync_tasks()` de `cron.py` - UNA SOLA VEZ
+- **Tareas automáticas**: Celery Beat programa y ejecuta las tareas periódicas según su periodicidad configurada
+- **Tareas manuales**: Puedes ejecutar cualquier tarea de Celery manualmente cuando lo necesites
+- Las tareas de Celery se envían a Redis (broker)
 - Celery Worker toma las tareas de Redis y las ejecuta
 - Los resultados se almacenan en Redis (backend)
 - **Mecanismo de lock**: Las tareas tienen un sistema de bloqueo para evitar ejecuciones simultáneas
@@ -1968,8 +1987,8 @@ sudo chown udid:udid /var/log/udid
 
 **⚠️ IMPORTANTE - Orden de Configuración:**
 
-1. **PRIMERO**: Iniciar solo el Worker para ejecutar la tarea inicial obligatoria
-2. **SEGUNDO**: Ejecutar `sync_all_data_automatic` manualmente (ver sección 12.6)
+1. **PRIMERO**: Ejecutar `execute_sync_tasks()` con script de cron (ver sección 12.6) - UNA SOLA VEZ
+2. **SEGUNDO**: Iniciar Celery Worker (necesario para las tareas periódicas)
 3. **TERCERO**: Después de completar la sincronización inicial, iniciar Beat para tareas automáticas
 
 ```bash
@@ -1977,9 +1996,17 @@ sudo chown udid:udid /var/log/udid
 sudo systemctl daemon-reload
 
 # ========================================================================
-# PASO 1: Iniciar SOLO el Worker (para ejecutar tarea inicial)
+# PASO 1: Ejecutar execute_sync_tasks() con script de cron (ver sección 12.6)
 # ========================================================================
-# Iniciar Worker (necesario para ejecutar tareas)
+# 🔴 CRÍTICO: Ejecutar la sincronización inicial ANTES de activar Celery
+# Ir a la sección 12.6 para ejecutar execute_sync_tasks() con el script de cron
+# Esta sincronización descarga TODA la información inicial desde Panaccess
+# IMPORTANTE: Esta tarea se ejecuta UNA SOLA VEZ, no periódicamente
+
+# ========================================================================
+# PASO 2: Iniciar Celery Worker (para tareas periódicas)
+# ========================================================================
+# Iniciar Worker (necesario para ejecutar tareas periódicas de Celery)
 sudo systemctl start celery-worker
 
 # Habilitar inicio automático del Worker
@@ -1990,16 +2017,10 @@ sudo systemctl status celery-worker
 # Debe mostrar: "active (running)"
 
 # ========================================================================
-# PASO 2: Ejecutar sync_all_data_automatic (ver sección 12.6)
+# PASO 3: Después de completar execute_sync_tasks(), activar Beat
 # ========================================================================
-# 🔴 CRÍTICO: Ejecutar la tarea inicial ANTES de activar Beat
-# Ir a la sección 12.6 para ejecutar sync_all_data_automatic
-# Esta tarea descarga TODA la información inicial desde Panaccess
-
-# ========================================================================
-# PASO 3: Después de completar sync_all_data_automatic, activar Beat
-# ========================================================================
-# Iniciar Beat (solo después de ejecutar sync_all_data_automatic)
+# Iniciar Beat (solo después de ejecutar execute_sync_tasks())
+# Beat ejecutará las tareas periódicas automáticamente
 sudo systemctl start celery-beat
 
 # Habilitar inicio automático de Beat
@@ -2031,37 +2052,90 @@ CELERY_BEAT_SCHEDULE = {
 }
 ```
 
-**⚠️ IMPORTANTE:** `sync_all_data_automatic` NO está en el schedule porque:
-- Debe ejecutarse MANUALMENTE UNA VEZ al desplegar el sistema por primera vez
-- Es OBLIGATORIA ejecutarla ANTES de activar Beat
-- Las demás tareas automáticas dependen de que esta tarea se haya ejecutado primero
-- Si activas Beat sin ejecutar `sync_all_data_automatic`, las tareas automáticas no tendrán datos base con los que trabajar
+**⚠️ IMPORTANTE:** `execute_sync_tasks()` NO está en el schedule de Celery porque:
+- Se ejecuta con un script de cron (`ejecutar_sync_tasks.py`) UNA SOLA VEZ
+- Es OBLIGATORIA ejecutarla ANTES de activar Celery Beat
+- Las tareas automáticas de Celery dependen de que esta sincronización se haya ejecutado primero
+- Si activas Beat sin ejecutar `execute_sync_tasks()`, las tareas automáticas no tendrán datos base con los que trabajar
+- El script verifica si ya se ejecutó para evitar ejecuciones duplicadas
 
 **Mecanismo de Lock:**
 - Todas las tareas tienen un sistema de bloqueo para evitar ejecuciones simultáneas
 - Si una tarea está en ejecución, las demás esperarán hasta que termine
 - Esto previene conflictos y sobrecarga del sistema
 
-### 12.6 Ejecutar Tarea Inicial OBLIGATORIA: sync_all_data_automatic
+### 12.6 Ejecutar Sincronización Inicial OBLIGATORIA: execute_sync_tasks()
 
-> 🔴 **CRÍTICO**: Esta tarea DEBE ejecutarse PRIMERO antes de activar las tareas automáticas. Es la sincronización inicial completa que descarga todos los datos desde Panaccess.
+> 🔴 **CRÍTICO**: Esta sincronización DEBE ejecutarse PRIMERO antes de activar las tareas automáticas de Celery. Es la sincronización inicial completa que descarga todos los datos desde Panaccess.
 
 **¿Por qué es obligatoria?**
 - Descarga TODA la información inicial desde Panaccess (suscriptores, smartcards, credenciales)
-- Las demás tareas automáticas dependen de tener datos base en la BD
-- Sin esta tarea, las tareas automáticas no tendrán datos con los que trabajar
+- Las tareas automáticas de Celery dependen de tener datos base en la BD
+- Sin esta sincronización, las tareas automáticas no tendrán datos con los que trabajar
 
 **⚠️ IMPORTANTE:**
 - Ejecutar SOLO UNA VEZ cuando se despliega el sistema por primera vez
-- NO está en el schedule de Celery Beat porque debe ejecutarse manualmente
+- Se ejecuta con un script de cron (`ejecutar_sync_tasks.py`), NO con Celery
+- El script verifica si ya se ejecutó para evitar ejecuciones duplicadas
 - Después de ejecutarla, puedes activar Celery Beat para las tareas periódicas
 
-**Tareas automáticas (se ejecutan después de sync_all_data_automatic):**
+**Tareas automáticas de Celery (se ejecutan después de execute_sync_tasks()):**
 - `check_and_sync_smartcards_monthly`: Verifica y descarga nuevas smartcards (normalmente se ejecuta el día 28 de cada mes)
 - `check_and_sync_subscribers_periodic`: Detecta nuevos suscriptores y actualiza datos (normalmente cada 5 minutos)
 - `validate_and_sync_all_data_daily`: Valida y corrige todos los registros (normalmente cada día a las 22:00)
 
-#### Método 1: Ejecutar desde el Shell de Django (Recomendado)
+### 12.6.1 Crear Script para Ejecutar execute_sync_tasks()
+
+Primero, creamos el script que ejecutará `execute_sync_tasks()` desde cron:
+
+```bash
+# Crear el script
+sudo nano /opt/udid/ejecutar_sync_tasks.py
+```
+
+El script ya está incluido en el proyecto. Si necesitas crearlo manualmente, copia el contenido del archivo `ejecutar_sync_tasks.py` en la raíz del proyecto.
+
+```bash
+# Hacer ejecutable
+sudo chmod +x /opt/udid/ejecutar_sync_tasks.py
+sudo chown udid:udid /opt/udid/ejecutar_sync_tasks.py
+
+# Crear directorio de logs (si no existe)
+sudo mkdir -p /var/log/udid
+sudo chown udid:udid /var/log/udid
+```
+
+### 12.6.2 Ejecutar execute_sync_tasks() UNA SOLA VEZ
+
+#### Método 1: Ejecutar con Script de Cron (Recomendado)
+
+Este es el método recomendado porque:
+- Ejecuta la sincronización de forma síncrona (puedes ver el progreso)
+- Verifica si ya se ejecutó para evitar duplicados
+- Guarda información de la ejecución para referencia futura
+- No requiere Celery Worker activo
+
+```bash
+# Cambiar al usuario udid
+sudo su - udid
+cd /opt/udid
+
+# Activar entorno virtual
+source env/bin/activate
+
+# Ejecutar el script (verifica si ya se ejecutó)
+python ejecutar_sync_tasks.py
+
+# Si necesitas forzar ejecución aunque ya se haya ejecutado:
+# python ejecutar_sync_tasks.py --force
+
+# Verificar si ya se ejecutó (sin ejecutar):
+# python ejecutar_sync_tasks.py --check
+```
+
+El script mostrará el progreso en tiempo real y guardará la información en `/var/log/udid/sync_tasks_completed.json`.
+
+#### Método 2: Ejecutar desde el Shell de Django
 
 ```bash
 # Cambiar al usuario udid
@@ -2075,37 +2149,30 @@ source env/bin/activate
 python manage.py shell
 ```
 
-Dentro del shell de Python, ejecutar la tarea que necesites:
+Dentro del shell de Python:
 
 ```python
-# Importar las tareas disponibles
-from udid.tasks import (sync_all_data_automatic,check_and_sync_smartcards_monthly,check_and_sync_subscribers_periodic,validate_and_sync_all_data_daily)
+# Importar la función de cron.py
+from udid.cron import execute_sync_tasks
 
-# Ejecutar la tarea que quieras (ejemplo: sincronización inicial)
-task = sync_all_data_automatic.delay()
+# Ejecutar la sincronización (se ejecuta de forma síncrona)
+result = execute_sync_tasks()
 
-# Ver el ID de la tarea
-print(f"Task ID: {task.id}")
-print(f"Estado: {task.state}")
+# Ver el resultado
+print(f"Éxito: {result['success']}")
+print(f"Mensaje: {result['message']}")
+print(f"Session ID: {result.get('session_id')}")
 
-# IMPORTANTE: La tarea se ejecuta en background
-# Puedes salir del shell y la tarea continuará ejecutándose
-# Para verificar el progreso, usar Flower o los logs
-
-# ⚠️ IMPORTANTE: Ejecutar sync_all_data_automatic PRIMERO
-# Las demás tareas automáticas se ejecutarán después según su periodicidad
-# cuando actives Celery Beat (ver sección 12.5, Paso 3)
-
-# Ejemplos de otras tareas (solo después de ejecutar sync_all_data_automatic):
-# task = check_and_sync_smartcards_monthly.delay()
-# task = check_and_sync_subscribers_periodic.delay()
-# task = validate_and_sync_all_data_daily.delay()
+# Ver detalles por tarea
+for task_name, task_result in result['tasks'].items():
+    status = "✅" if task_result['success'] else "❌"
+    print(f"{status} {task_name}: {task_result['message']}")
 
 # Salir del shell
 exit()
 ```
 
-#### Método 2: Ejecutar desde la Línea de Comandos
+#### Método 3: Ejecutar desde la Línea de Comandos
 
 ```bash
 # Cambiar al usuario udid
@@ -2115,74 +2182,36 @@ cd /opt/udid
 # Activar entorno virtual
 source env/bin/activate
 
-# Ejecutar la tarea directamente desde Python
+# Ejecutar directamente
 python -c "
-from udid.tasks import sync_all_data_automatic
-task = sync_all_data_automatic.delay()
-print(f'Task ID: {task.id}')
-print('Tarea iniciada. Verifica el progreso con:')
-print('  - Flower: http://IP_DEL_SERVIDOR:5555')
-print('  - Logs: tail -f /var/log/udid/celery-worker.log')
+from udid.cron import execute_sync_tasks
+result = execute_sync_tasks()
+print(f'Éxito: {result[\"success\"]}')
+print(f'Mensaje: {result[\"message\"]}')
+for task_name, task_result in result['tasks'].items():
+    status = '✅' if task_result['success'] else '❌'
+    print(f'{status} {task_name}: {task_result[\"message\"]}')
 "
 ```
 
-#### Método 3: Ejecutar de Forma Síncrona (Solo para Pruebas)
+#### Verificar el Progreso de la Sincronización
 
-> ⚠️ **Nota:** Este método bloquea la terminal hasta que la tarea termine. Solo usar para pruebas o si necesitas ver el resultado inmediatamente.
+**Si usas el script de cron (Método 1):**
+- El script muestra el progreso en tiempo real en la terminal
+- Los logs se guardan automáticamente en `/var/log/udid/sync_tasks_completed.json`
+- Puedes ver los logs de Django en `/opt/udid/server.log`
 
-```bash
-# Cambiar al usuario udid
-sudo su - udid
-cd /opt/udid
-
-# Activar entorno virtual
-source env/bin/activate
-
-# Ejecutar de forma síncrona (bloquea hasta completar)
-python manage.py shell -c "
-from udid.tasks import sync_all_data_automatic
-result = sync_all_data_automatic()
-print('Resultado:', result)
-"
-```
-
-#### Verificar el Progreso de la Tarea
-
-**Opción 1: Usar Flower (Recomendado)**
+**Ver logs de la sincronización:**
 
 ```bash
-# Acceder a Flower en el navegador
-# http://IP_DEL_SERVIDOR:5555
-# Usuario/contraseña: admin/admin (o el configurado en .env)
+# Ver logs de Django (donde se registra el progreso)
+sudo tail -f /opt/udid/server.log | grep -E "\[SYNC\]|\[UPDATE_SUBSCRIBERS\]"
 
-# Buscar la tarea por ID o nombre: sync_all_data_automatic
-# Verás el estado: PENDING → STARTED → SUCCESS/FAILURE
-```
+# Ver información de ejecución guardada
+cat /var/log/udid/sync_tasks_completed.json | python -m json.tool
 
-**Opción 2: Ver Logs del Worker**
-
-```bash
-# Ver logs en tiempo real
-sudo tail -f /var/log/udid/celery-worker.log
-
-# O usando journalctl
-sudo journalctl -u celery-worker -f
-
-# Buscar mensajes específicos de la tarea
-grep "INITIAL_SYNC" /var/log/udid/celery-worker.log | tail -20
-```
-
-**Opción 3: Verificar desde la Línea de Comandos**
-
-```bash
-cd /opt/udid
-source env/bin/activate
-
-# Ver tareas activas
-celery -A ubuntu inspect active
-
-# Ver estadísticas
-celery -A ubuntu inspect stats
+# Verificar si ya se ejecutó
+python ejecutar_sync_tasks.py --check
 ```
 
 #### Verificar que la Sincronización se Completó
@@ -2192,6 +2221,9 @@ celery -A ubuntu inspect stats
 sudo su - udid
 cd /opt/udid
 source env/bin/activate
+
+# Verificar información de ejecución
+python ejecutar_sync_tasks.py --check
 
 # Verificar que hay datos en la base de datos
 python manage.py shell
@@ -2221,22 +2253,26 @@ exit()
 
 **Si los conteos son mayores a 0**, la sincronización inicial fue exitosa.
 
-#### Solución de Problemas
-
-**La tarea no inicia:**
+**Ver información detallada de la ejecución:**
 
 ```bash
-# Verificar que Celery Worker está corriendo
-sudo systemctl status celery-worker
-
-# Si no está corriendo, iniciarlo
-sudo systemctl start celery-worker
-
-# Ver logs de errores
-sudo journalctl -u celery-worker -n 50
+# Ver archivo JSON con información de ejecución
+cat /var/log/udid/sync_tasks_completed.json | python -m json.tool
 ```
 
-**La tarea falla con errores de autenticación:**
+#### Solución de Problemas
+
+**El script no ejecuta (ya se ejecutó antes):**
+
+```bash
+# Verificar si ya se ejecutó
+python ejecutar_sync_tasks.py --check
+
+# Si necesitas ejecutarla nuevamente (por ejemplo, después de limpiar la BD)
+python ejecutar_sync_tasks.py --force
+```
+
+**La sincronización falla con errores de autenticación:**
 
 ```bash
 # Verificar que las credenciales de Panaccess están correctas en .env
@@ -2244,51 +2280,93 @@ cat /opt/udid/.env | grep -E "(url_panaccess|username|password|api_token)"
 
 # Verificar que puedes conectarte a Panaccess
 # (revisar logs para ver el error específico)
+tail -f /opt/udid/server.log | grep -E "\[SYNC\]|ERROR"
 ```
 
-**La tarea tarda mucho tiempo:**
+**La sincronización tarda mucho tiempo:**
 - Esto es normal si hay muchos registros (10,000+ smartcards pueden tomar 8-9 horas)
-- Verificar el progreso en Flower o en los logs
-- No interrumpir la tarea, dejar que complete
+- El script muestra el progreso en tiempo real
+- No interrumpir la sincronización, dejar que complete
+- Puedes verificar el progreso en los logs: `tail -f /opt/udid/server.log | grep "\[SYNC\]"`
 
-**Verificar que la tarea se completó correctamente:**
-
-```bash
-# Buscar en los logs el mensaje de finalización
-grep "INITIAL_SYNC.*finalizada\|completada\|success" /var/log/udid/celery-worker.log | tail -5
-```
-
-### 12.7 (Opcional) Activar Tareas Automáticas con Celery Beat
-
-Si en el futuro quieres activar las tareas periódicas automáticas, puedes hacerlo así:
+**Verificar que la sincronización se completó correctamente:**
 
 ```bash
-# Iniciar Celery Beat
-sudo systemctl start celery-beat
+# Ver información de ejecución guardada
+cat /var/log/udid/sync_tasks_completed.json | python -m json.tool
 
-# Habilitar inicio automático (opcional)
-sudo systemctl enable celery-beat
+# Ver logs de Django
+grep "\[SYNC\].*finalizada\|completada\|success" /opt/udid/server.log | tail -5
 
-# Verificar que está corriendo
-sudo systemctl status celery-beat
-
-# Ver logs
-sudo journalctl -u celery-beat -f
+# Verificar estado
+python ejecutar_sync_tasks.py --check
 ```
 
-**Tareas periódicas configuradas:**
+**Error al crear el archivo de marcador:**
+
+```bash
+# Verificar permisos del directorio
+ls -la /var/log/udid/
+
+# Si no existe o no tiene permisos, crearlo
+sudo mkdir -p /var/log/udid
+sudo chown udid:udid /var/log/udid
+```
+
+### 12.7 Activar Tareas Automáticas con Celery Beat
+
+> ✅ **IMPORTANTE**: Después de ejecutar `execute_sync_tasks()` exitosamente, debes activar Celery Beat para que las tareas periódicas se ejecuten automáticamente.
+
+**Tareas periódicas que se ejecutarán automáticamente:**
 - `check_and_sync_subscribers_periodic`: Cada 5 minutos
 - `check_and_sync_smartcards_monthly`: Día 28 de cada mes a las 3:00 AM
 - `validate_and_sync_all_data_daily`: Cada día a las 22:00 (10:00 PM)
 
-**Para desactivar las tareas automáticas nuevamente:**
+**Activar Celery Beat (después de ejecutar execute_sync_tasks()):**
 
 ```bash
-# Detener Celery Beat
+# Verificar que execute_sync_tasks() se completó exitosamente
+python ejecutar_sync_tasks.py --check
+
+# Si la sincronización fue exitosa, activar Beat
+sudo systemctl start celery-beat
+
+# Habilitar inicio automático
+sudo systemctl enable celery-beat
+
+# Verificar que está corriendo
+sudo systemctl status celery-beat
+# Debe mostrar: "active (running)"
+
+# Ver logs en tiempo real
+sudo journalctl -u celery-beat -f
+```
+
+**Verificar que las tareas periódicas se están ejecutando:**
+
+```bash
+# Ver logs del Worker para ver tareas ejecutándose
+sudo tail -f /var/log/udid/celery-worker.log
+
+# Ver tareas programadas en Beat
+sudo journalctl -u celery-beat | grep "Scheduler: Sending"
+
+# Verificar estado de Beat
+sudo systemctl status celery-beat
+```
+
+**Para desactivar las tareas automáticas temporalmente:**
+
+```bash
+# Detener Celery Beat (las tareas periódicas dejarán de ejecutarse)
 sudo systemctl stop celery-beat
 
 # Deshabilitar inicio automático
 sudo systemctl disable celery-beat
+
+# Para reactivarlas más tarde:
+sudo systemctl start celery-beat
+sudo systemctl enable celery-beat
 ```
 
 ### 12.8 (Opcional) Configurar Flower para Monitoreo
@@ -2350,7 +2428,9 @@ sudo systemctl enable celery-flower
 
 ### 12.9 Configurar Crontab para Tareas de Mantenimiento
 
-Aunque Celery maneja las tareas principales, algunas tareas de mantenimiento se ejecutan con crontab:
+> ⚠️ **NOTA IMPORTANTE**: El script `ejecutar_sync_tasks.py` NO debe programarse en crontab para ejecución periódica. Se ejecuta UNA SOLA VEZ manualmente cuando se despliega el sistema. El script tiene protección para evitar ejecuciones duplicadas.
+
+Aunque Celery maneja las tareas principales de sincronización, algunas tareas de mantenimiento se ejecutan con crontab:
 
 ```bash
 # Editar crontab del usuario udid
@@ -2375,6 +2455,12 @@ Agregar las siguientes líneas:
 # Rotación de logs (semanal, domingos a las 4 AM)
 0 4 * * 0 /usr/sbin/logrotate /etc/logrotate.d/udid
 ```
+
+**⚠️ NO agregar `ejecutar_sync_tasks.py` aquí:**
+- El script `ejecutar_sync_tasks.py` se ejecuta UNA SOLA VEZ manualmente
+- Tiene protección para evitar ejecuciones duplicadas
+- Si lo programas en crontab, se ejecutará periódicamente y puede causar problemas
+- Para ejecutarlo, usa: `python ejecutar_sync_tasks.py` (manual)
 
 Guardar y salir.
 
@@ -2441,7 +2527,8 @@ tail -f /var/log/udid/celery-worker.log
 
 # Buscar ejecuciones de tareas específicas
 grep "check_and_sync_subscribers_periodic" /var/log/udid/celery-worker.log | tail -10
-grep "sync_all_data_automatic" /var/log/udid/celery-worker.log | tail -5
+grep "check_and_sync_smartcards_monthly" /var/log/udid/celery-worker.log | tail -5
+grep "validate_and_sync_all_data_daily" /var/log/udid/celery-worker.log | tail -5
 ```
 
 #### Método 3: Usar Flower (si está configurado)
@@ -2491,9 +2578,14 @@ python manage.py shell
 Dentro del shell de Python:
 
 ```python
-from udid.tasks import sync_all_data_automatic
+# Importar tareas de Celery (NO execute_sync_tasks, esa se ejecuta con el script de cron)
+from udid.tasks import (
+    check_and_sync_smartcards_monthly,
+    check_and_sync_subscribers_periodic,
+    validate_and_sync_all_data_daily
+)
 
-# Ejecutar tarea de forma asíncrona
+# Ejecutar tarea de forma asíncrona (ejemplo: verificación periódica de suscriptores)
 result = check_and_sync_subscribers_periodic.delay()
 
 # Ver el ID de la tarea
@@ -2511,17 +2603,23 @@ exit()
 
 ### 12.12 Tareas Disponibles y Cuándo Usarlas
 
-| Tarea                                | Periodicidad Automática | Cuándo Usarla Manualmente | Duración          |
-|--------------------------------------|-------------------------|----------------------------|-------------------|
-| `sync_all_data_automatic`            | Una vez al iniciar | Primera vez que despliegas el sistema o cuando la BD está vacía | Puede tomar horas |
-| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Cuando quieres verificar smartcards fuera del horario programado | Minutos/Horas |
-| `check_and_sync_subscribers_periodic`| Cada 5 minutos | Cuando quieres forzar una verificación inmediata | Segundos/Minutos  |
-| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 | Cuando quieres validar y corregir datos fuera del horario programado | Puede tomar horas |
+| Tarea                                | Periodicidad Automática | Cuándo Usarla Manualmente | Duración          | Método de Ejecución |
+|--------------------------------------|-------------------------|----------------------------|-------------------|---------------------|
+| `execute_sync_tasks()` (cron.py)     | **UNA VEZ** (manual) | Primera vez que despliegas el sistema o cuando la BD está vacía | Puede tomar horas | Script de cron (`ejecutar_sync_tasks.py`) |
+| `check_and_sync_smartcards_monthly`  | Día 28 de cada mes a las 3:00 AM | Cuando quieres verificar smartcards fuera del horario programado | Minutos/Horas | Celery (tarea periódica) |
+| `check_and_sync_subscribers_periodic`| Cada 5 minutos | Cuando quieres forzar una verificación inmediata | Segundos/Minutos  | Celery (tarea periódica) |
+| `validate_and_sync_all_data_daily`   | Cada día a las 22:00 | Cuando quieres validar y corregir datos fuera del horario programado | Puede tomar horas | Celery (tarea periódica) |
+
+**Flujo de ejecución:**
+1. **Primero**: Ejecutar `execute_sync_tasks()` con el script de cron (`ejecutar_sync_tasks.py`) - UNA SOLA VEZ
+2. **Después**: Activar Celery Beat para que las tareas periódicas se ejecuten automáticamente
+3. **Opcional**: Ejecutar tareas de Celery manualmente cuando lo necesites
 
 **Nota sobre ejecución simultánea:**
-- Las tareas tienen un mecanismo de lock para evitar ejecuciones simultáneas
+- Las tareas de Celery tienen un mecanismo de lock para evitar ejecuciones simultáneas
 - Si una tarea está en ejecución, las demás esperarán hasta que termine
 - Esto previene conflictos y sobrecarga del sistema
+- El script `ejecutar_sync_tasks.py` verifica si ya se ejecutó para evitar duplicados
 
 ### 12.13 Comandos Útiles de Celery
 
@@ -3962,14 +4060,16 @@ Antes de considerar el despliegue completo, verificar:
 - [ ] Certificado SSL configurado
 - [ ] Nginx configurado y funcionando
 - [ ] Servicios systemd de Daphne creados y habilitados
+- [ ] Script `ejecutar_sync_tasks.py` creado y configurado
+- [ ] `execute_sync_tasks()` ejecutado UNA VEZ con el script de cron (sincronización inicial)
 - [ ] Servicios systemd de Celery Worker creado y habilitado
-- [ ] Celery Beat creado pero NO habilitado (tareas manuales por defecto)
+- [ ] Celery Beat creado y habilitado (después de ejecutar execute_sync_tasks())
 - [ ] Flower configurado (opcional pero recomendado)
-- [ ] Tareas de mantenimiento en crontab configuradas
+- [ ] Tareas de mantenimiento en crontab configuradas (NO incluir ejecutar_sync_tasks.py)
 - [ ] Firewall configurado
 - [ ] Pruebas de API exitosas
 - [ ] Pruebas de WebSocket exitosas
-- [ ] Verificación de ejecución manual de tareas de Celery
+- [ ] Verificación de ejecución de tareas periódicas de Celery
 
 ---
 
