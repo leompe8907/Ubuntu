@@ -1889,7 +1889,7 @@ ExecStart=/opt/udid/env/bin/celery -A ubuntu worker \
     --loglevel=info \
     --logfile=/var/log/udid/celery-worker.log \
     --pidfile=/var/run/udid/celery-worker.pid \
-    --concurrency=${CELERY_WORKER_CONCURRENCY:-auto}
+    --concurrency=${CELERY_WORKER_CONCURRENCY}
 
 # Comando para detener
 ExecStop=/bin/kill -s TERM $MAINPID

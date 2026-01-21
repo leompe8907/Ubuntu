@@ -175,6 +175,30 @@ def fetch_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
                     logger.warning(f"⚠️ Error de BD en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
                     time.sleep(RETRY_DELAY * retry_count)
                     
+            except PanaccessAPIError as e:
+                # Manejar errores del servidor que pueden ser temporales
+                if hasattr(e, 'error_code') and e.error_code == 'unknown_error_serverside':
+                    retry_count += 1
+                    consecutive_errors += 1
+                    
+                    if retry_count >= MAX_RETRIES:
+                        logger.error(f"❌ Error del servidor después de {MAX_RETRIES} reintentos en offset {offset}")
+                        raise
+                    
+                    logger.warning(
+                        f"⚠️ Error del servidor en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}. "
+                        f"Reintentando después de {RETRY_DELAY * retry_count}s..."
+                    )
+                    # Resetear sesión por si acaso el problema es con la sesión del servidor
+                    panaccess = get_panaccess()
+                    panaccess.reset_session()
+                    panaccess.ensure_session()
+                    time.sleep(RETRY_DELAY * retry_count)
+                else:
+                    # Para otros errores de API, no reintentar
+                    logger.error(f"❌ Error de API no recuperable en offset {offset}: {str(e)}")
+                    raise
+                    
             except PanaccessException as e:
                 retry_count += 1
                 consecutive_errors += 1
@@ -377,6 +401,28 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
                     panaccess.reset_session()
                     panaccess.ensure_session()
                 time.sleep(RETRY_DELAY * retry_count)
+                
+            except PanaccessAPIError as e:
+                # Manejar errores del servidor que pueden ser temporales
+                if hasattr(e, 'error_code') and e.error_code == 'unknown_error_serverside':
+                    retry_count += 1
+                    if retry_count >= MAX_RETRIES:
+                        logger.error(f"❌ Error del servidor después de {MAX_RETRIES} reintentos: {str(e)}")
+                        raise
+                    
+                    logger.warning(
+                        f"⚠️ Error del servidor en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}. "
+                        f"Reintentando después de {RETRY_DELAY * retry_count}s..."
+                    )
+                    # Resetear sesión por si acaso el problema es con la sesión del servidor
+                    panaccess = get_panaccess()
+                    panaccess.reset_session()
+                    panaccess.ensure_session()
+                    time.sleep(RETRY_DELAY * retry_count)
+                else:
+                    # Para otros errores de API, no reintentar
+                    logger.error(f"❌ Error de API no recuperable: {str(e)}")
+                    raise
         
         if not batch_processed:
             logger.error(f"❌ No se pudo procesar el lote en offset {offset}")
@@ -539,7 +585,7 @@ def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TI
             'offset': offset,
             'limit': limit,
             'orderDir': 'ASC',
-            'orderBy': 'created'
+            'orderBy': 'code'
         }
         
         # Hacer la llamada con timeout configurable
@@ -552,14 +598,21 @@ def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TI
             return answer
         else:
             error_message = response.get('errorMessage', 'Error desconocido al obtener suscriptores')
+            error_code = response.get('errorCode', None)
             
             # Detectar errores de sesión
             if 'session' in error_message.lower() or 'logged' in error_message.lower():
                 logger.error(f"🔑 Error de sesión: {error_message}")
                 raise PanaccessSessionError(f"Sesión expirada o inválida: {error_message}")
             
-            logger.error(f"❌ Error en respuesta de PanAccess: {error_message}")
-            raise PanaccessAPIError(error_message)
+            # Detectar errores del servidor que pueden ser temporales
+            if error_code == 'unknown_error_serverside':
+                logger.warning(f"⚠️ Error del servidor de PanAccess (puede ser temporal): {error_message}")
+                # Crear excepción con el código de error para que pueda ser manejada específicamente
+                raise PanaccessAPIError(error_message, error_code=error_code)
+            
+            logger.error(f"❌ Error en respuesta de PanAccess: {error_message} (código: {error_code})")
+            raise PanaccessAPIError(error_message, error_code=error_code)
 
     except (PanaccessTimeoutError, PanaccessSessionError):
         # Re-lanzar excepciones específicas
