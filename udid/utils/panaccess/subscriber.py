@@ -539,7 +539,7 @@ def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TI
             'offset': offset,
             'limit': limit,
             'orderDir': 'ASC',
-            'orderBy': 'code'
+            'orderBy': 'created'
         }
         
         # Hacer la llamada con timeout configurable
