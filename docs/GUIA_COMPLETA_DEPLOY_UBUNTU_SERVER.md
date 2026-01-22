@@ -1403,6 +1403,11 @@ server {
     # ========================================================================
     # Configuración SSL (se configurará en la siguiente sección)
     # ========================================================================
+    # ⚠️ IMPORTANTE: Si aún no has creado los certificados SSL (Sección 10),
+    # comenta temporalmente estas dos líneas para evitar errores al recargar Nginx:
+    # ssl_certificate /etc/nginx/ssl/udid.crt;
+    # ssl_certificate_key /etc/nginx/ssl/udid.key;
+    # Después de crear los certificados, descomenta estas líneas.
     ssl_certificate /etc/nginx/ssl/udid.crt;
     ssl_certificate_key /etc/nginx/ssl/udid.key;
     
@@ -1512,6 +1517,21 @@ Guardar y salir.
 
 ### 9.3 Habilitar el Sitio
 
+> ⚠️ **CRÍTICO - LEE ANTES DE CONTINUAR:**
+> 
+> La configuración de Nginx incluye referencias a certificados SSL (`/etc/nginx/ssl/udid.crt` y `/etc/nginx/ssl/udid.key`).
+> 
+> **Tienes DOS opciones:**
+> 
+> 1. **Opción A (Recomendada):** Crear los certificados SSL primero (ir a la Sección 10) y luego volver aquí para habilitar el sitio.
+> 2. **Opción B (Temporal):** Si quieres probar sin SSL primero, comenta temporalmente las líneas SSL en `/etc/nginx/sites-available/udid`:
+>    ```nginx
+>    # ssl_certificate /etc/nginx/ssl/udid.crt;
+>    # ssl_certificate_key /etc/nginx/ssl/udid.key;
+>    ```
+>    Y también cambia `listen 443 ssl http2;` por `listen 80;` (HTTP sin SSL).
+>    Después de crear los certificados, descomenta y vuelve a `listen 443 ssl http2;`.
+
 ```bash
 # Crear enlace simbólico para habilitar el sitio
 sudo ln -s /etc/nginx/sites-available/udid /etc/nginx/sites-enabled/
@@ -1523,20 +1543,26 @@ sudo rm /etc/nginx/sites-enabled/default
 sudo nginx -t
 
 # Debería mostrar: syntax is ok / test is successful
+# Si muestra error sobre certificados SSL, ve a la Sección 10 para crearlos primero
 
 # ⚠️ IMPORTANTE: Recargar Nginx para que cargue la nueva configuración
 # Sin este paso, Nginx seguirá usando la configuración anterior en memoria
+# Si obtienes error "cannot load certificate", significa que los certificados no existen
+# Ve a la Sección 10 para crearlos primero
 sudo systemctl reload nginx
 # O si prefieres reiniciar completamente:
 # sudo systemctl restart nginx
 
 # Verificar que Nginx está corriendo correctamente
 sudo systemctl status nginx
+# Si ves errores sobre certificados SSL, ve a la Sección 10
 ```
 
 ---
 
 ## 10. Configuración de SSL/HTTPS
+
+> ⚠️ **IMPORTANTE:** Si ya habilitaste el sitio de Nginx (Sección 9.3) y obtuviste un error sobre certificados SSL, esta es la sección que necesitas. Crea los certificados aquí y luego vuelve a recargar Nginx con `sudo systemctl reload nginx`.
 
 ### 10.1 Opción A: Certificado Autofirmado (Para IP sin dominio)
 
@@ -1562,6 +1588,19 @@ sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 # Cambiar permisos
 sudo chmod 600 /etc/nginx/ssl/udid.key
 sudo chmod 644 /etc/nginx/ssl/udid.crt
+
+# Verificar que los archivos se crearon correctamente
+ls -la /etc/nginx/ssl/
+
+# Deberías ver:
+# -rw-r--r-- 1 root root ... udid.crt
+# -rw------- 1 root root ... udid.key
+
+# ⚠️ IMPORTANTE: Si ya habilitaste el sitio de Nginx (Sección 9.3),
+# ahora debes recargar Nginx para que cargue los certificados:
+sudo nginx -t  # Verificar configuración
+sudo systemctl reload nginx  # Recargar Nginx
+sudo systemctl status nginx  # Verificar que no hay errores
 ```
 
 ### 10.2 Opción B: Let's Encrypt (Cuando tengas un dominio)
@@ -2464,7 +2503,15 @@ Agregar las siguientes líneas:
 0 * * * * cd /opt/udid && /opt/udid/env/bin/python -c "from udid.models import UDIDAuthRequest; from django.utils import timezone; UDIDAuthRequest.objects.filter(status='pending', expires_at__lt=timezone.now()).update(status='expired')" >> /var/log/udid/cleanup.log 2>&1
 
 # Rotación de logs (semanal, domingos a las 4 AM)
+# Nota: El backup se hace automáticamente en el postrotate de logrotate
 0 4 * * 0 /usr/sbin/logrotate /etc/logrotate.d/udid
+
+# Backup automático de logs (diario a las 2 AM)
+# El script verifica tamaño y hace backup si es necesario
+0 2 * * * /opt/udid/backup_logs.sh auto >> /var/log/udid/backup_logs.log 2>&1
+
+# Limpieza de backups antiguos (semanal, domingos a las 3 AM)
+0 3 * * 0 /opt/udid/backup_logs.sh cleanup >> /var/log/udid/backup_logs.log 2>&1
 ```
 
 **⚠️ NO agregar `ejecutar_sync_tasks.py` aquí:**
@@ -2475,7 +2522,51 @@ Agregar las siguientes líneas:
 
 Guardar y salir.
 
-### 12.10 Configurar Rotación de Logs
+### 12.10 Configurar Sistema de Backup y Rotación de Logs
+
+El sistema incluye un script de backup automático que:
+- **Hace backup cuando los logs alcanzan 100MB** (configurable)
+- **Hace backup periódico** (diario a las 2 AM)
+- **Guarda backups en `/var/backups/udid/logs/`**
+- **Retiene backups por 30 días** (configurable)
+- **Comprime los backups** para ahorrar espacio
+
+#### 12.10.1 Instalar Script de Backup de Logs
+
+```bash
+# Copiar el script de backup al servidor
+sudo cp backup_logs.sh /opt/udid/backup_logs.sh
+
+# Hacer ejecutable
+sudo chmod +x /opt/udid/backup_logs.sh
+sudo chown udid:udid /opt/udid/backup_logs.sh
+
+# Crear directorio de backups
+sudo mkdir -p /var/backups/udid/logs
+sudo chown udid:udid /var/backups/udid/logs
+
+# Probar el script
+sudo -u udid /opt/udid/backup_logs.sh test
+```
+
+#### 12.10.2 Configurar Backup Automático en Crontab
+
+```bash
+# Editar crontab del usuario udid
+sudo crontab -u udid -e
+```
+
+Agregar las siguientes líneas:
+
+```bash
+# Backup automático de logs (diario a las 2 AM)
+0 2 * * * /opt/udid/backup_logs.sh auto >> /var/log/udid/backup_logs.log 2>&1
+
+# Limpieza de backups antiguos (semanal, domingos a las 3 AM)
+0 3 * * 0 /opt/udid/backup_logs.sh cleanup >> /var/log/udid/backup_logs.log 2>&1
+```
+
+#### 12.10.3 Configurar Rotación de Logs (logrotate)
 
 ```bash
 # Crear configuración de logrotate
@@ -2494,6 +2585,9 @@ Copiar el siguiente contenido:
     notifempty
     create 0640 udid udid
     postrotate
+        # Hacer backup antes de rotar
+        /opt/udid/backup_logs.sh force > /dev/null 2>&1 || true
+        # Recargar servicios
         systemctl reload celery-worker > /dev/null 2>&1 || true
         systemctl reload celery-beat > /dev/null 2>&1 || true
     endscript
@@ -2508,12 +2602,89 @@ Copiar el siguiente contenido:
     notifempty
     create 0640 udid udid
     postrotate
+        # Hacer backup antes de rotar
+        /opt/udid/backup_logs.sh force > /dev/null 2>&1 || true
+        # Reiniciar servicios Daphne
         /opt/udid/manage_services.sh restart > /dev/null 2>&1 || true
     endscript
 }
 ```
 
 Guardar y salir.
+
+#### 12.10.4 Comandos Útiles del Script de Backup
+
+```bash
+# Verificar tamaño de logs y hacer backup si es necesario
+sudo -u udid /opt/udid/backup_logs.sh auto
+
+# Forzar backup inmediato de todos los logs
+sudo -u udid /opt/udid/backup_logs.sh force
+
+# Ver estadísticas de backups
+sudo -u udid /opt/udid/backup_logs.sh stats
+
+# Limpiar backups antiguos manualmente
+sudo -u udid /opt/udid/backup_logs.sh cleanup
+
+# Modo de prueba (no hace backup real)
+sudo -u udid /opt/udid/backup_logs.sh test
+```
+
+#### 12.10.5 Configuración del Script de Backup
+
+Puedes personalizar el script editando las variables al inicio de `/opt/udid/backup_logs.sh`:
+
+```bash
+# Tamaño máximo antes de forzar backup (en MB)
+MAX_SIZE_MB=100
+
+# Retención de backups (días)
+RETENTION_DAYS=30
+
+# Directorio de backup
+BACKUP_BASE_DIR="/var/backups/udid/logs"
+```
+
+#### 12.10.6 Estructura de Backups
+
+Los backups se organizan así:
+
+```
+/var/backups/udid/logs/
+├── 20260122_020000/          # Backup del 22 de enero a las 2 AM
+│   ├── udid/
+│   │   ├── celery-worker.log.gz
+│   │   ├── celery-beat.log.gz
+│   │   └── celery-flower.log.gz
+│   ├── django/
+│   │   └── server.log.gz
+│   ├── nginx/
+│   │   ├── udid_access.log.gz
+│   │   └── udid_error.log.gz
+│   └── backup_info.txt       # Información del backup
+├── 20260123_020000/
+└── ...
+```
+
+#### 12.10.7 Verificar que el Backup Funciona
+
+```bash
+# Verificar que el script está instalado
+ls -la /opt/udid/backup_logs.sh
+
+# Probar el script
+sudo -u udid /opt/udid/backup_logs.sh test
+
+# Verificar que se creó el directorio de backup
+ls -la /var/backups/udid/logs/
+
+# Ver logs del script de backup
+tail -f /var/log/udid/backup_logs.log
+
+# Ver estadísticas
+sudo -u udid /opt/udid/backup_logs.sh stats
+```
 
 ### 12.11 Verificar que Celery está Funcionando
 
@@ -2947,6 +3118,8 @@ Uso:
 
 ### 14.4 Backup de Base de Datos
 
+> 📝 **Nota:** Para backup de logs, ver la sección 12.10 "Configurar Sistema de Backup y Rotación de Logs".
+
 ```bash
 # Crear script de backup
 sudo nano /opt/udid/backup_db.sh
@@ -2980,6 +3153,8 @@ sudo crontab -e
 # Agregar: 0 2 * * * /opt/udid/backup_db.sh >> /var/log/udid/backup.log 2>&1
 ```
 
+> 📝 **Nota:** El backup de logs se ejecuta automáticamente a las 2 AM (ver sección 12.10). Si quieres cambiar la hora del backup de base de datos para que no coincida, puedes usar otra hora (ej: 1 AM).
+
 ---
 
 ## 15. Solución de Problemas
@@ -3011,6 +3186,53 @@ sudo systemctl start redis-server
 # Verificar que está escuchando
 redis-cli ping
 ```
+
+#### Error: "cannot load certificate" en Nginx
+
+**Síntoma:**
+```
+nginx[XXXX]: [emerg] XXXX#XXXX: cannot load certificate "/etc/nginx/ssl/udid.crt": 
+BIO_new_file() failed (SSL: error:80000002:system library::No such file or directory
+```
+
+**Causa:** Nginx está configurado para usar certificados SSL que no existen aún.
+
+**Solución:**
+
+```bash
+# 1. Verificar si los certificados existen
+ls -la /etc/nginx/ssl/
+
+# 2. Si no existen, crearlos (ver Sección 10.1)
+sudo mkdir -p /etc/nginx/ssl
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/udid.key \
+    -out /etc/nginx/ssl/udid.crt
+
+# 3. Cambiar permisos
+sudo chmod 600 /etc/nginx/ssl/udid.key
+sudo chmod 644 /etc/nginx/ssl/udid.crt
+
+# 4. Verificar configuración de Nginx
+sudo nginx -t
+
+# 5. Recargar Nginx
+sudo systemctl reload nginx
+
+# 6. Verificar que no hay errores
+sudo systemctl status nginx
+```
+
+**Alternativa temporal (sin SSL):**
+
+Si quieres probar sin SSL primero, comenta temporalmente las líneas SSL en `/etc/nginx/sites-available/udid`:
+
+```nginx
+# ssl_certificate /etc/nginx/ssl/udid.crt;
+# ssl_certificate_key /etc/nginx/ssl/udid.key;
+```
+
+Y cambia `listen 443 ssl http2;` por `listen 80;`. Después de crear los certificados, descomenta y vuelve a `listen 443 ssl http2;`.
 
 #### Error 502 Bad Gateway en Nginx
 
@@ -4110,6 +4332,13 @@ sudo journalctl -u celery-beat -f           # Ver logs de Celery Beat
 sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
 sudo tail -f /var/log/udid/celery-worker.log  # Ver logs de Worker
 sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat
+
+# === BACKUP DE LOGS ===
+sudo -u udid /opt/udid/backup_logs.sh auto   # Backup automático (verifica tamaño)
+sudo -u udid /opt/udid/backup_logs.sh force  # Forzar backup inmediato
+sudo -u udid /opt/udid/backup_logs.sh stats  # Ver estadísticas de backups
+sudo -u udid /opt/udid/backup_logs.sh cleanup # Limpiar backups antiguos
+sudo -u udid /opt/udid/backup_logs.sh test   # Modo de prueba
 
 # === DJANGO ===
 cd /opt/udid && source env/bin/activate   # Activar entorno
