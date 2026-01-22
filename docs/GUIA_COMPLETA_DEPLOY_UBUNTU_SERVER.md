@@ -1095,7 +1095,7 @@ Guardar y salir: `Ctrl + X`, luego `Y`, luego `Enter`
 ```bash
 # Generar una clave secreta segura
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
 
 # Copiar el resultado y pegarlo en el archivo .env como SECRET_KEY
@@ -1273,7 +1273,7 @@ Guardar y salir.
 ### 8.2 Ejecutar Migraciones
 
 ```bash
-# Asegurarse de estar en el directorio correcto con el venv activado
+# Asegurarse de estar en el directorio correcto con el entorno virtual activado
 cd /opt/udid
 source env/bin/activate
 
@@ -2834,8 +2834,7 @@ check_service postgresql >> $LOG_FILE
 check_service redis-server >> $LOG_FILE
 check_service nginx >> $LOG_FILE
 check_service celery-worker >> $LOG_FILE
-# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
-# check_service celery-beat >> $LOG_FILE
+check_service celery-beat >> $LOG_FILE
 
 for i in 0 1 2 3; do
     check_service udid@$i >> $LOG_FILE
@@ -2862,49 +2861,88 @@ sudo -u udid crontab -e
 
 ### 14.3 Actualizar el Proyecto
 
-Cuando necesites actualizar el código:
+> ⚠️ **IMPORTANTE**: Después de actualizar el código con `git pull`, debes reiniciar los servicios que ejecutan código Python (Daphne, Celery Worker, Celery Beat) para que carguen el nuevo código. Los servicios del sistema (Nginx, Redis, PostgreSQL) NO necesitan reinicio.
+
+**Proceso completo de actualización:**
 
 ```bash
-# Cambiar al usuario udid
-sudo su - udid
+# 1. Actualizar código
 cd /opt/udid
-
-# Detener servicios
-exit  # Volver a root
-sudo /opt/udid/manage_services.sh stop
-
-# Cambiar al usuario udid nuevamente
-sudo su - udid
-cd /opt/udid
-
-# Si usas Git
 git pull origin main
+# O si actualizas manualmente, copiar archivos nuevos
 
-# Si actualizas manualmente, copiar archivos nuevos
+# 2. Activar entorno virtual
+source env/bin/activate
 
-# Activar entorno virtual
-source venv/bin/activate
-
-# Instalar nuevas dependencias (si las hay)
+# 3. Instalar nuevas dependencias (si las hay)
 pip install -r requirements.txt
 
-# Aplicar migraciones (si las hay)
+# 4. Aplicar migraciones (si las hay)
 python manage.py migrate
 
-# Recolectar archivos estáticos
+# 5. Recolectar archivos estáticos (si hay cambios en estáticos)
 python manage.py collectstatic --noinput
 
-# Salir y reiniciar servicios
-exit
-sudo /opt/udid/manage_services.sh start
-sudo systemctl restart celery-worker
-# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
-# sudo systemctl restart celery-beat
-sudo systemctl restart nginx
+# 6. ⚠️ CRÍTICO: Reiniciar servicios que ejecutan código Python
+# Estos servicios tienen el código viejo en memoria y necesitan reiniciarse
+sudo /opt/udid/manage_services.sh restart  # Reinicia todas las instancias de Daphne
+sudo systemctl restart celery-worker        # Reinicia Celery Worker
+sudo systemctl restart celery-beat           # Reinicia Celery Beat (si está activo)
 
-# Verificar estado
+# 7. Recargar Nginx (solo si cambiaste configuración de Nginx)
+# sudo systemctl reload nginx
+
+# 8. Verificar que todo está funcionando
 sudo /opt/udid/manage_services.sh status
 sudo systemctl status celery-worker
+sudo systemctl status celery-beat
+```
+
+**Script rápido para actualización (opcional):**
+
+Puedes crear un script `/opt/udid/update.sh`:
+
+```bash
+#!/bin/bash
+# Script para actualizar el proyecto y reiniciar servicios
+
+cd /opt/udid
+source env/bin/activate
+
+echo "📥 Actualizando código..."
+git pull origin main
+
+echo "📦 Instalando dependencias..."
+pip install -r requirements.txt
+
+echo "🗄️ Aplicando migraciones..."
+python manage.py migrate
+
+echo "📁 Recolectando estáticos..."
+python manage.py collectstatic --noinput
+
+echo "🔄 Reiniciando servicios..."
+sudo /opt/udid/manage_services.sh restart
+sudo systemctl restart celery-worker celery-beat
+
+echo "✅ Actualización completada"
+echo "📊 Verificando estado..."
+sudo /opt/udid/manage_services.sh status
+sudo systemctl status celery-worker --no-pager | head -10
+sudo systemctl status celery-beat --no-pager | head -10
+```
+
+Hacer ejecutable:
+
+```bash
+sudo chmod +x /opt/udid/update.sh
+sudo chown udid:udid /opt/udid/update.sh
+```
+
+Uso:
+
+```bash
+/opt/udid/update.sh
 ```
 
 ### 14.4 Backup de Base de Datos
@@ -3001,7 +3039,7 @@ sudo chmod 600 /opt/udid/.env
 ```bash
 # Asegurarse de que el entorno virtual está activado
 cd /opt/udid
-source venv/bin/activate
+source env/bin/activate
 
 # Reinstalar dependencias
 pip install -r requirements.txt
@@ -3051,9 +3089,7 @@ Si todo falla, reiniciar todos los servicios:
 ```bash
 # Detener todos los servicios
 sudo /opt/udid/manage_services.sh stop
-sudo systemctl stop celery-worker celery-flower
-# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
-# sudo systemctl stop celery-beat
+sudo systemctl stop celery-worker celery-beat celery-flower
 sudo systemctl stop nginx
 sudo systemctl stop redis-server
 sudo systemctl stop postgresql
@@ -3065,9 +3101,7 @@ sleep 5
 sudo systemctl start postgresql
 sudo systemctl start redis-server
 sudo /opt/udid/manage_services.sh start
-sudo systemctl start celery-worker
-# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
-# sudo systemctl start celery-beat
+sudo systemctl start celery-worker celery-beat
 sudo systemctl start celery-flower  # Opcional
 sudo systemctl start nginx
 
@@ -3076,8 +3110,7 @@ sudo systemctl status postgresql
 sudo systemctl status redis-server
 sudo /opt/udid/manage_services.sh status
 sudo systemctl status celery-worker
-# Nota: celery-beat está deshabilitado por defecto
-# sudo systemctl status celery-beat
+sudo systemctl status celery-beat
 sudo systemctl status nginx
 ```
 
@@ -4010,6 +4043,50 @@ sudo tail -f /var/log/nginx/udid_access.log
 
 ---
 
+## 🔄 Actualizar Código del Proyecto (Después de git pull)
+
+> ⚠️ **IMPORTANTE**: Después de hacer `git pull` o actualizar archivos, los servicios que ejecutan código Python (Daphne, Celery Worker, Celery Beat) tienen el código viejo en memoria y **DEBEN reiniciarse** para cargar el nuevo código.
+
+### Proceso Rápido de Actualización
+
+```bash
+# 1. Actualizar código
+cd /opt/udid
+git pull origin main
+
+# 2. Activar entorno y actualizar dependencias (si es necesario)
+source env/bin/activate
+pip install -r requirements.txt  # Solo si hay nuevas dependencias
+python manage.py migrate         # Solo si hay nuevas migraciones
+python manage.py collectstatic --noinput  # Solo si hay cambios en estáticos
+
+# 3. ⚠️ CRÍTICO: Reiniciar servicios que ejecutan código Python
+sudo /opt/udid/manage_services.sh restart  # Reinicia todas las instancias de Daphne
+sudo systemctl restart celery-worker        # Reinicia Celery Worker
+sudo systemctl restart celery-beat          # Reinicia Celery Beat
+
+# 4. Verificar que todo está funcionando
+sudo /opt/udid/manage_services.sh status
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
+```
+
+### Servicios que NO Necesitan Reinicio
+
+Estos servicios **NO** necesitan reinicio después de `git pull`:
+- ✅ **Nginx**: Solo sirve archivos estáticos y hace proxy, no ejecuta código Python
+- ✅ **Redis**: Base de datos en memoria, no ejecuta código Python
+- ✅ **PostgreSQL**: Base de datos, no ejecuta código Python
+
+### Servicios que SÍ Necesitan Reinicio
+
+Estos servicios **SÍ** necesitan reinicio después de `git pull`:
+- 🔄 **Daphne** (instancias): Ejecutan código Django/ASGI
+- 🔄 **Celery Worker**: Ejecuta código de tareas
+- 🔄 **Celery Beat**: Ejecuta código de programación de tareas
+
+---
+
 ## 📝 Resumen de Comandos Importantes
 
 ```bash
@@ -4023,21 +4100,19 @@ sudo systemctl restart nginx                # Reiniciar Nginx
 sudo systemctl restart postgresql           # Reiniciar PostgreSQL
 sudo systemctl restart redis-server         # Reiniciar Redis
 sudo systemctl restart celery-worker        # Reiniciar Celery Worker
-# Nota: celery-beat está deshabilitado por defecto (tareas manuales)
-# sudo systemctl restart celery-beat         # Reiniciar Celery Beat (si está activo)
+sudo systemctl restart celery-beat          # Reiniciar Celery Beat
 sudo systemctl restart celery-flower        # Reiniciar Flower (opcional)
 
 # === LOGS ===
 sudo journalctl -u udid@0 -f               # Ver logs de Daphne
 sudo journalctl -u celery-worker -f        # Ver logs de Celery Worker
-# Nota: celery-beat está deshabilitado por defecto
-# sudo journalctl -u celery-beat -f        # Ver logs de Celery Beat (si está activo)
+sudo journalctl -u celery-beat -f           # Ver logs de Celery Beat
 sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
 sudo tail -f /var/log/udid/celery-worker.log  # Ver logs de Worker
-# sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat (si está activo)
+sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat
 
 # === DJANGO ===
-cd /opt/udid && source venv/bin/activate   # Activar entorno
+cd /opt/udid && source env/bin/activate   # Activar entorno
 python manage.py migrate                    # Aplicar migraciones
 python manage.py collectstatic --noinput   # Recolectar estáticos
 python manage.py createsuperuser           # Crear admin
