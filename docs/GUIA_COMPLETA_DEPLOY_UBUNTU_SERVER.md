@@ -1523,6 +1523,15 @@ sudo rm /etc/nginx/sites-enabled/default
 sudo nginx -t
 
 # Debería mostrar: syntax is ok / test is successful
+
+# ⚠️ IMPORTANTE: Recargar Nginx para que cargue la nueva configuración
+# Sin este paso, Nginx seguirá usando la configuración anterior en memoria
+sudo systemctl reload nginx
+# O si prefieres reiniciar completamente:
+# sudo systemctl restart nginx
+
+# Verificar que Nginx está corriendo correctamente
+sudo systemctl status nginx
 ```
 
 ---
@@ -1881,19 +1890,20 @@ Environment="PATH=/opt/udid/env/bin"
 EnvironmentFile=/opt/udid/.env
 
 # Comando para ejecutar Celery Worker
-# Configuración estándar: --concurrency auto
+# ⚠️ IMPORTANTE: Celery NO acepta "--concurrency auto", debe ser un número entero
+# Configuración estándar (servidor pequeño): --concurrency 2
 # Configuración optimizada para 32GB RAM / 32 cores: --concurrency 16
 # Configuración optimizada para 64GB RAM / 32 cores: --concurrency 24
 # Configuración optimizada para 124GB RAM / 64 cores: --concurrency 48
 ExecStart=/opt/udid/env/bin/celery -A ubuntu worker \
     --loglevel=info \
     --logfile=/var/log/udid/celery-worker.log \
-    --pidfile=/var/run/udid/celery-worker.pid \
-    --concurrency=${CELERY_WORKER_CONCURRENCY}
+    --pidfile=/run/udid/celery-worker.pid \
+    --concurrency=2
 
 # Comando para detener
 ExecStop=/bin/kill -s TERM $MAINPID
-PIDFile=/var/run/udid/celery-worker.pid
+PIDFile=/run/udid/celery-worker.pid
 
 # Reinicio automático
 Restart=always
@@ -1949,8 +1959,8 @@ EnvironmentFile=/opt/udid/.env
 ExecStart=/opt/udid/env/bin/celery -A ubuntu beat \
     --loglevel=info \
     --logfile=/var/log/udid/celery-beat.log \
-    --pidfile=/var/run/udid/celery-beat.pid \
-    --schedule=/var/run/udid/celerybeat-schedule
+    --pidfile=/run/udid/celery-beat.pid \
+    --schedule=/run/udid/celerybeat-schedule
 
 # Reinicio automático
 Restart=always
@@ -1975,8 +1985,9 @@ Guardar y salir.
 
 ```bash
 # Crear directorio para archivos PID y schedule
-sudo mkdir -p /var/run/udid
-sudo chown udid:udid /var/run/udid
+# ⚠️ IMPORTANTE: Usar /run/udid (no /var/run/udid) para evitar warnings de systemd
+sudo mkdir -p /run/udid
+sudo chown udid:udid /run/udid
 
 # Crear directorio de logs (si no existe)
 sudo mkdir -p /var/log/udid
@@ -4041,6 +4052,81 @@ curl -k https://localhost/health           # Verificar salud
 redis-cli ping                             # Verificar Redis
 sudo ss -tlnp | grep 800                   # Ver puertos Daphne
 sudo ss -tlnp | grep 5555                  # Ver puerto Flower (opcional)
+```
+
+---
+
+## 🔄 Verificación Después de Reiniciar el Servidor
+
+Después de reiniciar el servidor, los servicios configurados con `systemctl enable` deberían iniciarse automáticamente. Sigue estos pasos para verificar que todo está funcionando:
+
+### Verificar Servicios Habilitados para Inicio Automático
+
+```bash
+# Ver qué servicios están habilitados
+systemctl list-unit-files | grep -E "udid|celery|nginx|redis|postgresql" | grep enabled
+
+# Deberías ver:
+# celery-beat.service          enabled
+# celery-worker.service        enabled
+# nginx.service                enabled
+# postgresql.service           enabled
+# redis-server.service         enabled
+# udid@0.service               enabled
+# udid@1.service               enabled
+# udid@2.service               enabled
+# udid@3.service               enabled
+```
+
+### Verificar Estado de Todos los Servicios
+
+```bash
+# Servicios del sistema
+sudo systemctl status nginx
+sudo systemctl status redis-server
+sudo systemctl status postgresql
+
+# Instancias de Daphne
+sudo /opt/udid/manage_services.sh status
+
+# Celery
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
+```
+
+Todos deberían mostrar `Active: active (running)`.
+
+### Si Algún Servicio No Está Corriendo
+
+```bash
+# Habilitar e iniciar servicios que falten
+sudo systemctl enable nginx && sudo systemctl start nginx
+sudo systemctl enable redis-server && sudo systemctl start redis-server
+sudo systemctl enable postgresql && sudo systemctl start postgresql
+
+# Instancias de Daphne
+sudo /opt/udid/manage_services.sh enable
+sudo /opt/udid/manage_services.sh start
+
+# Celery
+sudo systemctl enable celery-worker && sudo systemctl start celery-worker
+sudo systemctl enable celery-beat && sudo systemctl start celery-beat
+```
+
+### Verificar Conectividad y Funcionamiento
+
+```bash
+# Verificar que Daphne está escuchando
+sudo ss -tlnp | grep 800
+
+# Verificar que Nginx está escuchando
+sudo ss -tlnp | grep -E "80|443"
+
+# Probar endpoint de salud
+curl -k https://localhost/health
+
+# Verificar Redis
+redis-cli ping
 ```
 
 ---
