@@ -38,13 +38,13 @@ class AuthWaitWS(AsyncWebsocketConsumer):
     """
 
     # Configuraciones
-    TIMEOUT_AUTOMATIC = getattr(settings, "UDID_WAIT_TIMEOUT_AUTOMATIC", 180)  # Validación automática
-    TIMEOUT_MANUAL = getattr(settings, "UDID_WAIT_TIMEOUT_MANUAL", 180)  # Validación manual
+    TIMEOUT_AUTOMATIC = getattr(settings, "UDID_WAIT_TIMEOUT_AUTOMATIC", 300)  # Validación automática
+    TIMEOUT_MANUAL = getattr(settings, "UDID_WAIT_TIMEOUT_MANUAL", 300)  # Validación manual
     TIMEOUT_SECONDS = getattr(settings, "UDID_WAIT_TIMEOUT", TIMEOUT_AUTOMATIC)  # Default: automático
     ENABLE_POLLING = getattr(settings, "UDID_ENABLE_POLLING", False) # Si querés habilitar un polling de respaldo (además del evento push)
     POLL_INTERVAL = getattr(settings, "UDID_POLL_INTERVAL", 2) # Intervalo de polling
     PING_INTERVAL = getattr(settings, "UDID_WS_PING_INTERVAL", 30)  # segundos
-    INACTIVITY_TIMEOUT = getattr(settings, "UDID_WS_INACTIVITY_TIMEOUT", 120)  # Tiempo de inactividad del WS: 120s
+    INACTIVITY_TIMEOUT = getattr(settings, "UDID_WS_INACTIVITY_TIMEOUT", 180)  # Tiempo de inactividad del WS: 120s
     MAX_CONNECTIONS_PER_TOKEN = getattr(settings, "UDID_WS_MAX_PER_TOKEN", 3) # Límite de WebSocket por dispositivo/UDID
     MAX_GLOBAL_CONNECTIONS = getattr(settings, "UDID_WS_MAX_GLOBAL", 1000) # Límite global del sistema
 

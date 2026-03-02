@@ -49,8 +49,8 @@ Este es un servidor Django/Channels que proporciona:
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              DAPHNE (Puertos 8000-8003)                         │
-│         Servidor ASGI - HTTP + WebSockets                       │
+│              DAPHNE (Puertos 8000-8032)                         │
+│           Servidor ASGI - HTTP + WebSockets                     │
 │              (Múltiples instancias)                             │
 └─────────────────────────────────────────────────────────────────┘
                     │                   │
@@ -771,10 +771,10 @@ supervised systemd
 # Configurar memoria máxima (ajustar según tu RAM disponible)
 # Para 8GB RAM, usar 2GB para Redis
 # Para 16GB RAM, usar 4GB para Redis
-# Para 32GB RAM, usar 8GB para Redis
+# Para 32GB RAM, usar 8GB para Redis (25% de RAM)
 # Para 64GB RAM / 32 cores, usar 16GB para Redis
 # Para 120GB RAM / 64 cores, usar 30GB para Redis
-maxmemory 2gb
+maxmemory 8gb
 
 # Política de evicción cuando se llena la memoria
 maxmemory-policy allkeys-lru
@@ -1116,7 +1116,43 @@ ls -la /opt/udid/.env
 
 Según tu configuración de hardware, ajusta estas variables en el archivo `.env`:
 
-#### Configuración 1: 32 GB RAM / 32 cores / 1 TB SSD
+#### Configuración 1: 32 GB RAM / 16 cores / 800 GB SSD (Configuración Recomendada)
+
+```env
+# ============================================================================
+# CONFIGURACIÓN OPTIMIZADA PARA 32GB RAM / 16 CORES / 800GB SSD
+# ============================================================================
+
+# Redis - Conexiones y capacidad
+REDIS_MAX_CONNECTIONS=300
+REDIS_SOCKET_CONNECT_TIMEOUT=5
+REDIS_SOCKET_TIMEOUT=5
+REDIS_RETRY_ON_TIMEOUT=True
+
+# Channel Layers (WebSockets)
+CHANNEL_LAYERS_CAPACITY=5000
+CHANNEL_LAYERS_EXPIRY=10
+CHANNEL_LAYERS_GROUP_EXPIRY=1800
+
+# Concurrencia y colas
+GLOBAL_SEMAPHORE_SLOTS=3000
+REQUEST_QUEUE_MAX_SIZE=5000
+REQUEST_QUEUE_MAX_WAIT_TIME=10
+
+# Cache
+CACHE_SOCKET_CONNECT_TIMEOUT=5
+CACHE_SOCKET_TIMEOUT=5
+CACHE_MAX_CONNECTIONS=50
+CACHE_KEY_PREFIX=udid_prod
+CACHE_TIMEOUT=300
+
+# Celery Workers
+CELERY_WORKER_PREFETCH_MULTIPLIER=8
+CELERY_WORKER_CONCURRENCY=12
+CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
+```
+
+#### Configuración 3: 32 GB RAM / 32 cores / 1 TB SSD
 
 ```env
 # ============================================================================
@@ -1152,7 +1188,7 @@ CELERY_WORKER_CONCURRENCY=16
 CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
 ```
 
-#### Configuración 2: 64 GB RAM / 32 cores / 1 TB SSD
+#### Configuración 4: 64 GB RAM / 32 cores / 1 TB SSD
 
 ```env
 # ============================================================================
@@ -1188,7 +1224,7 @@ CELERY_WORKER_CONCURRENCY=24
 CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
 ```
 
-#### Configuración 3: 124 GB RAM / 64 cores / 1 TB SSD
+#### Configuración 5: 124 GB RAM / 64 cores / 1 TB SSD
 
 ```env
 # ============================================================================
@@ -1364,20 +1400,50 @@ upstream udid_backend {
     ip_hash;
     
     # Instancias de Daphne (ajustar según número de workers)
-    # Configuración estándar: 4 instancias
+    # Configuración estándar: 4 instancias (puertos 8000-8003)
+    # Configuración optimizada para 32GB RAM / 16 cores: 33 instancias (puertos 8000-8032)
+    # Configuración optimizada para 64GB RAM / 32 cores: 40 instancias (puertos 8000-8039)
+    # Configuración optimizada para 120GB RAM / 64 cores: 60 instancias (puertos 8000-8059)
+    
+    # Configuración para 32GB RAM / 16 cores (33 instancias):
     server 127.0.0.1:8000;
     server 127.0.0.1:8001;
     server 127.0.0.1:8002;
     server 127.0.0.1:8003;
+    server 127.0.0.1:8004;
+    server 127.0.0.1:8005;
+    server 127.0.0.1:8006;
+    server 127.0.0.1:8007;
+    server 127.0.0.1:8008;
+    server 127.0.0.1:8009;
+    server 127.0.0.1:8010;
+    server 127.0.0.1:8011;
+    server 127.0.0.1:8012;
+    server 127.0.0.1:8013;
+    server 127.0.0.1:8014;
+    server 127.0.0.1:8015;
+    server 127.0.0.1:8016;
+    server 127.0.0.1:8017;
+    server 127.0.0.1:8018;
+    server 127.0.0.1:8019;
+    server 127.0.0.1:8020;
+    server 127.0.0.1:8021;
+    server 127.0.0.1:8022;
+    server 127.0.0.1:8023;
+    server 127.0.0.1:8024;
+    server 127.0.0.1:8025;
+    server 127.0.0.1:8026;
+    server 127.0.0.1:8027;
+    server 127.0.0.1:8028;
+    server 127.0.0.1:8029;
+    server 127.0.0.1:8030;
+    server 127.0.0.1:8031;
+    server 127.0.0.1:8032;
     
-    # Configuración optimizada para 64-120GB RAM / 32-64 cores: 40-60 instancias
-    # Descomentar estas líneas y comentar las 4 anteriores si usas la configuración optimizada:
-    # Para 64GB RAM / 32 cores: usar 40 instancias (puertos 8000-8039)
-    # Para 120GB RAM / 64 cores: usar 60 instancias (puertos 8000-8059)
-    # server 127.0.0.1:8000;
-    # server 127.0.0.1:8001;
-    # ... (continuar hasta 8039 para 40 instancias o 8059 para 60 instancias)
+    # Para configuraciones más grandes, descomentar las siguientes líneas:
+    # server 127.0.0.1:8033; ... hasta 8039 para 40 instancias (64GB RAM / 32 cores)
     # server 127.0.0.1:8039;  # Para 40 instancias
+    # ... hasta 8059 para 60 instancias (120GB RAM / 64 cores)
     # server 127.0.0.1:8059;  # Para 60 instancias
     
     # Mantener conexiones abiertas (aumentado para alta carga)
@@ -1721,9 +1787,13 @@ Copiar el siguiente contenido:
 
 # Número de instancias (ajustar según CPU cores y carga esperada)
 # Configuración estándar: 4 instancias (hasta 1000 requests simultáneos)
+# Configuración optimizada para 32GB RAM / 16 cores: 33 instancias (puertos 8000-8032)
 # Configuración optimizada para 64GB RAM / 32 cores: 40 instancias
 # Configuración optimizada para 120GB RAM / 64 cores: 60 instancias
-INSTANCES=4
+INSTANCES=33
+
+# Para configuración estándar (servidor pequeño), cambiar a:
+# INSTANCES=4
 
 # Para configuración optimizada de 64GB RAM / 32 cores, cambiar a:
 # INSTANCES=40
@@ -1931,6 +2001,7 @@ EnvironmentFile=/opt/udid/.env
 # Comando para ejecutar Celery Worker
 # ⚠️ IMPORTANTE: Celery NO acepta "--concurrency auto", debe ser un número entero
 # Configuración estándar (servidor pequeño): --concurrency 2
+# Configuración optimizada para 32GB RAM / 16 cores: --concurrency 12
 # Configuración optimizada para 32GB RAM / 32 cores: --concurrency 16
 # Configuración optimizada para 64GB RAM / 32 cores: --concurrency 24
 # Configuración optimizada para 124GB RAM / 64 cores: --concurrency 48
@@ -1938,7 +2009,7 @@ ExecStart=/opt/udid/env/bin/celery -A ubuntu worker \
     --loglevel=info \
     --logfile=/var/log/udid/celery-worker.log \
     --pidfile=/run/udid/celery-worker.pid \
-    --concurrency=2
+    --concurrency=12
 
 # Comando para detener
 ExecStop=/bin/kill -s TERM $MAINPID
@@ -1950,6 +2021,7 @@ RestartSec=3
 
 # Limitar recursos según configuración
 # Configuración estándar: 2GB
+# Configuración optimizada para 32GB RAM / 16 cores: 2GB
 # Configuración optimizada para 32GB RAM / 32 cores: 2GB
 # Configuración optimizada para 64GB RAM / 32 cores: 4GB
 # Configuración optimizada para 124GB RAM / 64 cores: 4GB
@@ -2020,7 +2092,9 @@ WantedBy=multi-user.target
 
 Guardar y salir.
 
-### 12.4 Crear Directorios Necesarios
+### 12.4 Crear Directorios y Archivos de Log Necesarios
+
+> ⚠️ **CRÍTICO**: Es importante crear los archivos de log **ANTES** de iniciar los servicios de Celery. Si los archivos no existen, Celery puede no escribir los logs correctamente.
 
 ```bash
 # Crear directorio para archivos PID y schedule
@@ -2031,6 +2105,23 @@ sudo chown udid:udid /run/udid
 # Crear directorio de logs (si no existe)
 sudo mkdir -p /var/log/udid
 sudo chown udid:udid /var/log/udid
+sudo chmod 755 /var/log/udid
+
+# ⚠️ IMPORTANTE: Crear archivos de log antes de iniciar los servicios
+# Esto asegura que Celery pueda escribir en ellos desde el inicio
+sudo touch /var/log/udid/celery-worker.log
+sudo touch /var/log/udid/celery-beat.log
+sudo touch /var/log/udid/celery-flower.log  # Opcional, solo si usas Flower
+
+# Establecer permisos correctos para los archivos de log
+sudo chown udid:udid /var/log/udid/*.log
+sudo chmod 664 /var/log/udid/*.log
+
+# Verificar que los archivos se crearon correctamente
+ls -la /var/log/udid/
+# Deberías ver:
+# -rw-rw-r-- 1 udid udid 0 ... celery-worker.log
+# -rw-rw-r-- 1 udid udid 0 ... celery-beat.log
 ```
 
 ### 12.5 Iniciar y Habilitar Servicios de Celery
@@ -2066,6 +2157,13 @@ sudo systemctl enable celery-worker
 sudo systemctl status celery-worker
 # Debe mostrar: "active (running)"
 
+# Verificar que el archivo de log se está escribiendo
+# Esperar unos segundos después de iniciar el servicio
+sleep 3
+ls -lh /var/log/udid/celery-worker.log
+# Si el archivo está vacío, los logs pueden estar solo en journal (normal)
+# Usa: sudo journalctl -u celery-worker -f para ver logs en tiempo real
+
 # ========================================================================
 # PASO 3: Después de completar execute_sync_tasks(), activar Beat
 # ========================================================================
@@ -2079,6 +2177,12 @@ sudo systemctl enable celery-beat
 # Verificar estado de Beat
 sudo systemctl status celery-beat
 # Debe mostrar: "active (running)"
+
+# Verificar que el archivo de log se está escribiendo
+sleep 3
+ls -lh /var/log/udid/celery-beat.log
+# Si el archivo está vacío, los logs pueden estar solo en journal (normal)
+# Usa: sudo journalctl -u celery-beat -f para ver logs en tiempo real
 ```
 
 ### 12.5.1 Verificar Configuración de Tareas Periódicas
@@ -2694,7 +2798,7 @@ sudo -u udid /opt/udid/backup_logs.sh stats
 # Verificar estado del Worker (debe estar activo)
 sudo systemctl status celery-worker
 
-# Verificar que Beat NO está corriendo (debe estar inactivo)
+# Verificar estado de Beat
 sudo systemctl status celery-beat
 
 # Ver logs en tiempo real
@@ -2703,14 +2807,61 @@ sudo journalctl -u celery-worker -f
 
 #### Método 2: Revisar logs de Celery
 
+> ⚠️ **Nota importante sobre logs**: Si los archivos `/var/log/udid/celery-worker.log` o `/var/log/udid/celery-beat.log` están vacíos o no existen, los logs pueden estar solo en systemd journal. Esto es normal cuando los servicios están configurados con `StandardOutput=journal`. Usa `journalctl` como alternativa.
+
 ```bash
-# Ver logs del Worker
+# Ver logs del Worker desde archivo (si existe y tiene contenido)
 tail -f /var/log/udid/celery-worker.log
 
-# Buscar ejecuciones de tareas específicas
+# Si el archivo está vacío, usar journalctl (recomendado)
+sudo journalctl -u celery-worker -f
+
+# Ver logs de Beat desde archivo (si existe y tiene contenido)
+tail -f /var/log/udid/celery-beat.log
+
+# Si el archivo está vacío, usar journalctl (recomendado)
+sudo journalctl -u celery-beat -f
+
+# Buscar ejecuciones de tareas específicas (desde journal)
+sudo journalctl -u celery-worker | grep "check_and_sync_subscribers_periodic" | tail -10
+sudo journalctl -u celery-worker | grep "check_and_sync_smartcards_monthly" | tail -5
+sudo journalctl -u celery-worker | grep "validate_and_sync_all_data_daily" | tail -5
+
+# O desde archivo (si tiene contenido)
 grep "check_and_sync_subscribers_periodic" /var/log/udid/celery-worker.log | tail -10
 grep "check_and_sync_smartcards_monthly" /var/log/udid/celery-worker.log | tail -5
 grep "validate_and_sync_all_data_daily" /var/log/udid/celery-worker.log | tail -5
+```
+
+#### Solución: Archivos de log no existen o están vacíos
+
+Si obtienes el error `cannot open '/var/log/udid/celery-worker.log' for reading: No such file or directory`:
+
+```bash
+# 1. Verificar que el directorio existe
+ls -la /var/log/udid/
+
+# 2. Si no existe, crearlo
+sudo mkdir -p /var/log/udid
+sudo chown udid:udid /var/log/udid
+sudo chmod 755 /var/log/udid
+
+# 3. Crear los archivos de log
+sudo touch /var/log/udid/celery-worker.log
+sudo touch /var/log/udid/celery-beat.log
+sudo chown udid:udid /var/log/udid/*.log
+sudo chmod 664 /var/log/udid/*.log
+
+# 4. Reiniciar los servicios
+sudo systemctl restart celery-worker
+sudo systemctl restart celery-beat
+
+# 5. Verificar que ahora existen
+ls -lh /var/log/udid/
+
+# 6. Si los archivos siguen vacíos, usar journalctl (esto es normal)
+sudo journalctl -u celery-worker -f
+sudo journalctl -u celery-beat -f
 ```
 
 #### Método 3: Usar Flower (si está configurado)
@@ -3256,6 +3407,47 @@ sudo chmod -R 755 /opt/udid
 sudo chmod 600 /opt/udid/.env
 ```
 
+#### Error: "cannot open '/var/log/udid/celery-worker.log' for reading: No such file or directory"
+
+**Síntoma:**
+```bash
+tail: cannot open '/var/log/udid/celery-worker.log' for reading: No such file or directory
+```
+
+**Causa:** Los archivos de log no fueron creados antes de iniciar los servicios de Celery.
+
+**Solución:**
+
+```bash
+# 1. Verificar que el directorio existe
+ls -la /var/log/udid/
+
+# 2. Si no existe, crearlo
+sudo mkdir -p /var/log/udid
+sudo chown udid:udid /var/log/udid
+sudo chmod 755 /var/log/udid
+
+# 3. Crear los archivos de log
+sudo touch /var/log/udid/celery-worker.log
+sudo touch /var/log/udid/celery-beat.log
+sudo chown udid:udid /var/log/udid/*.log
+sudo chmod 664 /var/log/udid/*.log
+
+# 4. Reiniciar los servicios
+sudo systemctl restart celery-worker
+sudo systemctl restart celery-beat
+
+# 5. Verificar que ahora existen
+ls -lh /var/log/udid/
+
+# 6. Si los archivos siguen vacíos, usar journalctl (esto es normal)
+# Los logs pueden estar solo en systemd journal cuando StandardOutput=journal
+sudo journalctl -u celery-worker -f
+sudo journalctl -u celery-beat -f
+```
+
+**Prevención:** Siempre crear los archivos de log en la sección 12.4 antes de iniciar los servicios (ver sección 12.4 "Crear Directorios y Archivos de Log Necesarios").
+
 #### Error "ModuleNotFoundError" en Python
 
 ```bash
@@ -3430,9 +3622,32 @@ Esta configuración está optimizada específicamente para un servidor de **alta
 - Celery: ~4GB
 - Buffer/Cache: ~10GB
 
-#### 🎯 Configuraciones Específicas por Hardware (32GB, 64GB, 124GB RAM / 32-64 cores / 1TB)
+#### 🎯 Configuraciones Específicas por Hardware
 
-##### Configuración 1: 32 GB RAM / 32 cores / 1 TB SSD
+##### Configuración 1: 32 GB RAM / 16 cores / 800 GB SSD (Configuración Recomendada)
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 16 cores |
+| **RAM** | 32 GB |
+| **Disco** | 800 GB SSD/NVMe |
+| **Workers Daphne** | 33 instancias (puertos 8000-8032) |
+| **Redis Memory** | 8 GB (25% de RAM) |
+| **PostgreSQL Connections** | 800 |
+| **Nginx Worker Connections** | 8192 |
+| **Conexiones Simultáneas** | ~3000-5000 |
+| **Celery Concurrency** | 12 |
+
+**Distribución de Memoria (32GB RAM):**
+- PostgreSQL: ~10GB (shared_buffers + work_mem + otros)
+- Redis: 8GB (25% de RAM)
+- Daphne Workers: ~16.5GB (33 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~1GB
+- Celery: ~2GB
+- Buffer/Cache: ~0.5GB
+
+##### Configuración 2: 32 GB RAM / 32 cores / 1 TB SSD
 
 | Recurso | Especificación |
 |---------|----------------|
@@ -3445,7 +3660,29 @@ Esta configuración está optimizada específicamente para un servidor de **alta
 | **Nginx Worker Connections** | 8192 |
 | **Conexiones Simultáneas** | ~3000-4000 |
 
-**Distribución de Memoria (32GB RAM):**
+**Distribución de Memoria (32GB RAM / 16 cores):**
+- PostgreSQL: ~10GB (shared_buffers + work_mem + otros)
+- Redis: 8GB (25% de RAM)
+- Daphne Workers: ~16.5GB (33 instancias × ~500MB cada una)
+- Sistema Operativo: ~4GB
+- Nginx: ~1GB
+- Celery: ~2GB
+- Buffer/Cache: ~0.5GB
+
+##### Configuración 2: 32 GB RAM / 32 cores / 1 TB SSD
+
+| Recurso | Especificación |
+|---------|----------------|
+| **CPU** | 32 cores |
+| **RAM** | 32 GB |
+| **Disco** | 1 TB SSD/NVMe |
+| **Workers Daphne** | 32 instancias (puertos 8000-8031) |
+| **Redis Memory** | 8 GB (25% de RAM) |
+| **PostgreSQL Connections** | 800 |
+| **Nginx Worker Connections** | 8192 |
+| **Conexiones Simultáneas** | ~3000-4000 |
+
+**Distribución de Memoria (32GB RAM / 32 cores):**
 - PostgreSQL: ~10GB (shared_buffers + work_mem + otros)
 - Redis: 8GB (25% de RAM)
 - Daphne Workers: ~16GB (32 instancias × ~500MB cada una)
@@ -3454,7 +3691,7 @@ Esta configuración está optimizada específicamente para un servidor de **alta
 - Celery: ~2GB
 - Buffer/Cache: ~1GB
 
-##### Configuración 2: 64 GB RAM / 32 cores / 1 TB SSD
+##### Configuración 3: 64 GB RAM / 32 cores / 1 TB SSD
 
 | Recurso | Especificación |
 |---------|----------------|
@@ -3476,7 +3713,7 @@ Esta configuración está optimizada específicamente para un servidor de **alta
 - Celery: ~4GB
 - Buffer/Cache: ~2GB
 
-##### Configuración 3: 124 GB RAM / 64 cores / 1 TB SSD
+##### Configuración 4: 124 GB RAM / 64 cores / 1 TB SSD
 
 | Recurso | Especificación |
 |---------|----------------|
@@ -3503,6 +3740,7 @@ Esta configuración está optimizada específicamente para un servidor de **alta
 | Configuración | RAM | CPU | Disco | Redis Max Connections | Channel Layers Capacity | Semaphore Slots | Queue Max Size | Celery Concurrency | Celery Prefetch |
 |---------------|-----|-----|-------|----------------------|------------------------|-----------------|----------------|-------------------|-----------------|
 | **Estándar** | 8-16 GB | 4-8 cores | 80 GB | 100 | 2000 | 1000 | 1000 | auto | 4 |
+| **32GB/16cores** | 32 GB | 16 cores | 800 GB | 300 | 5000 | 3000 | 5000 | 12 | 8 |
 | **32GB/32cores** | 32 GB | 32 cores | 1 TB | 300 | 5000 | 3000 | 5000 | 16 | 8 |
 | **64GB/32cores** | 64 GB | 32 cores | 1 TB | 400 | 10000 | 5000 | 10000 | 24 | 10 |
 | **124GB/64cores** | 124 GB | 64 cores | 1 TB | 600 | 20000 | 10000 | 20000 | 48 | 16 |
@@ -3536,6 +3774,52 @@ max_connections = 200
 # WAL
 wal_buffers = 64MB
 checkpoint_completion_target = 0.9
+```
+
+#### Para PostgreSQL (32GB RAM / 16 cores / 800GB SSD / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/postgresql/*/main/postgresql.conf
+```
+
+```conf
+# Ajustes de memoria optimizados para 32GB RAM
+shared_buffers = 8GB              # 25% de 32GB RAM
+effective_cache_size = 24GB       # 75% de 32GB RAM
+work_mem = 128MB                  # Ajustado para más conexiones simultáneas
+maintenance_work_mem = 2GB        # Aumentado para operaciones de mantenimiento
+temp_buffers = 32MB
+hash_mem_multiplier = 2.0
+
+# Conexiones
+max_connections = 800             # Ajustado para alta carga
+
+# WAL (Write-Ahead Logging)
+wal_buffers = 64MB
+checkpoint_completion_target = 0.9
+wal_compression = on
+max_wal_size = 2GB                # Aumentado para reducir checkpoints
+min_wal_size = 1GB
+
+# I/O
+random_page_cost = 1.1            # Para SSD
+effective_io_concurrency = 200    # Para SSD con múltiples operaciones
+
+# Parallel Query (aprovechar múltiples cores - 16 cores)
+max_parallel_workers_per_gather = 4  # Para 16 cores
+max_parallel_workers = 16        # Número de workers paralelos
+max_parallel_maintenance_workers = 4
+
+# Autovacuum
+autovacuum_max_workers = 4       # Aumentado para más cores
+autovacuum_naptime = 10s
+```
+
+Guardar y reiniciar PostgreSQL:
+
+```bash
+sudo systemctl restart postgresql
+sudo systemctl status postgresql
 ```
 
 #### Para PostgreSQL (32GB RAM / 32 cores / 1TB SSD / 3000+ requests simultáneos):
@@ -3766,6 +4050,49 @@ tcp-keepalive 300
 timeout 0
 ```
 
+#### Para Redis (32GB RAM / 16 cores / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/redis/redis.conf
+```
+
+```conf
+# Memoria optimizada para 32GB RAM
+maxmemory 8gb                     # 25% de 32GB RAM
+maxmemory-policy allkeys-lru      # Eliminar claves menos usadas cuando se llena
+
+# Persistencia (opcional - deshabilitar para mejor rendimiento)
+save ""                           # Deshabilitar persistencia para mejor rendimiento
+
+# Bind solo a localhost por seguridad
+bind 127.0.0.1 ::1
+
+# Timeouts
+timeout 300                       # Desconectar clientes inactivos después de 300 segundos
+tcp-keepalive 300
+
+# Logging
+loglevel notice
+logfile /var/log/redis/redis-server.log
+
+# Threading (Redis 6+ con múltiples cores)
+io-threads 4                      # Para 16 cores, usar 4 threads de I/O
+io-threads-do-reads yes           # Habilitar threading para lecturas
+
+# Conexiones
+maxclients 10000                  # Máximo de clientes conectados simultáneamente
+
+# Performance
+tcp-backlog 511                   # Cola de conexiones pendientes
+```
+
+Guardar y reiniciar Redis:
+
+```bash
+sudo systemctl restart redis-server
+sudo systemctl status redis-server
+```
+
 #### Para Redis (32GB RAM / 32 cores / 3000+ requests simultáneos):
 
 ```bash
@@ -3960,6 +4287,34 @@ worker_processes auto;
 worker_connections 4096;
 multi_accept on;
 use epoll;
+```
+
+#### Para Nginx (32GB RAM / 16 cores / 3000+ requests simultáneos):
+
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+Buscar la sección `worker_processes` y ajustar:
+
+```nginx
+# Worker processes - usar todos los cores disponibles (16 cores)
+worker_processes 16;
+worker_rlimit_nofile 65536;       # Aumentado para más archivos abiertos (16 cores)
+
+events {
+    use epoll;                     # Mejor para Linux
+    worker_connections 8192;      # 8192 × número de workers = capacidad total
+    multi_accept on;               # Aceptar múltiples conexiones a la vez
+    accept_mutex off;             # Desactivar mutex para mejor rendimiento con muchos cores
+}
+```
+
+Guardar y verificar configuración:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
 #### Para Nginx (32GB RAM / 32 cores / 3000+ requests simultáneos):
@@ -4357,6 +4712,233 @@ redis-cli ping                             # Verificar Redis
 sudo ss -tlnp | grep 800                   # Ver puertos Daphne
 sudo ss -tlnp | grep 5555                  # Ver puerto Flower (opcional)
 ```
+
+---
+
+## ⚡ Configuración de Inicio Automático (Reinicio y Restauración de Energía)
+
+> **⚠️ IMPORTANTE:** Esta sección es **CRÍTICA** si el servidor se despliega en zonas con inestabilidad energética. Configura el inicio automático para que todos los servicios se reinicien automáticamente cuando el servidor se reinicie o cuando regrese la energía eléctrica.
+
+### ¿Por qué es Necesario?
+
+Cuando el servidor se reinicia (por corte de energía, reinicio manual, o cualquier otra razón), los servicios deben iniciarse automáticamente sin intervención manual. Ubuntu Server usa **systemd** para gestionar servicios, y los servicios configurados con `systemctl enable` se iniciarán automáticamente al arrancar el sistema.
+
+### ¿Cómo Funciona?
+
+1. **Al arrancar el servidor**: systemd inicia automáticamente todos los servicios habilitados
+2. **Orden de inicio**: Los servicios se inician según sus dependencias (`After=`, `Requires=`)
+3. **Reinicio automático**: Si un servicio falla, systemd lo reinicia automáticamente (gracias a `Restart=always`)
+
+### Verificar y Configurar Inicio Automático
+
+#### Paso 1: Verificar Servicios del Sistema (PostgreSQL, Redis, Nginx)
+
+Estos servicios deben estar habilitados para inicio automático:
+
+```bash
+# Verificar estado de servicios del sistema
+sudo systemctl is-enabled postgresql
+sudo systemctl is-enabled redis-server
+sudo systemctl is-enabled nginx
+
+# Deberían mostrar: "enabled"
+```
+
+**Si alguno muestra "disabled", habilitarlo:**
+
+```bash
+# Habilitar inicio automático
+sudo systemctl enable postgresql
+sudo systemctl enable redis-server
+sudo systemctl enable nginx
+
+# Verificar que quedaron habilitados
+sudo systemctl is-enabled postgresql
+sudo systemctl is-enabled redis-server
+sudo systemctl is-enabled nginx
+```
+
+#### Paso 2: Verificar Servicios de UDID (Daphne)
+
+Verificar que todas las instancias de Daphne estén habilitadas:
+
+```bash
+# Verificar instancias habilitadas
+systemctl list-unit-files | grep "udid@" | grep enabled
+
+# Deberías ver todas las instancias que configuraste (ej: udid@0, udid@1, udid@2, udid@3)
+```
+
+**Si faltan instancias habilitadas, usar el script de gestión:**
+
+```bash
+# Habilitar todas las instancias para inicio automático
+sudo /opt/udid/manage_services.sh enable
+
+# Verificar que todas quedaron habilitadas
+systemctl list-unit-files | grep "udid@" | grep enabled
+```
+
+#### Paso 3: Verificar Servicios de Celery
+
+Verificar que Celery Worker y Celery Beat estén habilitados:
+
+```bash
+# Verificar servicios de Celery
+sudo systemctl is-enabled celery-worker
+sudo systemctl is-enabled celery-beat
+
+# Deberían mostrar: "enabled"
+```
+
+**Si alguno muestra "disabled", habilitarlo:**
+
+```bash
+# Habilitar inicio automático de Celery
+sudo systemctl enable celery-worker
+sudo systemctl enable celery-beat
+
+# Verificar que quedaron habilitados
+sudo systemctl is-enabled celery-worker
+sudo systemctl is-enabled celery-beat
+```
+
+#### Paso 4: Verificación Completa de Todos los Servicios
+
+Ejecutar este comando para ver todos los servicios relacionados con UDID que están habilitados:
+
+```bash
+# Ver todos los servicios habilitados relacionados con UDID
+systemctl list-unit-files | grep -E "udid|celery|nginx|redis|postgresql" | grep enabled
+
+# Deberías ver algo como:
+# celery-beat.service          enabled
+# celery-worker.service        enabled
+# nginx.service                enabled
+# postgresql.service           enabled
+# redis-server.service         enabled
+# udid@0.service               enabled
+# udid@1.service               enabled
+# udid@2.service               enabled
+# udid@3.service               enabled
+```
+
+**Si falta algún servicio en la lista, habilitarlo con los comandos anteriores.**
+
+### Probar el Inicio Automático
+
+#### Opción 1: Reinicio del Servidor (Recomendado para Probar)
+
+> **⚠️ ADVERTENCIA:** Esto reiniciará el servidor. Asegúrate de tener acceso físico o por consola antes de ejecutar este comando.
+
+```bash
+# Reiniciar el servidor
+sudo reboot
+
+# Después de que el servidor arranque (esperar 2-3 minutos), conectarse por SSH y verificar:
+# 1. Todos los servicios deberían estar corriendo
+# 2. El servidor debería responder a peticiones HTTP/HTTPS
+```
+
+#### Opción 2: Simular Inicio (Sin Reiniciar)
+
+Puedes verificar el orden de inicio sin reiniciar el servidor:
+
+```bash
+# Ver el orden de inicio de los servicios
+systemctl list-dependencies multi-user.target | grep -E "udid|celery|nginx|redis|postgresql"
+
+# Esto muestra qué servicios se iniciarán automáticamente y en qué orden
+```
+
+### Verificar que Todo Funciona Después del Reinicio
+
+Después de que el servidor arranque, ejecutar estos comandos para verificar que todos los servicios iniciaron correctamente:
+
+```bash
+# 1. Verificar servicios del sistema
+sudo systemctl status nginx
+sudo systemctl status redis-server
+sudo systemctl status postgresql
+
+# 2. Verificar instancias de Daphne
+sudo /opt/udid/manage_services.sh status
+
+# 3. Verificar Celery
+sudo systemctl status celery-worker
+sudo systemctl status celery-beat
+
+# 4. Verificar que los puertos están escuchando
+sudo ss -tlnp | grep 800    # Puertos de Daphne
+sudo ss -tlnp | grep -E "80|443"  # Puertos de Nginx
+
+# 5. Probar endpoint de salud
+curl -k https://localhost/health
+
+# 6. Verificar Redis
+redis-cli ping
+```
+
+**Todos los servicios deberían mostrar `Active: active (running)`.**
+
+### Solución de Problemas
+
+#### Si un Servicio No Inicia Automáticamente
+
+1. **Verificar que está habilitado:**
+   ```bash
+   sudo systemctl is-enabled nombre-del-servicio
+   ```
+
+2. **Habilitarlo si no lo está:**
+   ```bash
+   sudo systemctl enable nombre-del-servicio
+   ```
+
+3. **Verificar logs para ver por qué no inicia:**
+   ```bash
+   sudo journalctl -u nombre-del-servicio -n 50
+   ```
+
+4. **Iniciar manualmente y verificar:**
+   ```bash
+   sudo systemctl start nombre-del-servicio
+   sudo systemctl status nombre-del-servicio
+   ```
+
+#### Si el Servidor No Arranca Automáticamente Después de un Corte de Energía
+
+Esto puede ser un problema de configuración del BIOS/UEFI del servidor físico:
+
+1. **Acceder al BIOS/UEFI del servidor** (generalmente presionando F2, F12, Del, o Esc durante el arranque)
+
+2. **Buscar opciones como:**
+   - "Power Management"
+   - "AC Recovery"
+   - "After Power Loss"
+   - "Restore on AC Power Loss"
+
+3. **Configurar para que el servidor arranque automáticamente:**
+   - Opción: "Power On" o "Always On"
+   - **NO** configurar como "Power Off" o "Last State"
+
+4. **Guardar y salir del BIOS/UEFI**
+
+> **Nota:** Esta configuración depende del hardware del servidor. En servidores virtuales (VPS, cloud), generalmente ya está configurado para arrancar automáticamente.
+
+### Checklist de Configuración de Inicio Automático
+
+Antes de considerar el despliegue completo, verificar:
+
+- [ ] PostgreSQL habilitado para inicio automático (`systemctl is-enabled postgresql` = enabled)
+- [ ] Redis habilitado para inicio automático (`systemctl is-enabled redis-server` = enabled)
+- [ ] Nginx habilitado para inicio automático (`systemctl is-enabled nginx` = enabled)
+- [ ] Todas las instancias de UDID habilitadas (`systemctl list-unit-files | grep "udid@" | grep enabled`)
+- [ ] Celery Worker habilitado (`systemctl is-enabled celery-worker` = enabled)
+- [ ] Celery Beat habilitado (`systemctl is-enabled celery-beat` = enabled)
+- [ ] Verificación completa muestra todos los servicios habilitados
+- [ ] Prueba de reinicio realizada y todos los servicios iniciaron correctamente
+- [ ] (Opcional) BIOS/UEFI configurado para arranque automático después de corte de energía
 
 ---
 

@@ -5,7 +5,7 @@ from .automatico import RequestUDIDView, ValidateUDIDView, GetSubscriberInfoView
 from .views import (
     RequestUDIDManualView, ValidateAndAssociateUDIDView, AuthenticateWithUDIDView, 
     DisassociateUDIDView, ValidateStatusUDIDView, ListSubscribersWithUDIDView, 
-    MetricsDashboardView, ManualSyncView
+    MetricsDashboardView, ManualSyncView, SubscriberInfoListView
 )
 
 from .sync_views import (
@@ -35,6 +35,7 @@ urlpatterns = [
     #* Public UDID management
     # Note: The public UDID management views are implemented in the views module.
     path('subscriberinfo/',ListSubscribersWithUDIDView.as_view(), name='list-subscribers'),
+    path('search/',SubscriberInfoListView.as_view(), name='search-subscribers'),
     
     #* Funciones de authentication
     # Note: The authentication views are implemented in the auth module.

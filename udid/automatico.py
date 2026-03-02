@@ -49,11 +49,11 @@ class RequestUDIDView(APIView):
             # CAPA 1: Rate limiting por Device Fingerprint
             device_fingerprint = generate_device_fingerprint(request)
             
-            # Verificar rate limit (ajustado: más restrictivo)
+            # Verificar rate limit: 3 solicitudes por dispositivo en 5 minutos
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=2,  # Reducido de 3 a 2 requests por fingerprint
-                window_minutes=10  # Aumentado de 5 a 10 minutos
+                max_requests=3,
+                window_minutes=5
             )
             
             if not is_allowed:

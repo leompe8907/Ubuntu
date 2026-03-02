@@ -435,15 +435,20 @@ CSRF_USE_SESSIONS = False
 X_FRAME_OPTIONS = 'DENY'
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# Configuración específica para APIs móviles
-# Si CSRF_TRUSTED_ORIGINS está en .env, se usa esa, sino se usa la lista por defecto
+# CSRF: orígenes desde los que se aceptan POST (Referer check).
+# Si CSRF_TRUSTED_ORIGINS está en .env, se usa; si no, se reutilizan los orígenes de CORS.
 if DjangoConfig.CSRF_TRUSTED_ORIGINS:
     CSRF_TRUSTED_ORIGINS = DjangoConfig.CSRF_TRUSTED_ORIGINS
+elif DjangoConfig.CORS_ORIGIN_WHITELIST:
+    CSRF_TRUSTED_ORIGINS = list(DjangoConfig.CORS_ORIGIN_WHITELIST)
 else:
-    # Lista por defecto si no está en .env
     CSRF_TRUSTED_ORIGINS = [
-        'https://delancer-c121eb70d8e2.herokuapp.com',
-        'https://*.herokuapp.com',
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://front-udid-eta.vercel.app",
+        "https://smarttv10foot.herokuapp.com",
     ]
 
 

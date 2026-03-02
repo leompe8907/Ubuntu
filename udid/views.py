@@ -99,10 +99,11 @@ class RequestUDIDManualView(APIView):
                         f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
                         f"ip={client_ip}, retry_after={retry_after}s"
                     )
+                    retry_at = timezone.now() + timedelta(seconds=retry_after)
                     return Response({
-                        "error": "Rate limit exceeded",
-                        "message": "Too many requests. Please retry later.",
+                        "error_code": "RATE_LIMIT_EXCEEDED",
                         "retry_after": retry_after,
+                        "retry_at": retry_at.isoformat(),
                         "remaining": remaining
                     }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                         "Retry-After": str(retry_after)
@@ -113,8 +114,8 @@ class RequestUDIDManualView(APIView):
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=2,  # Reducido de 3 a 2 requests por fingerprint
-                window_minutes=10  # Aumentado de 5 a 10 minutos
+                max_requests=3, # requests por dispositivo
+                window_minutes=5 # ventana de tiempo en minutos
             )
             
             if not is_allowed:
@@ -123,10 +124,11 @@ class RequestUDIDManualView(APIView):
                     f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}, "
                     f"retry_after={retry_after}s"
                 )
+                retry_at = timezone.now() + timedelta(seconds=retry_after)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many requests from this device. Please try again later.",
+                    "error_code": "DEVICE_FP_RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
                     "remaining_requests": remaining
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
@@ -181,9 +183,10 @@ class RequestUDIDManualView(APIView):
                 "status": auth_request.status,
                 "expires_in_minutes": 5,
                 "device_fingerprint": auth_request.device_fingerprint,
+                "remaining_requests": remaining - 1,
                 "rate_limit": {
                     "remaining": remaining - 1,
-                    "reset_in_seconds": 10 * 60
+                    "reset_in_seconds": 5 * 60
                 }
             }, status=status.HTTP_201_CREATED)
             
@@ -240,10 +243,11 @@ class ValidateAndAssociateUDIDView(APIView):
                     f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
                     f"ip={client_ip}, retry_after={retry_after}s"
                 )
+                retry_at = timezone.now() + timedelta(seconds=retry_after)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many requests. Please retry later.",
+                    "error_code": "RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
                     "remaining": remaining
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
@@ -264,12 +268,12 @@ class ValidateAndAssociateUDIDView(APIView):
         udid_request = data["udid_request"]   # instancia ya validada por el serializer
         udid = udid_request.udid if hasattr(udid_request, 'udid') else None
         
-        # 4. Rate limiting por UDID (Redis, sin BD)
+        # 4. Rate limiting por UDID (Redis, sin BD): 1 intento por minuto
         if udid:
             is_allowed, remaining, retry_after = check_udid_rate_limit(
                 udid,
-                max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
-                window_minutes=60
+                max_requests=1,
+                window_minutes=1
             )
             
             if not is_allowed:
@@ -278,10 +282,11 @@ class ValidateAndAssociateUDIDView(APIView):
                     f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
                     f"ip={client_ip}, retry_after={retry_after}s"
                 )
+                retry_at = timezone.now() + timedelta(seconds=retry_after)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many association attempts for this UDID. Please try again later.",
+                    "error_code": "UDID_ASSOCIATION_RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
                     "remaining_requests": remaining
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
@@ -351,9 +356,10 @@ class ValidateAndAssociateUDIDView(APIView):
         
         # Agregar información de rate limit si está disponible
         if udid and remaining is not None:
+            response_data["remaining_requests"] = remaining - 1
             response_data["rate_limit"] = {
                 "remaining": remaining - 1,
-                "reset_in_seconds": 60 * 60
+                "reset_in_seconds": 60
             }
 
         return Response(response_data, status=status.HTTP_200_OK)
@@ -437,13 +443,13 @@ class AuthenticateWithUDIDView(APIView):
         # FAST-FAIL: Rate limiting ANTES de tocar la BD
         # ========================================================================
         
-        # 1. Rate limiting con token bucket (Redis, sin BD)
+        # 1. Rate limiting con token bucket (Redis, sin BD): 5 intentos, 1 min entre intentos
         client_token = get_client_token(request)
         if client_token:
             is_allowed, remaining, retry_after = check_token_bucket_lua(
                 identifier=client_token,
-                capacity=10,  # 10 requests
-                refill_rate=1,  # 1 token por segundo
+                capacity=5,
+                refill_rate=1,
                 window_seconds=60,
                 tokens_requested=1
             )
@@ -455,20 +461,21 @@ class AuthenticateWithUDIDView(APIView):
                     f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
                     f"ip={client_ip}, retry_after={retry_after}s"
                 )
+                retry_at = timezone.now() + timedelta(seconds=retry_after)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many requests. Please retry later.",
+                    "error_code": "RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
                     "remaining": remaining
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
                 })
 
-        # 2. Rate limiting por UDID (Redis, sin BD)
+        # 2. Rate limiting por UDID (Redis, sin BD): 5 intentos cada 5 min (1 min entre intentos)
         is_allowed, remaining, retry_after = check_udid_rate_limit(
             udid,
-            max_requests=5,  # Reducido de 10 a 5 para operaciones críticas
-            window_minutes=60
+            max_requests=5,
+            window_minutes=5
         )
         
         if not is_allowed:
@@ -477,10 +484,11 @@ class AuthenticateWithUDIDView(APIView):
                 f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
                 f"ip={client_ip}, retry_after={retry_after}s"
             )
+            retry_at = timezone.now() + timedelta(seconds=retry_after)
             return Response({
-                "error": "Rate limit exceeded",
-                "message": "Too many authentication attempts for this UDID. Please try again later.",
+                "error_code": "UDID_AUTH_RATE_LIMIT_EXCEEDED",
                 "retry_after": retry_after,
+                "retry_at": retry_at.isoformat(),
                 "remaining_requests": remaining
             }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(retry_after)
@@ -506,10 +514,11 @@ class AuthenticateWithUDIDView(APIView):
                 f"retry_delay={retry_delay}s, attempt={attempt_number}, "
                 f"is_reconnection={is_reconnection}, ip={client_ip}"
             )
+            retry_at = timezone.now() + timedelta(seconds=retry_delay)
             return Response({
-                "error": "Service temporarily unavailable",
-                "message": "System is handling high reconnection volume. Please retry after a short delay.",
+                "error_code": "SERVICE_TEMPORARILY_UNAVAILABLE",
                 "retry_after": retry_delay,
+                "retry_at": retry_at.isoformat(),
                 "attempt": attempt_number,
                 "is_reconnection": is_reconnection
             }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
@@ -525,10 +534,11 @@ class AuthenticateWithUDIDView(APIView):
             
             if not is_allowed:
                 retry_delay, _ = get_retry_info(udid, 'reconnection')
+                retry_at = timezone.now() + timedelta(seconds=retry_delay)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "System is handling high reconnection volume. Please retry.",
+                    "error_code": "RECONNECTION_RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_delay,
+                    "retry_at": retry_at.isoformat(),
                     "is_reconnection": True,
                     "reason": reason
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
@@ -654,9 +664,10 @@ class AuthenticateWithUDIDView(APIView):
                         # "key_fingerprint": app_credentials.key_fingerprint
                     },
                     "expires_at": req.expires_at,
+                    "remaining_requests": remaining - 1,
                     "rate_limit": {
                         "remaining": remaining - 1,
-                        "reset_in_seconds": 60 * 60
+                        "reset_in_seconds": 5 * 60
                     }
                 }, status=status.HTTP_200_OK)
 
@@ -710,13 +721,13 @@ class ValidateStatusUDIDView(APIView):
         # FAST-FAIL: Rate limiting ANTES de tocar la BD
         # ========================================================================
         
-        # 1. Rate limiting con token bucket (Redis, sin BD)
+        # 1. Rate limiting con token bucket (Redis, sin BD): 5 intentos, 1 min entre intentos
         client_token = get_client_token(request)
         if client_token:
             is_allowed, remaining, retry_after = check_token_bucket_lua(
                 identifier=client_token,
-                capacity=20,  # 20 requests (más permisivo para validación de estado)
-                refill_rate=1,  # 1 token por segundo
+                capacity=5,
+                refill_rate=1,
                 window_seconds=60,
                 tokens_requested=1
             )
@@ -728,27 +739,29 @@ class ValidateStatusUDIDView(APIView):
                     f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
                     f"ip={client_ip}, retry_after={retry_after}s"
                 )
+                retry_at = timezone.now() + timedelta(seconds=retry_after)
                 return Response({
-                    "error": "Rate limit exceeded",
-                    "message": "Too many requests. Please retry later.",
+                    "error_code": "RATE_LIMIT_EXCEEDED",
                     "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
                     "remaining": remaining
                 }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                     "Retry-After": str(retry_after)
                 })
         
-        # 2. Rate limiting por UDID (Redis, sin BD)
+        # 2. Rate limiting por UDID (Redis, sin BD): 5 intentos cada 5 min
         is_allowed, remaining, retry_after = check_udid_rate_limit(
             udid,
-            max_requests=20,  # Reducido de 30 a 20 validaciones por UDID cada 5 minutos
+            max_requests=5,
             window_minutes=5
         )
         
         if not is_allowed:
+            retry_at = timezone.now() + timedelta(seconds=retry_after)
             return Response({
-                "error": "Rate limit exceeded",
-                "message": "Too many status checks for this UDID. Please try again later.",
+                "error_code": "UDID_STATUS_RATE_LIMIT_EXCEEDED",
                 "retry_after": retry_after,
+                "retry_at": retry_at.isoformat(),
                 "remaining_requests": remaining
             }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(retry_after)
@@ -880,6 +893,7 @@ class ValidateStatusUDIDView(APIView):
         increment_rate_limit_counter('udid', udid)
         
         # Agregar información de rate limit a la respuesta
+        response_data["remaining_requests"] = remaining - 1
         response_data["rate_limit"] = {
             "remaining": remaining - 1,
             "reset_in_seconds": 5 * 60
