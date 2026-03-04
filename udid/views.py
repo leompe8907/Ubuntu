@@ -1,10 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework import status, filters
 from rest_framework.response import Response
-from rest_framework.generics import ListAPIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
-
-from django_filters.rest_framework import DjangoFilterBackend
 
 from django.db.models import Q
 from django.db import transaction
@@ -25,7 +22,7 @@ import hashlib
 import json
 
 from .management.commands.keyGenerator import hybrid_encrypt_for_app
-from .serializers import UDIDAssociationSerializer, PublicSubscriberInfoSerializer
+from .serializers import UDIDAssociationSerializer
 from .util import (
     get_client_ip, compute_encrypted_hash, json_serialize_credentials, is_valid_app_type,
     generate_device_fingerprint, check_device_fingerprint_rate_limit, check_udid_rate_limit,
@@ -87,9 +84,9 @@ class RequestUDIDManualView(APIView):
             if client_token:
                 is_allowed, remaining, retry_after = check_token_bucket_lua(
                     identifier=client_token,
-                    capacity=3,  # 3 requests (más restrictivo para generación de UDID)
-                    refill_rate=1,  # 1 token por segundo
-                    window_seconds=60,
+                    capacity=1,  # 1 token cada 5 min (ventana 5 min entre solicitudes)
+                    refill_rate=1,
+                    window_seconds=300,  # 5 min
                     tokens_requested=1
                 )
                 
@@ -114,8 +111,8 @@ class RequestUDIDManualView(APIView):
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
                 device_fingerprint,
-                max_requests=3, # requests por dispositivo
-                window_minutes=5 # ventana de tiempo en minutos
+                max_requests=1,  # 1 request cada 5 min (ventana 5 min entre solicitudes)
+                window_minutes=5
             )
             
             if not is_allowed:
@@ -1103,17 +1100,81 @@ class ListSubscribersWithUDIDView(APIView):
                 "details": str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-class SubscriberInfoListView(ListAPIView):
+class SubscriberInfoListView(APIView):
     permission_classes = [IsAuthenticated]
-    queryset = SubscriberInfo.objects.all().order_by('subscriber_code')
-    serializer_class = PublicSubscriberInfoSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    
-    # 🔍 Filtros exactos (parámetros: ?subscriber_code=123&sn=XYZ)
-    filterset_fields = ['subscriber_code', 'sn']
-    
-    # 🔎 Búsqueda parcial (parámetro: ?search=juan)
-    search_fields = ['subscriber_code', 'sn', 'login1']
+    """
+    Lista suscriptores con filtros (?subscriber_code=, ?sn=) y búsqueda (?search=).
+    Devuelve los mismos parámetros que ListSubscribersWithUDIDView (incl. campos UDID).
+    """
+    def get(self, request):
+        try:
+            page_number = request.query_params.get('page', 1)
+            page_size = request.query_params.get('page_size', 20)
+            search = request.query_params.get('search', '').strip()
+            subscriber_code_filter = request.query_params.get('subscriber_code', '').strip()
+            sn_filter = request.query_params.get('sn', '').strip()
+
+            subscribers = SubscriberInfo.objects.all().order_by('subscriber_code')
+
+            if subscriber_code_filter:
+                subscribers = subscribers.filter(subscriber_code=subscriber_code_filter)
+            if sn_filter:
+                subscribers = subscribers.filter(sn=sn_filter)
+            if search:
+                search_q = Q(subscriber_code__icontains=search) | Q(sn__icontains=search)
+                if search.isdigit():
+                    search_q |= Q(login1=int(search))
+                subscribers = subscribers.filter(search_q)
+
+            paginator = Paginator(subscribers, page_size)
+            page_obj = paginator.get_page(page_number)
+
+            data = []
+            for subscriber in page_obj.object_list:
+                udid_info = UDIDAuthRequest.objects.filter(
+                    subscriber_code=subscriber.subscriber_code,
+                    sn=subscriber.sn,
+                    status__in=['validated', 'used', 'revoked']
+                ).order_by('-validated_at').first()
+
+                full_data = {
+                    "subscriber_code": subscriber.subscriber_code,
+                    "first_name": subscriber.first_name,
+                    "last_name": subscriber.last_name,
+                    "sn": subscriber.sn,
+                    "activated": subscriber.activated,
+                    "products": subscriber.products,
+                    "packages": subscriber.packages,
+                    "packageNames": subscriber.packageNames,
+                    "model": subscriber.model,
+                    "lastActivation": subscriber.lastActivation,
+                    "lastActivationIP": subscriber.lastActivationIP,
+                    "lastServiceListDownload": subscriber.lastServiceListDownload,
+                    "udid": udid_info.udid if udid_info else None,
+                    "udid_status": udid_info.status if udid_info else None,
+                    "created_at": udid_info.created_at if udid_info else None,
+                    "validated_at": udid_info.validated_at if udid_info else None,
+                    "user_agent": udid_info.user_agent if udid_info else None,
+                    "app_type": udid_info.app_type if udid_info else None,
+                    "app_version": udid_info.app_version if udid_info else None,
+                    "method": udid_info.method if udid_info else None,
+                    "validated_by_operator": udid_info.validated_by_operator if udid_info else None,
+                }
+                clean_data = {k: v for k, v in full_data.items() if v is not None and v != [] and v != ''}
+                data.append(clean_data)
+
+            return Response({
+                "count": paginator.count,
+                "total_pages": paginator.num_pages,
+                "current_page": page_obj.number,
+                "results": data
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                "error": "Error al obtener la información",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class MetricsDashboardView(APIView):
     """

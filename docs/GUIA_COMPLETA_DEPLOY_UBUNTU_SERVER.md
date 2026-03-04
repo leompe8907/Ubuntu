@@ -3526,6 +3526,7 @@ sudo /opt/udid/manage_services.sh status
 sudo systemctl status celery-worker
 sudo systemctl status celery-beat
 sudo systemctl status nginx
+sudo tail -f /var/log/nginx/udid_access.log | grep "/udid/"
 ```
 
 ---
@@ -4687,6 +4688,7 @@ sudo journalctl -u celery-beat -f           # Ver logs de Celery Beat
 sudo tail -f /var/log/nginx/udid_error.log # Ver errores de Nginx
 sudo tail -f /var/log/udid/celery-worker.log  # Ver logs de Worker
 sudo tail -f /var/log/udid/celery-beat.log    # Ver logs de Beat
+sudo tail -f /var/log/nginx/udid_access.log | grep "/udid/"
 
 # === BACKUP DE LOGS ===
 sudo -u udid /opt/udid/backup_logs.sh auto   # Backup automático (verifica tamaño)
