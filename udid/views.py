@@ -79,34 +79,7 @@ class RequestUDIDManualView(APIView):
             # FAST-FAIL: Rate limiting ANTES de tocar la BD
             # ========================================================================
             
-            # 1. Rate limiting con token bucket (Redis, sin BD)
-            client_token = get_client_token(request)
-            if client_token:
-                is_allowed, remaining, retry_after = check_token_bucket_lua(
-                    identifier=client_token,
-                    capacity=1,  # 1 token cada 5 min (ventana 5 min entre solicitudes)
-                    refill_rate=1,
-                    window_seconds=300,  # 5 min
-                    tokens_requested=1
-                )
-                
-                if not is_allowed:
-                    logger.warning(
-                        f"RequestUDIDManualView: Token bucket rate limit excedido - "
-                        f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
-                        f"ip={client_ip}, retry_after={retry_after}s"
-                    )
-                    retry_at = timezone.now() + timedelta(seconds=retry_after)
-                    return Response({
-                        "error_code": "RATE_LIMIT_EXCEEDED",
-                        "retry_after": retry_after,
-                        "retry_at": retry_at.isoformat(),
-                        "remaining": remaining
-                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
-                        "Retry-After": str(retry_after)
-                    })
-            
-            # 2. Rate limiting por Device Fingerprint (Redis, sin BD)
+            # Rate limiting por Device Fingerprint (Redis, sin BD)
             device_fingerprint = generate_device_fingerprint(request)
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(

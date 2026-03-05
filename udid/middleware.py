@@ -45,35 +45,7 @@ class RequestUDIDRateLimitMiddleware(MiddlewareMixin):
 
         client_ip = request.META.get("REMOTE_ADDR", "")
 
-        # 1. Token bucket (si el cliente envía X-Client-Token o UDID)
-        client_token = get_client_token(request)
-        if client_token:
-            is_allowed, remaining, retry_after = check_token_bucket_lua(
-                identifier=client_token,
-                capacity=1,
-                refill_rate=1,
-                window_seconds=300,  # 5 min entre solicitudes
-                tokens_requested=1,
-            )
-            if not is_allowed:
-                logger.warning(
-                    "RequestUDIDRateLimitMiddleware: Token bucket excedido - "
-                    "path=%s, token=%.8s..., ip=%s, retry_after=%ss",
-                    request.path, client_token, client_ip, retry_after,
-                )
-                retry_at = timezone.now() + timedelta(seconds=retry_after)
-                return JsonResponse(
-                    {
-                        "error_code": "RATE_LIMIT_EXCEEDED",
-                        "retry_after": retry_after,
-                        "retry_at": retry_at.isoformat(),
-                        "remaining": remaining,
-                    },
-                    status=429,
-                    headers={"Retry-After": str(retry_after)},
-                )
-
-        # 2. Device fingerprint (1 solicitud cada 5 min, ventana 5 min entre solicitudes)
+        # Rate limiting por Device Fingerprint (1 solicitud cada 5 min)
         device_fingerprint = generate_device_fingerprint(request)
         is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
             device_fingerprint,
