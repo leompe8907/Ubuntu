@@ -312,28 +312,28 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 # SQLite3
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': BASE_DIR / 'db.sqlite3',
-#         'OPTIONS': {
-#             'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
-#         },
-#     }
-# }
-
-# Docker Compose Postgres
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "udid"),
-        "USER": os.getenv("POSTGRES_USER", "udid_user"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
+        },
     }
 }
+
+# Docker Compose Postgres
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.getenv("POSTGRES_DB", "udid"),
+#         "USER": os.getenv("POSTGRES_USER", "udid_user"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
+#         "CONN_MAX_AGE": 60,
+#     }
+# }
 
 # Xampp MariaDB
 # DATABASES = {

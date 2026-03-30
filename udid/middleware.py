@@ -3,7 +3,6 @@ Middleware para rastrear carga del sistema y aplicar protección DDoS.
 """
 import logging
 import time
-import uuid
 from datetime import timedelta
 
 from django.utils.deprecation import MiddlewareMixin
@@ -22,7 +21,6 @@ from .util import (
 )
 from .utils.server.metrics import record_request_latency, record_error, get_metrics
 from .models import APIKey
-from .utils.server.request_queue import get_request_queue
 from .utils.server.degradation import get_degradation_manager, should_degrade
 
 logger = logging.getLogger(__name__)
@@ -315,44 +313,15 @@ class BackpressureMiddleware(MiddlewareMixin):
                         headers={"Retry-After": str(response_data.get('retry_after', 60))}
                     )
             
-            # Si hay degradación, intentar encolar el request
+            # Nota importante:
+            # Evitamos rechazar requests por "cola simulada" cuando no existe
+            # un flujo real de dequeue/espera. Eso generaba 503 falsos incluso
+            # con baja carga (pocas requests).
+            #
+            # La protección fuerte queda en GlobalConcurrencyMiddleware
+            # (semáforo global). Aquí solo exponemos nivel de degradación.
             if degradation_level in ('high', 'critical'):
-                request_queue = get_request_queue()
-                request_id = str(uuid.uuid4())
-                
-                # Intentar encolar
-                success, queue_position, estimated_wait = request_queue.enqueue(
-                    request_id=request_id,
-                    priority=request_priority
-                )
-                
-                if not success:
-                    # Cola llena, rechazar request
-                    response_data, status_code = degradation_manager.get_degraded_response('critical')
-                    return JsonResponse(
-                        response_data,
-                        status=status_code,
-                        headers={"Retry-After": str(response_data.get('retry_after', 60))}
-                    )
-                
-                # Si está en cola, esperar o rechazar según timeout
-                if queue_position > 0:
-                    # Para simplicidad, rechazamos si hay espera significativa
-                    # En producción, se podría implementar espera real
-                    if estimated_wait > 5:  # Más de 5 segundos de espera
-                        response_data, status_code = degradation_manager.get_degraded_response(degradation_level)
-                        return JsonResponse(
-                            {
-                                **response_data,
-                                'queue_position': queue_position,
-                                'estimated_wait': estimated_wait
-                            },
-                            status=status_code,
-                            headers={"Retry-After": str(estimated_wait)}
-                        )
-                
-                # Almacenar request_id para liberarlo después
-                request._queue_request_id = request_id
+                request._degradation_queue_bypassed = True
             
             # Agregar headers de degradación si aplica
             if degradation_level != 'none':
@@ -370,14 +339,6 @@ class BackpressureMiddleware(MiddlewareMixin):
         """
         Libera recursos de la cola después de procesar el request.
         """
-        # Liberar slot de la cola si estaba encolado
-        if hasattr(request, '_queue_request_id'):
-            try:
-                request_queue = get_request_queue()
-                request_queue.release(request._queue_request_id)
-            except Exception as e:
-                logger.error(f"Error releasing queue slot: {e}", exc_info=True)
-        
         # Agregar headers de degradación si aplica
         if hasattr(request, '_degradation_info'):
             degradation_info = request._degradation_info
@@ -393,11 +354,5 @@ class BackpressureMiddleware(MiddlewareMixin):
         """
         Asegura que los recursos se liberen incluso si hay una excepción.
         """
-        if hasattr(request, '_queue_request_id'):
-            try:
-                request_queue = get_request_queue()
-                request_queue.release(request._queue_request_id)
-            except Exception:
-                pass
         return None
 
