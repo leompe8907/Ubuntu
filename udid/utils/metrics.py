@@ -20,6 +20,8 @@ class MetricsCollector:
     def __init__(self):
         self.latencies = deque(maxlen=1000)
         self.error_counts = {'429': 0, '503': 0, '500': 0}
+        self._recent_http_error_flags = deque(maxlen=1000)
+        self._total_http_requests = 0
         self.redis_latencies = deque(maxlen=100)
         self._last_reset = time.time()
     
@@ -32,6 +34,15 @@ class MetricsCollector:
         status_str = str(status_code)
         if status_str in self.error_counts:
             self.error_counts[status_str] += 1
+
+    def record_request_outcome(self, latency_ms, status_code):
+        self.record_latency(latency_ms)
+        self._total_http_requests += 1
+        if status_code in (429, 503, 500):
+            self._recent_http_error_flags.append(1)
+            self.record_error(status_code)
+        else:
+            self._recent_http_error_flags.append(0)
     
     def record_redis_latency(self, latency_ms):
         """Registra latencia de operaciones Redis"""
@@ -41,6 +52,8 @@ class MetricsCollector:
         """Resetea todas las métricas"""
         self.latencies.clear()
         self.error_counts = {'429': 0, '503': 0, '500': 0}
+        self._recent_http_error_flags.clear()
+        self._total_http_requests = 0
         self.redis_latencies.clear()
         self._last_reset = time.time()
     
@@ -65,6 +78,8 @@ class MetricsCollector:
     def _get_base_metrics(self):
         """Obtiene métricas base de latencia y errores"""
         if not self.latencies:
+            rf = self._recent_http_error_flags
+            rolling = (sum(rf) / len(rf)) if rf else 0.0
             return {
                 'p50': 0,
                 'p95': 0,
@@ -74,6 +89,8 @@ class MetricsCollector:
                 'p99_ms': 0,
                 'errors': self.error_counts.copy(),
                 'total_requests': 0,
+                'total_http_requests': self._total_http_requests,
+                'rolling_error_rate': round(rolling, 4),
                 'avg_latency_ms': 0
             }
         
@@ -89,6 +106,9 @@ class MetricsCollector:
         p99 = sorted_latencies[p99_idx] if p99_idx < n else 0
         
         avg_latency = sum(sorted_latencies) / n if n > 0 else 0
+
+        rf = self._recent_http_error_flags
+        rolling_error_rate = (sum(rf) / len(rf)) if rf else 0.0
         
         return {
             'p50': p50,
@@ -99,6 +119,8 @@ class MetricsCollector:
             'p99_ms': round(p99, 2),
             'errors': self.error_counts.copy(),
             'total_requests': n,
+            'total_http_requests': self._total_http_requests,
+            'rolling_error_rate': round(rolling_error_rate, 4),
             'avg_latency_ms': round(avg_latency, 2)
         }
     
@@ -294,6 +316,10 @@ def record_request_latency(latency_ms):
 def record_error(status_code):
     """Registra un error por código de estado"""
     _metrics_collector.record_error(status_code)
+
+
+def record_request_outcome(latency_ms, status_code):
+    _metrics_collector.record_request_outcome(latency_ms, status_code)
 
 
 def record_redis_latency(latency_ms):

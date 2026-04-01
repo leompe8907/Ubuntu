@@ -64,9 +64,13 @@ class DegradationManager:
             elif level == 'medium':
                 level = 'high'
         
-        if error_rate and error_rate > 0.1:  # > 10% errores
+        # rolling_error_rate (ventana reciente); no acumulado incoherente
+        if error_rate and error_rate > 0.35:
             if level != 'critical':
                 level = 'critical'
+        elif error_rate and error_rate > 0.18:
+            if level in ('none', 'medium'):
+                level = 'high'
         
         if cpu_percent and cpu_percent > 90:  # > 90% CPU
             if level == 'none':

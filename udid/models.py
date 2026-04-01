@@ -27,7 +27,7 @@ class ListOfSubscriber(models.Model):
     modified = models.DateField(null=True, blank=True)
 
     def __str__(self):
-        return self.data
+        return self.code or self.id
 
 class ListOfSmartcards(models.Model):
     sn = models.CharField(max_length=100, unique=True, null=True, blank=True)
@@ -67,7 +67,7 @@ class ListOfSmartcards(models.Model):
     hardware = models.CharField(max_length=100, null=True, blank=True)
 
     def __str__(self):
-        return self.data
+        return str(self.sn or self.pk)
 
 class SubscriberLoginInfo(models.Model):
     subscriberCode = models.CharField(max_length=100, null=True, blank=True)
@@ -78,7 +78,7 @@ class SubscriberLoginInfo(models.Model):
     licenses = models.JSONField(null=True, blank=True)
 
     def __str__(self):
-        return self.data
+        return str(self.subscriberCode or self.pk)
 
 class SubscriberInfo(models.Model):
     # Subscriber fields
@@ -167,7 +167,7 @@ class SubscriberInfo(models.Model):
         self.save()
 
     def __str__(self):
-        return self.data
+        return f"{self.subscriber_code}:{self.sn or '-'}"
 
 class AuthAuditLog(models.Model):
     ACTION_TYPES = [
@@ -575,6 +575,8 @@ class APIKey(models.Model):
     Las API keys se usan para autenticar requests y aplicar cuotas.
     """
     key = models.CharField(max_length=128, unique=True, db_index=True)
+    # SHA-256 hex (64) de la key; búsqueda preferente sin depender solo del texto plano en columnas indexadas
+    key_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     name = models.CharField(max_length=100, null=True, blank=True)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='api_keys')
     plan = models.ForeignKey(Plan, on_delete=models.PROTECT, related_name='api_keys')
@@ -621,27 +623,36 @@ class APIKey(models.Model):
         """Marca la API key como usada (actualiza last_used_at)"""
         self.last_used_at = timezone.now()
         self.save(update_fields=['last_used_at'])
+
+    def save(self, *args, **kwargs):
+        if self.key:
+            from udid.utils.server.token_signing import hash_api_key
+            self.key_hash = hash_api_key(self.key)
+        super().save(*args, **kwargs)
     
     @classmethod
     def find_by_key(cls, api_key):
         """
         Encuentra una API key por su valor original.
-        Compara directamente la key (para compatibilidad con migración).
-        En producción, debería comparar hashes.
-        
-        Args:
-            api_key: API key original a buscar
-            
-        Returns:
-            APIKey: Instancia de APIKey si se encuentra, None si no
+        Preferencia: búsqueda por key_hash; compatibilidad: columna key (legacy).
         """
+        if not api_key:
+            return None
+        from udid.utils.server.token_signing import hash_api_key
+        h = hash_api_key(api_key)
+        qs = cls.objects.filter(is_active=True)
         try:
-            return cls.objects.get(key=api_key, is_active=True)
+            return qs.get(key_hash=h)
+        except cls.DoesNotExist:
+            pass
+        except cls.MultipleObjectsReturned:
+            return qs.filter(key_hash=h).first()
+        try:
+            return qs.get(key=api_key)
         except cls.DoesNotExist:
             return None
         except cls.MultipleObjectsReturned:
-            # Si hay múltiples, retornar el primero
-            return cls.objects.filter(key=api_key, is_active=True).first()
+            return qs.filter(key=api_key).first()
     
     def __str__(self):
         return f"{self.name or 'Unnamed'} ({self.tenant.name}) - {self.key[:16]}..."

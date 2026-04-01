@@ -1,6 +1,10 @@
 # udid/services.py
+import logging
+
 from django.db import transaction
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from .models import (UDIDAuthRequest,SubscriberInfo,AppCredentials,EncryptedCredentialsLog,)
 from .management.commands.keyGenerator import hybrid_encrypt_for_app
@@ -191,5 +195,5 @@ def authenticate_with_udid_service(
             }
 
     except Exception as e:
-        # Error inesperado no controlado
-        return {"ok": False, "error": "Internal server error", "code": "internal_error", "details": str(e)}
+        logger.exception("authenticate_with_udid_service failed")
+        return {"ok": False, "error": "Internal server error", "code": "internal_error"}

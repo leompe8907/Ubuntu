@@ -5,10 +5,11 @@ Endpoints que ejecutan procesos de sincronización completos de suscriptores, sm
 """
 import logging
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework import status
 
+from .api_errors import handle_view_exception, response_upstream_unavailable
 from .utils.panaccess.subscriber import (
     sync_subscribers,
     DataBaseEmpty,
@@ -29,8 +30,16 @@ from .utils.panaccess.exceptions import PanaccessException
 logger = logging.getLogger(__name__)
 
 
+def _with_success_false(response):
+    """Añade success=False al JSON sin mutar el objeto Response de forma frágil."""
+    data = response.data
+    payload = dict(data) if isinstance(data, dict) else {"detail": data}
+    payload["success"] = False
+    return Response(payload, status=response.status_code)
+
+
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAdminUser])
 def sync_subscribers_view(request):
     """
     Vista para sincronizar suscriptores desde PanAccess.
@@ -83,15 +92,14 @@ def sync_subscribers_view(request):
         }, status=status.HTTP_200_OK)
         
     except PanaccessException as e:
-        error_msg = f"Error de PanAccess: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        return Response({
-            'success': False,
-            'error_type': type(e).__name__,
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+        return _with_success_false(
+            response_upstream_unavailable(
+                "sync_subscribers_view",
+                message="PanAccess no disponible o rechazó la sincronización de suscriptores.",
+                exc=e,
+            )
+        )
+
     except ValueError as e:
         error_msg = f"Error de parámetros: {str(e)}"
         logger.error(f"❌ {error_msg}")
@@ -103,17 +111,10 @@ def sync_subscribers_view(request):
         }, status=status.HTTP_400_BAD_REQUEST)
         
     except Exception as e:
-        error_msg = f"Error inesperado: {str(e)}"
-        logger.error(f"💥 {error_msg}", exc_info=True)
-        
-        return Response({
-            'success': False,
-            'error_type': 'Exception',
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return _with_success_false(handle_view_exception("sync_subscribers_view", e))
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAdminUser])
 def sync_smartcards_view(request):
     """
     Vista para sincronizar smartcards desde PanAccess.
@@ -166,15 +167,14 @@ def sync_smartcards_view(request):
         }, status=status.HTTP_200_OK)
         
     except PanaccessException as e:
-        error_msg = f"Error de PanAccess: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        return Response({
-            'success': False,
-            'error_type': type(e).__name__,
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+        return _with_success_false(
+            response_upstream_unavailable(
+                "sync_smartcards_view",
+                message="PanAccess no disponible o rechazó la sincronización de smartcards.",
+                exc=e,
+            )
+        )
+
     except ValueError as e:
         error_msg = f"Error de parámetros: {str(e)}"
         logger.error(f"❌ {error_msg}")
@@ -186,17 +186,10 @@ def sync_smartcards_view(request):
         }, status=status.HTTP_400_BAD_REQUEST)
         
     except Exception as e:
-        error_msg = f"Error inesperado: {str(e)}"
-        logger.error(f"💥 {error_msg}", exc_info=True)
-        
-        return Response({
-            'success': False,
-            'error_type': 'Exception',
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return _with_success_false(handle_view_exception("sync_smartcards_view", e))
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAdminUser])
 def sync_logins_view(request):
     """
     Vista para sincronizar credenciales de login de suscriptores desde PanAccess.
@@ -237,37 +230,19 @@ def sync_logins_view(request):
         }, status=status.HTTP_200_OK)
         
     except PanaccessException as e:
-        error_msg = f"Error de PanAccess: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        return Response({
-            'success': False,
-            'error_type': type(e).__name__,
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-    except ValueError as e:
-        error_msg = f"Error de parámetros: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        return Response({
-            'success': False,
-            'error_type': 'ValueError',
-            'message': str(e)
-        }, status=status.HTTP_400_BAD_REQUEST)
-        
+        return _with_success_false(
+            response_upstream_unavailable(
+                "sync_logins_view",
+                message="PanAccess no disponible o rechazó la sincronización de logins.",
+                exc=e,
+            )
+        )
+
     except Exception as e:
-        error_msg = f"Error inesperado: {str(e)}"
-        logger.error(f"💥 {error_msg}", exc_info=True)
-        
-        return Response({
-            'success': False,
-            'error_type': 'Exception',
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return _with_success_false(handle_view_exception("sync_logins_view", e))
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAdminUser])
 def sync_subscriberinfo_view(request):
     """
     Vista para sincronizar y consolidar información de suscriptores en SubscriberInfo.
@@ -343,15 +318,14 @@ def sync_subscriberinfo_view(request):
         }, status=status.HTTP_200_OK)
         
     except PanaccessException as e:
-        error_msg = f"Error de PanAccess: {str(e)}"
-        logger.error(f"❌ {error_msg}")
-        
-        return Response({
-            'success': False,
-            'error_type': type(e).__name__,
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+        return _with_success_false(
+            response_upstream_unavailable(
+                "sync_subscriberinfo_view",
+                message="PanAccess o consolidación de SubscriberInfo falló.",
+                exc=e,
+            )
+        )
+
     except ValueError as e:
         error_msg = f"Error de parámetros: {str(e)}"
         logger.error(f"❌ {error_msg}")
@@ -363,11 +337,4 @@ def sync_subscriberinfo_view(request):
         }, status=status.HTTP_400_BAD_REQUEST)
         
     except Exception as e:
-        error_msg = f"Error inesperado: {str(e)}"
-        logger.error(f"💥 {error_msg}", exc_info=True)
-        
-        return Response({
-            'success': False,
-            'error_type': 'Exception',
-            'message': str(e)
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return _with_success_false(handle_view_exception("sync_subscriberinfo_view", e))

@@ -4,9 +4,6 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# Cargar variables desde el archivo .env
-load_dotenv()
-
 def _getenv_or_default(name, default=None):
     """
     Obtiene una variable de entorno del .env.

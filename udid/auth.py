@@ -6,6 +6,8 @@ from rest_framework.permissions import AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from django.db.utils import IntegrityError
+
+from udid.api_errors import handle_view_exception
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.core.exceptions import ValidationError
@@ -163,15 +165,19 @@ class RegisterUserView(APIView):
                 }
             }, status=status.HTTP_201_CREATED)
 
-        except IntegrityError as e:
-            logger.error(
+        except IntegrityError:
+            logger.warning(
                 f"RegisterUserView: Error de integridad - "
-                f"username={username}, email={email}, ip={client_ip}, error={str(e)}", exc_info=True
+                f"username={username}, email={email}, ip={client_ip}",
+                exc_info=True,
             )
             increment_register_attempt(device_fingerprint, window_minutes=60)
-            return Response({
-                "error": f"Error de integridad en la base de datos: {str(e)}. El usuario pudo haberse creado pero el perfil no se completó."
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": "No se pudo completar el registro por conflicto de datos. Intente de nuevo.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except ValidationError as e:
             logger.warning(
                 f"RegisterUserView: Error de validación - "
@@ -183,15 +189,11 @@ class RegisterUserView(APIView):
                 "details": e.message_dict
             }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(
-                f"RegisterUserView: Error inesperado - "
-                f"username={username}, ip={client_ip}, error={str(e)}", exc_info=True
-            )
             increment_register_attempt(device_fingerprint, window_minutes=60)
-            return Response({
-                "error": "Error inesperado al registrar el usuario.",
-                "details": str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return handle_view_exception(
+                f"RegisterUserView username={username!r}",
+                e,
+            )
 class LoginView(APIView):
     permission_classes = [AllowAny]
     
@@ -285,7 +287,9 @@ class LoginView(APIView):
         # Obtener operador si existe
         try:
             operator_code = user.userprofile.operator_code
-        except:
+        except UserProfile.DoesNotExist:
+            operator_code = None
+        except AttributeError:
             operator_code = None
 
         logger.info(

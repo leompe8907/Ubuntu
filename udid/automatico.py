@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 
 from django.utils import timezone
+from django.db import transaction
 
 from datetime import timedelta
 
@@ -26,6 +27,7 @@ from udid.util import (
 )
 
 from .management.commands.keyGenerator import hybrid_encrypt_for_app, rsa_encrypt_for_app
+from .api_errors import handle_view_exception, response_encryption_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -123,14 +125,7 @@ class RequestUDIDView(APIView):
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
-            logger.error(
-                f"RequestUDIDView: Error interno - "
-                f"ip={client_ip}, error={str(e)}", exc_info=True
-            )
-            return Response({
-                "error": "Internal server error",
-                "message": "An error occurred while processing your request"
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return handle_view_exception(f"RequestUDIDView ip={client_ip}", e)
 
 class ValidateUDIDView(APIView):
     permission_classes = [AllowAny]
@@ -234,6 +229,13 @@ class ValidateUDIDView(APIView):
                 "error": "Subscriber code no válido."
             }, status=status.HTTP_404_NOT_FOUND)
 
+        # Expirar filas colgantes del mismo subscriber antes de validar (merge con segunda definición previa)
+        UDIDAuthRequest.objects.filter(
+            subscriber_code=subscriber_code,
+            expires_at__lt=timezone.now(),
+            status__in=['validated', 'pending'],
+        ).update(status='expired', sn=None)
+
         # Actualizar registro
         req.status = "validated"
         req.validated_at = timezone.now()
@@ -318,13 +320,23 @@ class GetSubscriberInfoView(APIView):
                 "Retry-After": str(retry_after)
             })
 
-        #✅ Intentar obtener la solicitud de UDID
+        if not is_valid_app_type(app_type):
+            return Response({
+                "error": f"Invalid app_type. Must be one of: android_tv, samsung_tv, lg_tv, set_top_box, mobile_app, web_player",
+                "received": app_type
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        return self._execute_get_subscriber_info(
+            request, udid, app_type, app_version, client_ip, user_agent, remaining
+        )
+
+    @transaction.atomic
+    def _execute_get_subscriber_info(self, request, udid, app_type, app_version, client_ip, user_agent, remaining):
         try:
-            req = UDIDAuthRequest.objects.get(udid=udid)
+            req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
         except UDIDAuthRequest.DoesNotExist:
             return Response({"error": "UDID no encontrado."}, status=status.HTTP_404_NOT_FOUND)
 
-        # ✅ VALIDAR ESTADO DE LA SOLICITUD
         if req.status != "validated":
             return Response({
                 "error": f"UDID no está validado. Estado actual: {req.status}"
@@ -337,46 +349,22 @@ class GetSubscriberInfoView(APIView):
                 "error": "El token ha expirado."
             }, status=status.HTTP_403_FORBIDDEN)
 
-        #✅ Validar tipo de app usando la función centralizada
-        if not is_valid_app_type(app_type):
-            return Response({
-                "error": f"Invalid app_type. Must be one of: android_tv, samsung_tv, lg_tv, set_top_box, mobile_app, web_player",
-                "received": app_type
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        # ✅ VERIFICAR UDID
-        try:
-            req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({
-                "error": "UDID no encontrado."
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        # ✅ VALIDAR CREDENCIALES DE APLICACIÓN
         try:
             app_credentials = AppCredentials.objects.get(
                 app_type=app_type,
                 app_version=app_version,
                 is_active=True
             )
-            
             if not app_credentials.is_usable():
-                raise AppCredentials.DoesNotExist("Credenciales no utilizables")
-                
+                raise AppCredentials.DoesNotExist()
         except AppCredentials.DoesNotExist:
-            # Intentar con cualquier versión activa del mismo tipo
-            try:
-                app_credentials = AppCredentials.objects.filter(
-                    app_type=app_type,
-                    is_active=True
-                ).exclude(
-                    is_compromised=True
-                ).order_by('-created_at').first()
-                
-                if not app_credentials:
-                    raise AppCredentials.DoesNotExist()
-                    
-            except:
+            app_credentials = AppCredentials.objects.filter(
+                app_type=app_type,
+                is_active=True
+            ).exclude(
+                is_compromised=True
+            ).order_by('-created_at').first()
+            if not app_credentials:
                 return Response({
                     "error": f"No hay credenciales seguras disponibles para app_type='{app_type}'",
                     "details": {
@@ -386,23 +374,15 @@ class GetSubscriberInfoView(APIView):
                     }
                 }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        # ✅ ACTUALIZAR INFO DE APP EN UDID
         req.app_type = app_type
         req.app_version = app_version
         req.app_credentials_used = app_credentials
         req.save()
 
-        #✅ Verificar si el token ha expirado
         if req.is_expired():
             req.status = "expired"
             req.save()
             return Response({"error": "El token ha expirado."}, status=status.HTTP_403_FORBIDDEN)
-
-        # ✅ LIMPIAR UDIDS EXPIRADOS
-        UDIDAuthRequest.objects.filter(
-            expires_at__lt=timezone.now(),
-            status__in=['validated', 'pending']
-        ).update(status='expired', sn=None)
 
         #✅ PASO 1: Buscar subscriber code
         subscriber_code = req.subscriber_code
@@ -444,13 +424,14 @@ class GetSubscriberInfoView(APIView):
             udid=udid
         ).values('sn', 'app_type', 'udid')
 
-        print(f"🔍 DEBUG - Subscriber: {subscriber_code}")
-        print(f"🔍 DEBUG - App Type solicitado: {app_type}")
-        print(f"🔍 DEBUG - SNs ocupados (todos los tipos): {list(used_sns_via_udid)}")
-        print(f"🔍 DEBUG - Detalles de SNs ocupados:")
-        for usage in used_sns_with_app_type:
-            print(f"    SN {usage['sn']} → {usage['app_type']} (UDID: {usage['udid'][:8]}...)")
-        print(f"🔍 DEBUG - Total SNs disponibles: {subscriber_infos.count()}")
+        logger.debug(
+            "GetSubscriberInfoView: subscriber=%s app_type=%s used_sns=%s details=%s total_candidates=%s",
+            subscriber_code,
+            app_type,
+            list(used_sns_via_udid),
+            list(used_sns_with_app_type),
+            subscriber_infos.count(),
+        )
 
         #✅ PASO 4: Buscar SN disponible (que NO esté en uso por NINGÚN tipo de app)
         selected_subscriber = None
@@ -462,7 +443,7 @@ class GetSubscriberInfoView(APIView):
                 if not selected_subscriber:
                     selected_subscriber = sub
         
-        print(f"🔍 DEBUG - SNs completamente disponibles: {available_sns}")
+        logger.debug("GetSubscriberInfoView: available_sns=%s", available_sns)
         
         #✅ PASO 5: Si no hay SNs disponibles, mostrar detalles específicos
         if not selected_subscriber:
@@ -500,7 +481,7 @@ class GetSubscriberInfoView(APIView):
         req.sn = selected_subscriber.sn
         req.save()
 
-        print(f"✅ DEBUG - SN asignado: {selected_subscriber.sn} a UDID: {udid}")
+        logger.debug("GetSubscriberInfoView: sn_assigned=%s udid=%s", selected_subscriber.sn, udid)
 
         # ✅ ENCRIPTACIÓN SEGURA
         try:
@@ -526,14 +507,8 @@ class GetSubscriberInfoView(APIView):
             req.mark_credentials_delivered(app_credentials)
             
         except Exception as e:
-            self._log_failed_attempt(req, f"Encryption error: {str(e)}", request)
-            return Response({
-                "error": "Error en encriptación de credenciales",
-                "details": {
-                    "app_type": app_type,
-                    "solution": "Contacte al administrador del sistema"
-                }
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            self._log_failed_attempt(req, "Encryption error", request)
+            return response_encryption_unavailable("GetSubscriberInfoView:encrypt", e)
 
         # ✅ PREPARAR RESPUESTA SEGURA
         response_data = {
@@ -864,9 +839,12 @@ class SNUsageStatsView(APIView):
             sn = udid['sn']
             # Si ya existe esta SN, es un error de lógica (no debería pasar)
             if sn in sns_in_use:
-                print(f"⚠️ WARNING: SN {sn} está siendo usado por múltiples app_types:")
-                print(f"    Existente: {sns_in_use[sn]['app_type']}")
-                print(f"    Nuevo: {udid['app_type']}")
+                logger.warning(
+                    "SNUsageStatsView: SN %s usado por múltiples app_types existente=%s nuevo=%s",
+                    sn,
+                    sns_in_use[sn].get("app_type"),
+                    udid.get("app_type"),
+                )
             sns_in_use[sn] = udid
         
         # Preparar respuesta detallada
@@ -911,67 +889,6 @@ class SNUsageStatsView(APIView):
                 "remaining": remaining - 1,
                 "reset_in_seconds": 5 * 60
             }
-        }, status=status.HTTP_200_OK)
-
-class ValidateUDIDView(APIView):
-    permission_classes = [AllowAny]
-    def post(self, request):
-        # Intentar obtener parámetros del body primero, luego de query params
-        udid = request.data.get('udid') or request.query_params.get('udid')
-        temp_token = request.data.get('temp_token') or request.query_params.get('temp_token')
-        subscriber_code = request.data.get('subscriber_code') or request.query_params.get('subscriber_code')
-        operator_id = request.data.get('operator_id') or request.query_params.get('operator_id')  # opcional
-
-        # Validaciones iniciales
-        if not all([udid, temp_token, subscriber_code]):
-            return Response({"error": "Parámetros incompletos."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            req = UDIDAuthRequest.objects.get(udid=udid, temp_token=temp_token)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({"error": "Solicitud inválida o token incorrecto."}, status=status.HTTP_404_NOT_FOUND)
-
-        if req.status != "pending":
-            return Response({"error": "El UDID ya fue validado, usado o revocado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if req.is_expired():
-            req.status = "expired"
-            req.save()
-            return Response({"error": "El token ha expirado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not ListOfSubscriber.objects.filter(code=subscriber_code).exists():
-            return Response({"error": "Subscriber code no válido."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Limpiar SNs de UDIDs expirados del mismo subscriber antes de validar
-        UDIDAuthRequest.objects.filter(
-            subscriber_code=subscriber_code,
-            expires_at__lt=timezone.now(),
-            status__in=['validated', 'pending']
-        ).update(status='expired', sn=None)
-
-        # Actualizar registro
-        req.status = "validated"
-        req.validated_at = timezone.now()
-        req.subscriber_code = subscriber_code
-        req.validated_by_operator = operator_id
-        req.save()
-
-        # Log de auditoría (asíncrono)
-        log_audit_async(
-            action_type='udid_validated',
-            udid=udid,
-            subscriber_code=subscriber_code,
-            operator_id=operator_id,
-            client_ip=request.META.get('REMOTE_ADDR'),
-            user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            details={"message": "UDID validado correctamente"}
-        )
-
-        return Response({
-            "message": "UDID validado exitosamente.",
-            "udid": udid,
-            "subscriber_code": subscriber_code,
-            "expires_at": req.expires_at
         }, status=status.HTTP_200_OK)
 
 def validate_device_sn_association(udid, device_fingerprint=None, client_ip=None):
