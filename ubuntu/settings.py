@@ -491,6 +491,8 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    # Handler global: el proyecto requiere evitar cualquier 5xx
+    'EXCEPTION_HANDLER': 'udid.api_errors.drf_exception_handler',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': DjangoConfig.REST_FRAMEWORK_PAGE_SIZE,
     'DEFAULT_FILTER_BACKENDS': [

@@ -5,6 +5,7 @@ from rest_framework.permissions import AllowAny
 
 from django.utils import timezone
 from django.db import transaction
+from django.db.utils import OperationalError
 
 from datetime import timedelta
 
@@ -332,76 +333,84 @@ class GetSubscriberInfoView(APIView):
 
     @transaction.atomic
     def _execute_get_subscriber_info(self, request, udid, app_type, app_version, client_ip, user_agent, remaining):
+        # Este método corre dentro de una transacción: si SQLite se bloquea o hay errores de BD
+        # debemos convertirlos en 503/409/400 coherentes para no devolver 500 y “parecer” que el
+        # servidor quedó colgado (típico de locks de SQLite bajo concurrencia).
         try:
-            req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({"error": "UDID no encontrado."}, status=status.HTTP_404_NOT_FOUND)
+            try:
+                req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
+            except UDIDAuthRequest.DoesNotExist:
+                return Response({"error": "UDID no encontrado."}, status=status.HTTP_404_NOT_FOUND)
 
-        if req.status != "validated":
-            return Response({
-                "error": f"UDID no está validado. Estado actual: {req.status}"
-            }, status=status.HTTP_403_FORBIDDEN)
-
-        if req.is_expired():
-            req.status = "expired"
-            req.save()
-            return Response({
-                "error": "El token ha expirado."
-            }, status=status.HTTP_403_FORBIDDEN)
-
-        try:
-            app_credentials = AppCredentials.objects.get(
-                app_type=app_type,
-                app_version=app_version,
-                is_active=True
-            )
-            if not app_credentials.is_usable():
-                raise AppCredentials.DoesNotExist()
-        except AppCredentials.DoesNotExist:
-            app_credentials = AppCredentials.objects.filter(
-                app_type=app_type,
-                is_active=True
-            ).exclude(
-                is_compromised=True
-            ).order_by('-created_at').first()
-            if not app_credentials:
+            if req.status != "validated":
                 return Response({
-                    "error": f"No hay credenciales seguras disponibles para app_type='{app_type}'",
-                    "details": {
-                        "requested_version": app_version,
-                        "app_type": app_type,
-                        "solution": "Contacte al administrador para generar nuevas credenciales"
-                    }
-                }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                    "error": f"UDID no está validado. Estado actual: {req.status}"
+                }, status=status.HTTP_403_FORBIDDEN)
 
-        req.app_type = app_type
-        req.app_version = app_version
-        req.app_credentials_used = app_credentials
-        req.save()
+            if req.is_expired():
+                req.status = "expired"
+                req.save()
+                return Response({
+                    "error": "El token ha expirado."
+                }, status=status.HTTP_403_FORBIDDEN)
 
-        if req.is_expired():
-            req.status = "expired"
+            try:
+                app_credentials = AppCredentials.objects.get(
+                    app_type=app_type,
+                    app_version=app_version,
+                    is_active=True
+                )
+                if not app_credentials.is_usable():
+                    raise AppCredentials.DoesNotExist()
+            except AppCredentials.DoesNotExist:
+                app_credentials = AppCredentials.objects.filter(
+                    app_type=app_type,
+                    is_active=True
+                ).exclude(
+                    is_compromised=True
+                ).order_by('-created_at').first()
+                if not app_credentials:
+                    return Response({
+                        "error": f"No hay credenciales seguras disponibles para app_type='{app_type}'",
+                        "details": {
+                            "requested_version": app_version,
+                            "app_type": app_type,
+                            "solution": "Contacte al administrador para generar nuevas credenciales"
+                        }
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={"Retry-After": "10"})
+
+            req.app_type = app_type
+            req.app_version = app_version
+            req.app_credentials_used = app_credentials
             req.save()
-            return Response({"error": "El token ha expirado."}, status=status.HTTP_403_FORBIDDEN)
 
-        #✅ PASO 1: Buscar subscriber code
-        subscriber_code = req.subscriber_code
+            if req.is_expired():
+                req.status = "expired"
+                req.save()
+                return Response({"error": "El token ha expirado."}, status=status.HTTP_403_FORBIDDEN)
 
-        #✅ PASO 2: Filtrar todas las SNs del subscriber con productos asociados
-        subscriber_infos = SubscriberInfo.objects.filter(
-            subscriber_code=subscriber_code
-        ).exclude(
-            products__isnull=True
-        ).exclude(
-            products=[]
-        )
+            #✅ PASO 1: Buscar subscriber code
+            subscriber_code = req.subscriber_code
 
-        if not subscriber_infos.exists():
-            self._log_failed_attempt(req, "No smartcards with products", request)
-            req.mark_as_used()
-            return Response({
-                "error": "El usuario no tiene productos asociados a su cuenta."
-            }, status=status.HTTP_404_NOT_FOUND)
+            #✅ PASO 2: Filtrar todas las SNs del subscriber con productos asociados
+            subscriber_infos = SubscriberInfo.objects.filter(
+                subscriber_code=subscriber_code
+            ).exclude(
+                products__isnull=True
+            ).exclude(
+                products=[]
+            )
+
+            if not subscriber_infos.exists():
+                self._log_failed_attempt(req, "No smartcards with products", request)
+                req.mark_as_used()
+                return Response({
+                    "error": "El usuario no tiene productos asociados a su cuenta."
+                }, status=status.HTTP_404_NOT_FOUND)
+        except OperationalError as e:
+            return handle_view_exception("GetSubscriberInfoView:db", e)
+        except Exception as e:
+            return handle_view_exception("GetSubscriberInfoView:unexpected", e)
 
         #✅ PASO 3: Validar qué SNs están asociados a UDIDs activos (CUALQUIER APP_TYPE)
         used_sns_via_udid = UDIDAuthRequest.objects.filter(

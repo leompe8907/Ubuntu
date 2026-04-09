@@ -3,6 +3,9 @@ import os
 import random
 import string
 import json
+import time
+import math
+import gevent
 
 # ============================================================
 # CONFIGURACIÓN DEL ESCENARIO (AJUSTABLE)
@@ -26,6 +29,12 @@ SPAWN_RATE = int(os.getenv("SPAWN_RATE", "50"))
 
 # Cuánto tiempo mantener el pico (en minutos)
 HOLD_PEAK_MINUTES = int(os.getenv("HOLD_PEAK_MINUTES", "5"))
+
+# Reintentos ante 429 (sin 5xx en backend)
+MAX_RETRIES_429 = int(os.getenv("MAX_RETRIES_429", "3"))
+BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "0.5"))
+BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "10"))
+BACKOFF_JITTER_RATIO = float(os.getenv("BACKOFF_JITTER_RATIO", "0.3"))
 
 
 # ============================================================
@@ -63,6 +72,32 @@ def build_headers():
     return headers
 
 
+def _parse_retry_after_seconds(response):
+    """
+    Retry-After puede venir como segundos (RFC) o faltar.
+    Preferimos respetarlo si está.
+    """
+    ra = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+    if not ra:
+        return None
+    try:
+        seconds = int(str(ra).strip())
+        return max(0, seconds)
+    except Exception:
+        return None
+
+
+def _exp_backoff_seconds(attempt_number):
+    """
+    Backoff exponencial con jitter.
+    attempt_number: 1,2,3...
+    """
+    base = BACKOFF_BASE_SECONDS * (2 ** (attempt_number - 1))
+    base = min(base, BACKOFF_MAX_SECONDS)
+    jitter = base * BACKOFF_JITTER_RATIO
+    return max(0.0, base + random.uniform(-jitter, jitter))
+
+
 # ============================================================
 # USUARIO DE LOCUST (COMPORTAMIENTO)
 # ============================================================
@@ -84,23 +119,49 @@ class UdidUser(HttpUser):
         """
         payload = build_udid_payload()
 
-        with self.client.post(
-            UDID_VALIDATE_PATH,
-            data=json.dumps(payload),
-            headers=self.headers,
-            name="UDID validate",
-            catch_response=True,
-        ) as response:
-            # Si querés ser estricto, marcá como fallo cualquier cosa que no sea 2xx
-            if response.status_code >= 500:
-                response.failure(f"Error 5xx: {response.status_code} - {response.text}")
-            elif response.status_code == 429:
-                response.failure("Rate limited (429)")
-            elif response.status_code == 503:
-                response.failure("Server overloaded (503)")
-            else:
-                # Si querés aceptar 4xx como parte del flujo (ej: UDID inválido), podés tratarlos distinto
-                response.success()
+        last_response = None
+        for attempt in range(1, MAX_RETRIES_429 + 2):  # 1 intento + N retries
+            with self.client.post(
+                UDID_VALIDATE_PATH,
+                data=json.dumps(payload),
+                headers=self.headers,
+                name="UDID validate",
+                catch_response=True,
+            ) as response:
+                last_response = response
+
+                # Backend ajustado para no devolver 5xx; si aparece, lo marcamos como fallo fuerte.
+                if 500 <= response.status_code <= 599:
+                    response.failure(f"Unexpected 5xx: {response.status_code} - {response.text}")
+                    return
+
+                # 429: respetar Retry-After si existe y reintentar con backoff.
+                if response.status_code == 429:
+                    retry_after = _parse_retry_after_seconds(response)
+                    sleep_s = retry_after if retry_after is not None else _exp_backoff_seconds(attempt)
+
+                    if attempt <= MAX_RETRIES_429:
+                        response.success()  # No contar como fallo: es control de carga
+                        gevent.sleep(sleep_s)
+                        continue
+
+                    response.failure(f"Rate limited (429) after retries. Last Retry-After={retry_after}")
+                    return
+
+                # 2xx OK
+                if 200 <= response.status_code <= 299:
+                    response.success()
+                    return
+
+                # 4xx esperables del flujo (UDID inválido, etc.): no “rompen” el servidor.
+                # Ajustá esta lista según tu lógica de negocio.
+                if response.status_code in (400, 401, 403, 404, 409):
+                    response.success()
+                    return
+
+                # Cualquier otro status lo marcamos como fallo.
+                response.failure(f"Unexpected status: {response.status_code} - {response.text}")
+                return
 
 
 # ============================================================

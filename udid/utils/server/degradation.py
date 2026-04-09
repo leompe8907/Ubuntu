@@ -105,7 +105,7 @@ class DegradationManager:
                 'message': 'System is under extreme load. Please try again later.',
                 'retry_after': 60,
                 'degradation_level': 'critical'
-            }, 503
+            }, 429
         
         elif level == 'high':
             return {

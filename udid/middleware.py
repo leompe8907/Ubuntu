@@ -126,12 +126,12 @@ class GlobalConcurrencyMiddleware(MiddlewareMixin):
         )
         
         if not acquired:
-            # Retornar respuesta 503 con Retry-After
+            # Requisito del proyecto: evitar 5xx → usar 429 con Retry-After
             return JsonResponse({
                 "error": "Service temporarily unavailable",
                 "message": "System is handling high load. Please retry after the specified time.",
                 "retry_after": retry_after
-            }, status=503, headers={"Retry-After": str(retry_after)})
+            }, status=429, headers={"Retry-After": str(retry_after)})
         
         # Almacenar slot_id en request para liberarlo después
         request._semaphore_slot_id = slot_id
@@ -259,7 +259,7 @@ class APIKeyAuthMiddleware(MiddlewareMixin):
                     "error": "Service temporarily unavailable",
                     "message": "Authentication service error. Please retry.",
                 },
-                status=503,
+                status=429,
                 headers={"Retry-After": "30"},
             )
 

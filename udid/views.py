@@ -206,7 +206,7 @@ class RequestUDIDManualView(APIView):
                         "error_code": "SERVICE_TEMPORARILY_UNAVAILABLE",
                         "detail": "Could not allocate a unique UDID. Please retry.",
                     },
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
                     headers={"Retry-After": "2"},
                 )
             
@@ -258,7 +258,7 @@ class RequestUDIDManualView(APIView):
             return Response({
                 "error_code": "SERVICE_TEMPORARILY_UNAVAILABLE",
                 "detail": "The service is currently experiencing high load. Please try again later."
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": "5"
             })
         except Exception as e:
@@ -314,10 +314,15 @@ class ValidateAndAssociateUDIDView(APIView):
                     "Retry-After": str(retry_after)
                 })
         
-        # 2. Validación básica de datos (sin BD)
-        serializer = UDIDAssociationSerializer(data=request.data)
-        
-        if not serializer.is_valid():
+        # 2. Validación básica de datos
+        # Nota: el serializer consulta BD; si SQLite está lockeada puede lanzar OperationalError.
+        try:
+            serializer = UDIDAssociationSerializer(data=request.data)
+            is_valid = serializer.is_valid()
+        except Exception as e:
+            return handle_view_exception("ValidateAndAssociateUDIDView:serializer", e)
+
+        if not is_valid:
             logger.warning(
                 f"ValidateAndAssociateUDIDView: Datos inválidos - "
                 f"ip={client_ip}, errors={serializer.errors}"
@@ -364,34 +369,37 @@ class ValidateAndAssociateUDIDView(APIView):
         # ========================================================================
         
         # 5. AHORA SÍ: select_for_update() - al final, después de todas las validaciones
-        with transaction.atomic():
-            # Bloqueo optimista de la fila del request
-            udid_request = UDIDAuthRequest.objects.select_for_update().get(pk=udid_request.pk)
-            
-            # Asegurar que tenemos el UDID
-            udid = udid_request.udid
+        try:
+            with transaction.atomic():
+                # Bloqueo optimista de la fila del request
+                udid_request = UDIDAuthRequest.objects.select_for_update().get(pk=udid_request.pk)
+                
+                # Asegurar que tenemos el UDID
+                udid = udid_request.udid
 
-            # Asociar y marcar como validated (auditoría adentro)
-            self.associate_udid_with_subscriber(
-                udid_request, subscriber, sn, operator_id, method, request
-            )
+                # Asociar y marcar como validated (auditoría adentro)
+                self.associate_udid_with_subscriber(
+                    udid_request, subscriber, sn, operator_id, method, request
+                )
 
-            # Notificar a los WebSockets que esperan este UDID: al commit
-            def _notify():
-                try:
-                    channel_layer = get_channel_layer()
-                    if channel_layer:
-                        async_to_sync(channel_layer.group_send)(
-                            f"udid_{udid}",              # 👈 mismo group que usa el consumer
-                            {"type": "udid.validated", "udid": udid}  # 👈 llama a AuthWaitWS.udid_validated
-                        )
-                        logger.info("Notificado udid.validated para %s", udid)
-                    else:
-                        logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
-                except Exception as e:
-                    logger.exception("Error notificando WebSocket para udid %s: %s", udid, e)
+                # Notificar a los WebSockets que esperan este UDID: al commit
+                def _notify():
+                    try:
+                        channel_layer = get_channel_layer()
+                        if channel_layer:
+                            async_to_sync(channel_layer.group_send)(
+                                f"udid_{udid}",              # 👈 mismo group que usa el consumer
+                                {"type": "udid.validated", "udid": udid}  # 👈 llama a AuthWaitWS.udid_validated
+                            )
+                            logger.info("Notificado udid.validated para %s", udid)
+                        else:
+                            logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
+                    except Exception as e:
+                        logger.exception("Error notificando WebSocket para udid %s: %s", udid, e)
 
-            transaction.on_commit(_notify)
+                transaction.on_commit(_notify)
+        except Exception as e:
+            return handle_view_exception("ValidateAndAssociateUDIDView:atomic", e)
 
         logger.info(
             f"ValidateAndAssociateUDIDView: Asociación exitosa - "
@@ -582,7 +590,7 @@ class AuthenticateWithUDIDView(APIView):
                 "retry_at": retry_at.isoformat(),
                 "attempt": attempt_number,
                 "is_reconnection": is_reconnection
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(retry_delay),
                 "X-Retry-After": str(retry_delay)
             })
@@ -649,7 +657,7 @@ class AuthenticateWithUDIDView(APIView):
                     return Response({
                         "error": f"No valid app credentials available for app_type='{app_type}'",
                         "solution": "Contact administrator"
-                    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={"Retry-After": "10"})
 
                 # Encriptar credenciales
                 try:

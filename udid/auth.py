@@ -58,7 +58,7 @@ class RegisterUserView(APIView):
                 "error": "Service temporarily unavailable",
                 "message": "System is under high load. Please try again later.",
                 "retry_after": breaker_retry_after
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(breaker_retry_after)
             })
 
@@ -223,7 +223,7 @@ class LoginView(APIView):
                 "error": "Service temporarily unavailable",
                 "message": "System is under high load. Please try again later.",
                 "retry_after": breaker_retry_after
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
+            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
                 "Retry-After": str(breaker_retry_after)
             })
 
