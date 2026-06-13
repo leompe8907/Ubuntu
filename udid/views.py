@@ -987,6 +987,10 @@ class DisassociateUDIDView(APIView):
                     }
                 )
 
+                # Incrementar contador de rate limiting
+                if udid:
+                    increment_rate_limit_counter('udid', udid)
+
                 return Response({
                     "message": f"UDID {req.udid} was successfully disassociated",
                     "revoked_at": req.revoked_at,
