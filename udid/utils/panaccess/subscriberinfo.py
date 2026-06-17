@@ -291,13 +291,21 @@ def compare_and_update_subscriber_data(subscriber_code):
 
 def sync_merge_all_subscribers():
     """
-    Sincroniza smartcards hacia SubscriberInfo.
-    Usa recorrido directo de ListOfSmartcards para no omitir ninguna SN.
+    Sincronización incremental para tareas periódicas (cada 5 min).
+    Procesa códigos de suscriptor; no recorre las ~400k smartcards completas.
+    Para carga inicial o reparación masiva usar sync_all_smartcards_bulk().
     """
-    logger.info("[sync_merge_all_subscribers] Iniciando sincronización de suscriptores...")
+    logger.info("[sync_merge_all_subscribers] Iniciando sincronización incremental...")
     try:
-        total = sync_all_smartcards_bulk()
-        logger.info(f"[sync_merge_all_subscribers] Finalizado. Smartcards procesadas: {total}")
+        codes = sorted(get_all_subscriber_codes())
+        logger.info(f"[sync_merge_all_subscribers] Códigos a procesar: {len(codes)}")
+        total_created = 0
+        for code in codes:
+            total_created += sync_subscriber_code(code) or 0
+        logger.info(
+            f"[sync_merge_all_subscribers] Finalizado. "
+            f"Códigos: {len(codes)}, registros nuevos: {total_created}"
+        )
     except Exception as e:
         logger.error(f"[sync_merge_all_subscribers] Error inesperado: {str(e)}")
         raise
