@@ -1115,7 +1115,12 @@ class SubscriberInfoListView(APIView):
             subscriber_code_filter = request.query_params.get('subscriber_code', '').strip()
             sn_filter = request.query_params.get('sn', '').strip()
 
-            subscribers = SubscriberInfo.objects.all().order_by('subscriber_code')
+            subscribers = (
+                SubscriberInfo.objects
+                .exclude(sn__isnull=True)
+                .exclude(sn='')
+                .order_by('subscriber_code')
+            )
 
             if subscriber_code_filter:
                 subscribers = subscribers.filter(subscriber_code__istartswith=subscriber_code_filter)
