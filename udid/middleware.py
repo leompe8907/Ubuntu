@@ -1,20 +1,74 @@
 """
 Middleware para rastrear carga del sistema y aplicar protección DDoS.
 """
+import logging
 import time
+from datetime import timedelta
+
 from django.utils.deprecation import MiddlewareMixin
 from django.http import JsonResponse
+from django.utils import timezone
+
 from .util import (
     track_system_request,
     acquire_global_semaphore,
     release_global_semaphore,
-    check_plan_rate_limit
+    check_plan_rate_limit,
+    generate_device_fingerprint,
+    check_device_fingerprint_rate_limit,
+    get_client_token,
+    check_token_bucket_lua,
 )
 from .utils.server.metrics import record_request_latency, record_error, get_metrics
 from .models import APIKey
-from .utils.server.request_queue import get_request_queue
 from .utils.server.degradation import get_degradation_manager, should_degrade
-import uuid
+
+logger = logging.getLogger(__name__)
+
+
+class RequestUDIDRateLimitMiddleware(MiddlewareMixin):
+    """
+    Rate limiting temprano solo para GET /udid/request-udid-manual/.
+    Se ejecuta ANTES del semáforo global para devolver 429 (abuso por dispositivo)
+    sin consumir slot, evitando que requests abusivos reciban 503 por saturación.
+    """
+    REQUEST_UDID_MANUAL_PATH = "/udid/request-udid-manual/"
+
+    def process_request(self, request):
+        path = request.path.rstrip("/") or request.path
+        if path != self.REQUEST_UDID_MANUAL_PATH.rstrip("/"):
+            return None
+        if request.method != "GET":
+            return None
+
+        client_ip = request.META.get("REMOTE_ADDR", "")
+
+        # Rate limiting por Device Fingerprint (1 solicitud cada 5 min)
+        device_fingerprint = generate_device_fingerprint(request)
+        is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
+            device_fingerprint,
+            max_requests=1,
+            window_minutes=5,
+        )
+        if not is_allowed:
+            logger.warning(
+                "RequestUDIDRateLimitMiddleware: Device fingerprint excedido - "
+                "path=%s, device_fp=%.8s..., ip=%s, retry_after=%ss",
+                request.path, device_fingerprint or "", client_ip, retry_after,
+            )
+            retry_at = timezone.now() + timedelta(seconds=retry_after)
+            return JsonResponse(
+                {
+                    "error_code": "DEVICE_FP_RATE_LIMIT_EXCEEDED",
+                    "retry_after": retry_after,
+                    "retry_at": retry_at.isoformat(),
+                    "remaining_requests": remaining,
+                },
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        return None
 
 
 class SystemLoadTrackingMiddleware(MiddlewareMixin):
@@ -259,44 +313,15 @@ class BackpressureMiddleware(MiddlewareMixin):
                         headers={"Retry-After": str(response_data.get('retry_after', 60))}
                     )
             
-            # Si hay degradación, intentar encolar el request
+            # Nota importante:
+            # Evitamos rechazar requests por "cola simulada" cuando no existe
+            # un flujo real de dequeue/espera. Eso generaba 503 falsos incluso
+            # con baja carga (pocas requests).
+            #
+            # La protección fuerte queda en GlobalConcurrencyMiddleware
+            # (semáforo global). Aquí solo exponemos nivel de degradación.
             if degradation_level in ('high', 'critical'):
-                request_queue = get_request_queue()
-                request_id = str(uuid.uuid4())
-                
-                # Intentar encolar
-                success, queue_position, estimated_wait = request_queue.enqueue(
-                    request_id=request_id,
-                    priority=request_priority
-                )
-                
-                if not success:
-                    # Cola llena, rechazar request
-                    response_data, status_code = degradation_manager.get_degraded_response('critical')
-                    return JsonResponse(
-                        response_data,
-                        status=status_code,
-                        headers={"Retry-After": str(response_data.get('retry_after', 60))}
-                    )
-                
-                # Si está en cola, esperar o rechazar según timeout
-                if queue_position > 0:
-                    # Para simplicidad, rechazamos si hay espera significativa
-                    # En producción, se podría implementar espera real
-                    if estimated_wait > 5:  # Más de 5 segundos de espera
-                        response_data, status_code = degradation_manager.get_degraded_response(degradation_level)
-                        return JsonResponse(
-                            {
-                                **response_data,
-                                'queue_position': queue_position,
-                                'estimated_wait': estimated_wait
-                            },
-                            status=status_code,
-                            headers={"Retry-After": str(estimated_wait)}
-                        )
-                
-                # Almacenar request_id para liberarlo después
-                request._queue_request_id = request_id
+                request._degradation_queue_bypassed = True
             
             # Agregar headers de degradación si aplica
             if degradation_level != 'none':
@@ -314,14 +339,6 @@ class BackpressureMiddleware(MiddlewareMixin):
         """
         Libera recursos de la cola después de procesar el request.
         """
-        # Liberar slot de la cola si estaba encolado
-        if hasattr(request, '_queue_request_id'):
-            try:
-                request_queue = get_request_queue()
-                request_queue.release(request._queue_request_id)
-            except Exception as e:
-                logger.error(f"Error releasing queue slot: {e}", exc_info=True)
-        
         # Agregar headers de degradación si aplica
         if hasattr(request, '_degradation_info'):
             degradation_info = request._degradation_info
@@ -337,11 +354,5 @@ class BackpressureMiddleware(MiddlewareMixin):
         """
         Asegura que los recursos se liberen incluso si hay una excepción.
         """
-        if hasattr(request, '_queue_request_id'):
-            try:
-                request_queue = get_request_queue()
-                request_queue.release(request._queue_request_id)
-            except Exception:
-                pass
         return None
 

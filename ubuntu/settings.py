@@ -273,6 +273,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "udid.middleware.SystemLoadTrackingMiddleware",
+    "udid.middleware.RequestUDIDRateLimitMiddleware",
     "udid.middleware.GlobalConcurrencyMiddleware",
     "udid.middleware.BackpressureMiddleware",
     "udid.middleware.APIKeyAuthMiddleware",
@@ -322,35 +323,35 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # }
 
 # Docker Compose Postgres
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.postgresql",
-#         "NAME": os.getenv("POSTGRES_DB", "udid"),
-#         "USER": os.getenv("POSTGRES_USER", "udid_user"),
-#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
-#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
-#         "CONN_MAX_AGE": 60,
-#     }
-# }
-
-# Xampp MariaDB
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'udid',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': DatabaseConfig.MYSQL_HOST,  # cambia a "db" si usas docker-compose
-        'PORT': DatabaseConfig.MYSQL_PORT,
-        'OPTIONS': {
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-        },
-        # Optimizaciones para mejor rendimiento con carga alta
-        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
-        'AUTOCOMMIT': True,
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("POSTGRES_DB", "udid"),
+        "USER": os.getenv("POSTGRES_USER", "udid_user"),
+        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
     }
 }
+
+# Xampp MariaDB
+#DATABASES = {
+#    'default': {
+#        'ENGINE': 'django.db.backends.mysql',
+#        'NAME': 'udid',
+#        'USER': 'root',
+#        'PASSWORD': '',
+#        'HOST': DatabaseConfig.MYSQL_HOST,  # cambia a "db" si usas docker-compose
+#        'PORT': DatabaseConfig.MYSQL_PORT,
+#        'OPTIONS': {
+#            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#        },
+#        # Optimizaciones para mejor rendimiento con carga alta
+#        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
+#        'AUTOCOMMIT': True,
+#    }
+#}
 
 # Heroku Postgres
 # DATABASES = {
@@ -385,20 +386,31 @@ AUTH_PASSWORD_VALIDATORS = [
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 
-# DjangoConfig.CORS_ORIGIN_WHITELIST
-# Usar la configuración de DjangoConfig que viene de CORS_ALLOWED_ORIGINS en .env
-if DjangoConfig.CORS_ORIGIN_WHITELIST:
-    # Usar la configuración de DjangoConfig (viene de CORS_ALLOWED_ORIGINS en .env)
-    CORS_ORIGIN_WHITELIST = DjangoConfig.CORS_ORIGIN_WHITELIST
-else:
-    # Lista por defecto si no está configurado
-    CORS_ORIGIN_WHITELIST = [
-        'http://localhost:8000',
-        'http://127.0.0.1:8000',
-        'http://localhost:3000',
-        'http://localhost:5173',
-        'https://front-udid-eta.vercel.app',
-    ]
+# Usar la configuración de DjangoConfig que viene de CORS_ALLOWED_ORIGINS en .env.
+# En CORS el "origin" es solo scheme + host (+ puerto), NO la ruta ni query.
+# Por eso normalizamos URLs completas a su origin (scheme://netloc).
+def _normalize_cors_origin(value: str) -> str:
+    value = (value or "").strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return value
+
+_DEFAULT_CORS_ORIGIN_WHITELIST = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://front-udid-eta.vercel.app",
+    "https://smarttv10foot.herokuapp.com",
+    "https://bromteck.com",
+]
+
+_cors_allowed = DjangoConfig.CORS_ORIGIN_WHITELIST or _DEFAULT_CORS_ORIGIN_WHITELIST
+# django-cors-headers >= 4 usa CORS_ALLOWED_ORIGINS.
+# Mantenemos CORS_ORIGIN_WHITELIST solo como compatibilidad con configuraciones antiguas.
+CORS_ALLOWED_ORIGINS = [_normalize_cors_origin(o) for o in _cors_allowed]
+CORS_ORIGIN_WHITELIST = CORS_ALLOWED_ORIGINS
 
 CORS_ALLOW_HEADERS = [
     'accept',               # Tipo de contenido que el cliente acepta recibir
@@ -435,15 +447,21 @@ CSRF_USE_SESSIONS = False
 X_FRAME_OPTIONS = 'DENY'
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# Configuración específica para APIs móviles
-# Si CSRF_TRUSTED_ORIGINS está en .env, se usa esa, sino se usa la lista por defecto
+# CSRF: orígenes desde los que se aceptan POST (Referer check).
+# Si CSRF_TRUSTED_ORIGINS está en .env, se usa; si no, se reutilizan los orígenes de CORS.
 if DjangoConfig.CSRF_TRUSTED_ORIGINS:
     CSRF_TRUSTED_ORIGINS = DjangoConfig.CSRF_TRUSTED_ORIGINS
+elif DjangoConfig.CORS_ORIGIN_WHITELIST:
+    CSRF_TRUSTED_ORIGINS = list(DjangoConfig.CORS_ORIGIN_WHITELIST)
 else:
-    # Lista por defecto si no está en .env
     CSRF_TRUSTED_ORIGINS = [
-        'https://delancer-c121eb70d8e2.herokuapp.com',
-        'https://*.herokuapp.com',
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://front-udid-eta.vercel.app",
+        "https://smarttv10foot.herokuapp.com",
+        "https://bromteck.com",
     ]
 
 

@@ -224,9 +224,13 @@ def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, wind
     if cached_count is not None:
         remaining = max(0, max_requests - cached_count)
         if cached_count >= max_requests:
-            # Calcular tiempo de espera
-            retry_after = window_minutes * 60
-            # Log de rate limit excedido
+            # Obtener tiempo restante real hasta que expire la ventana (TTL)
+            ttl_fn = getattr(cache, 'ttl', None)
+            if callable(ttl_fn):
+                remaining_seconds = ttl_fn(cache_key)
+                retry_after = max(1, int(remaining_seconds)) if remaining_seconds and remaining_seconds > 0 else window_minutes * 60
+            else:
+                retry_after = window_minutes * 60
             logger.warning(
                 f"Rate limit exceeded: device_fingerprint={device_fingerprint[:8]}..., "
                 f"count={cached_count}, limit={max_requests}, "
@@ -265,8 +269,13 @@ def check_udid_rate_limit(udid, max_requests=20, window_minutes=60):
     if cached_count is not None:
         remaining = max(0, max_requests - cached_count)
         if cached_count >= max_requests:
-            retry_after = window_minutes * 60
-            # Log de rate limit excedido
+            # Obtener tiempo restante real hasta que expire la ventana (TTL)
+            ttl_fn = getattr(cache, 'ttl', None)
+            if callable(ttl_fn):
+                remaining_seconds = ttl_fn(cache_key)
+                retry_after = max(1, int(remaining_seconds)) if remaining_seconds and remaining_seconds > 0 else window_minutes * 60
+            else:
+                retry_after = window_minutes * 60
             logger.warning(
                 f"Rate limit exceeded: udid={udid[:8] if len(udid) > 8 else udid}..., "
                 f"count={cached_count}, limit={max_requests}, "
