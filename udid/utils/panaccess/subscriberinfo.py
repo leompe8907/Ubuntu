@@ -29,6 +29,25 @@ def get_all_subscriber_codes():
     return codes
 
 
+def _smartcard_row_to_data(sc):
+    """Convierte un registro ListOfSmartcards a dict para SubscriberInfo."""
+    return {
+        'sn': sc.sn,
+        'pin': sc.pin,
+        'first_name': sc.firstName,
+        'last_name': sc.lastName,
+        'lastActivation': sc.lastActivation,
+        'lastContact': sc.lastContact,
+        'lastServiceListDownload': sc.lastServiceListDownload,
+        'lastActivationIP': sc.lastActivationIP,
+        'lastApiKeyId': sc.lastApiKeyId,
+        'products': sc.products if sc.products else [],
+        'packages': sc.packages if sc.packages else [],
+        'packageNames': sc.packageNames if sc.packageNames else [],
+        'model': sc.model,
+    }
+
+
 def get_smartcard_data(subscriber_code):
     """
     Busca todos los datos de smartcards para un suscriptor por código.
@@ -46,22 +65,7 @@ def get_smartcard_data(subscriber_code):
             if not sc.sn:
                 logger.warning(f"[get_smartcard_data] Smartcard sin SN, se omite: {sc.id}")
                 continue
-
-            result.append({
-                'sn': sc.sn,
-                'pin': sc.pin,
-                'first_name': sc.firstName,
-                'last_name': sc.lastName,
-                'lastActivation': sc.lastActivation,
-                'lastContact': sc.lastContact,
-                'lastServiceListDownload': sc.lastServiceListDownload,
-                'lastActivationIP': sc.lastActivationIP,
-                'lastApiKeyId': sc.lastApiKeyId,
-                'products': sc.products if sc.products else [],
-                'packages': sc.packages if sc.packages else [],
-                'packageNames': sc.packageNames if sc.packageNames else [],
-                'model': sc.model,
-            })
+            result.append(_smartcard_row_to_data(sc))
 
         return result
 
@@ -148,6 +152,76 @@ def _upsert_subscriber_info_record(subscriber_code, smartcard_data, login_data=N
     return created
 
 
+def sync_smartcard_record(sc):
+    """Consolida un registro ListOfSmartcards en SubscriberInfo."""
+    if not sc or not sc.sn:
+        return False
+    if not sc.subscriberCode:
+        logger.warning(f"[sync_smartcard_record] SN={sc.sn} sin subscriberCode, no se consolida")
+        return False
+    login_data = get_login_data(sc.subscriberCode)
+    _upsert_subscriber_info_record(sc.subscriberCode, _smartcard_row_to_data(sc), login_data)
+    return True
+
+
+def sync_smartcard_by_sn(sn):
+    """
+    Consolida una SN concreta desde ListOfSmartcards hacia SubscriberInfo.
+    Útil cuando la smartcard existe pero aún no pasó por el merge masivo.
+    """
+    sn = str(sn).strip()
+    if not sn:
+        return False
+    if SubscriberInfo.objects.filter(sn=sn).exists():
+        return True
+    sc = ListOfSmartcards.objects.filter(sn=sn).first()
+    if not sc:
+        logger.warning(f"[sync_smartcard_by_sn] SN={sn} no encontrada en ListOfSmartcards")
+        return False
+    return sync_smartcard_record(sc)
+
+
+def ensure_sn_searchable(sn):
+    """Garantiza que una SN esté en SubscriberInfo si existe en ListOfSmartcards."""
+    return sync_smartcard_by_sn(sn)
+
+
+def sync_all_smartcards_bulk(transaction_size=100):
+    """
+    Consolida TODAS las smartcards hacia SubscriberInfo recorriendo ListOfSmartcards.
+    Más fiable que iterar solo por códigos de suscriptor.
+    """
+    logger.info("[sync_all_smartcards_bulk] Iniciando consolidación masiva desde smartcards...")
+    qs = (
+        ListOfSmartcards.objects
+        .exclude(sn__isnull=True).exclude(sn='')
+        .exclude(subscriberCode__isnull=True).exclude(subscriberCode='')
+    )
+    total = 0
+    batch = []
+
+    for sc in qs.iterator(chunk_size=500):
+        batch.append(sc)
+        if len(batch) < transaction_size:
+            continue
+        with transaction.atomic():
+            for item in batch:
+                sync_smartcard_record(item)
+        total += len(batch)
+        batch = []
+        if total % 5000 == 0:
+            logger.info(f"[sync_all_smartcards_bulk] Procesadas {total} smartcards...")
+
+    if batch:
+        with transaction.atomic():
+            for item in batch:
+                sync_smartcard_record(item)
+        total += len(batch)
+
+    logger.info(f"[sync_all_smartcards_bulk] Finalizado. Total procesadas: {total}")
+    return total
+
+
 def sync_subscriber_code(subscriber_code):
     """
     Sincroniza todas las SN de un suscriptor hacia SubscriberInfo (crear + actualizar).
@@ -217,24 +291,13 @@ def compare_and_update_subscriber_data(subscriber_code):
 
 def sync_merge_all_subscribers():
     """
-    Sincroniza todos los códigos conocidos hacia SubscriberInfo.
-    Procesa cada suscriptor (crea SN nuevas y actualiza existentes).
+    Sincroniza smartcards hacia SubscriberInfo.
+    Usa recorrido directo de ListOfSmartcards para no omitir ninguna SN.
     """
     logger.info("[sync_merge_all_subscribers] Iniciando sincronización de suscriptores...")
-
     try:
-        codes = sorted(get_all_subscriber_codes())
-        logger.info(f"[sync_merge_all_subscribers] Total de códigos a procesar: {len(codes)}")
-
-        total_created = 0
-        for code in codes:
-            total_created += sync_subscriber_code(code) or 0
-
-        logger.info(
-            f"[sync_merge_all_subscribers] Finalizado. "
-            f"Códigos: {len(codes)}, registros nuevos: {total_created}"
-        )
-
+        total = sync_all_smartcards_bulk()
+        logger.info(f"[sync_merge_all_subscribers] Finalizado. Smartcards procesadas: {total}")
     except Exception as e:
         logger.error(f"[sync_merge_all_subscribers] Error inesperado: {str(e)}")
         raise

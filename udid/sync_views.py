@@ -304,18 +304,10 @@ def sync_subscriberinfo_view(request):
         
         # Ejecutar según el modo
         if mode == 'full':
-            logger.info("📥 Modo: Consolidación completa (fuerza merge de todos)")
-            # Obtener todos los códigos y hacer merge completo
-            codes = sorted(get_all_subscriber_codes())
-            logger.info(f"📊 Total de códigos a procesar: {len(codes)}")
-            
-            from .utils.panaccess.subscriberinfo import merge_subscriber_data
-            total_processed = 0
-            for code in codes:
-                merge_subscriber_data(code)
-                total_processed += 1
-            
-            message = f"Consolidación completa de {total_processed} suscriptores en SubscriberInfo completada"
+            logger.info("📥 Modo: Consolidación completa desde ListOfSmartcards")
+            from .utils.panaccess.subscriberinfo import sync_all_smartcards_bulk
+            total_processed = sync_all_smartcards_bulk()
+            message = f"Consolidación completa de {total_processed} smartcards en SubscriberInfo completada"
             result = {'total_processed': total_processed, 'mode': 'full'}
             
         else:  # mode == 'sync' (default)

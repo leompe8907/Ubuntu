@@ -1125,7 +1125,13 @@ class SubscriberInfoListView(APIView):
             if subscriber_code_filter:
                 subscribers = subscribers.filter(subscriber_code__istartswith=subscriber_code_filter)
             if sn_filter:
-                subscribers = subscribers.filter(sn__istartswith=sn_filter)
+                from .utils.panaccess.subscriberinfo import ensure_sn_searchable
+                # SN completa (10+ dígitos): consolidar al vuelo si falta en SubscriberInfo
+                if len(sn_filter) >= 10 and sn_filter.isdigit():
+                    ensure_sn_searchable(sn_filter)
+                    subscribers = subscribers.filter(sn=sn_filter)
+                else:
+                    subscribers = subscribers.filter(sn__istartswith=sn_filter)
             if search:
                 search_q = Q(subscriber_code__icontains=search) | Q(sn__icontains=search)
                 if search.isdigit():
