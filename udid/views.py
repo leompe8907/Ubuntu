@@ -31,7 +31,7 @@ from .util import (
     should_apply_retry_delay, reset_retry_info, get_retry_info,
     get_client_token, check_token_bucket_lua
 )
-from .models import UDIDAuthRequest, SubscriberInfo, ListOfSmartcards, AppCredentials, EncryptedCredentialsLog
+from .models import UDIDAuthRequest, SubscriberInfo, AppCredentials, EncryptedCredentialsLog
 from .utils.server.log_buffer import log_audit_async
 from .utils.server.metrics import get_metrics, reset_metrics
 from .cron import execute_sync_tasks
@@ -79,7 +79,34 @@ class RequestUDIDManualView(APIView):
             # FAST-FAIL: Rate limiting ANTES de tocar la BD
             # ========================================================================
             
-            # Rate limiting por Device Fingerprint (Redis, sin BD)
+            # 1. Rate limiting con token bucket (Redis, sin BD)
+            client_token = get_client_token(request)
+            if client_token:
+                is_allowed, remaining, retry_after = check_token_bucket_lua(
+                    identifier=client_token,
+                    capacity=1,  # 1 token cada 5 min (ventana 5 min entre solicitudes)
+                    refill_rate=1,
+                    window_seconds=300,  # 5 min
+                    tokens_requested=1
+                )
+                
+                if not is_allowed:
+                    logger.warning(
+                        f"RequestUDIDManualView: Token bucket rate limit excedido - "
+                        f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                        f"ip={client_ip}, retry_after={retry_after}s"
+                    )
+                    retry_at = timezone.now() + timedelta(seconds=retry_after)
+                    return Response({
+                        "error_code": "RATE_LIMIT_EXCEEDED",
+                        "retry_after": retry_after,
+                        "retry_at": retry_at.isoformat(),
+                        "remaining": remaining
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                        "Retry-After": str(retry_after)
+                    })
+            
+            # 2. Rate limiting por Device Fingerprint (Redis, sin BD)
             device_fingerprint = generate_device_fingerprint(request)
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
@@ -987,10 +1014,6 @@ class DisassociateUDIDView(APIView):
                     }
                 )
 
-                # Incrementar contador de rate limiting
-                if udid:
-                    increment_rate_limit_counter('udid', udid)
-
                 return Response({
                     "message": f"UDID {req.udid} was successfully disassociated",
                     "revoked_at": req.revoked_at,
@@ -1081,101 +1104,9 @@ class SubscriberInfoListView(APIView):
     permission_classes = [IsAuthenticated]
     """
     Lista suscriptores con filtros (?subscriber_code=, ?sn=) y búsqueda (?search=).
-    Busca en SubscriberInfo y ListOfSmartcards. Devuelve los mismos parámetros que
-    ListSubscribersWithUDIDView (incl. campos UDID).
+    Los filtros subscriber_code y sn hacen coincidencia por prefijo (istartswith).
+    Devuelve los mismos parámetros que ListSubscribersWithUDIDView (incl. campos UDID).
     """
-
-    def _clean_result(self, full_data):
-        return {k: v for k, v in full_data.items() if v is not None and v != [] and v != ''}
-
-    def _get_udid_info(self, subscriber_code, sn):
-        query = UDIDAuthRequest.objects.filter(
-            sn=sn,
-            status__in=['validated', 'used', 'revoked'],
-        )
-        if subscriber_code:
-            query = query.filter(subscriber_code=subscriber_code)
-        return query.order_by('-validated_at').first()
-
-    def _build_udid_fields(self, udid_info):
-        return {
-            "udid": udid_info.udid if udid_info else None,
-            "udid_status": udid_info.status if udid_info else None,
-            "created_at": udid_info.created_at if udid_info else None,
-            "validated_at": udid_info.validated_at if udid_info else None,
-            "user_agent": udid_info.user_agent if udid_info else None,
-            "app_type": udid_info.app_type if udid_info else None,
-            "app_version": udid_info.app_version if udid_info else None,
-            "method": udid_info.method if udid_info else None,
-            "validated_by_operator": udid_info.validated_by_operator if udid_info else None,
-        }
-
-    def _build_from_subscriber_info(self, subscriber):
-        udid_info = self._get_udid_info(subscriber.subscriber_code, subscriber.sn)
-        return self._clean_result({
-            "subscriber_code": subscriber.subscriber_code,
-            "first_name": subscriber.first_name,
-            "last_name": subscriber.last_name,
-            "sn": subscriber.sn,
-            "activated": subscriber.activated,
-            "products": subscriber.products,
-            "packages": subscriber.packages,
-            "packageNames": subscriber.packageNames,
-            "model": subscriber.model,
-            "lastActivation": subscriber.lastActivation,
-            "lastActivationIP": subscriber.lastActivationIP,
-            "lastServiceListDownload": subscriber.lastServiceListDownload,
-            **self._build_udid_fields(udid_info),
-        })
-
-    def _build_from_smartcard(self, smartcard):
-        udid_info = self._get_udid_info(smartcard.subscriberCode, smartcard.sn)
-        return self._clean_result({
-            "subscriber_code": smartcard.subscriberCode,
-            "first_name": smartcard.firstName,
-            "last_name": smartcard.lastName,
-            "sn": smartcard.sn,
-            "products": smartcard.products,
-            "packages": smartcard.packages,
-            "packageNames": smartcard.packageNames,
-            "model": smartcard.model,
-            "lastActivation": smartcard.lastActivation,
-            "lastActivationIP": smartcard.lastActivationIP,
-            "lastServiceListDownload": smartcard.lastServiceListDownload,
-            **self._build_udid_fields(udid_info),
-        })
-
-    def _filter_subscriber_info(self, subscriber_code_filter, sn_filter, search):
-        subscribers = SubscriberInfo.objects.all().order_by('subscriber_code', 'sn')
-        if subscriber_code_filter:
-            subscribers = subscribers.filter(subscriber_code=subscriber_code_filter)
-        if sn_filter:
-            subscribers = subscribers.filter(sn=sn_filter)
-        if search:
-            search_q = Q(subscriber_code__icontains=search) | Q(sn__icontains=search)
-            if search.isdigit():
-                search_q |= Q(login1=int(search))
-            subscribers = subscribers.filter(search_q)
-        return subscribers
-
-    def _filter_smartcards(self, subscriber_code_filter, sn_filter, search):
-        smartcards = ListOfSmartcards.objects.exclude(
-            Q(sn__isnull=True) | Q(sn='')
-        ).order_by('subscriberCode', 'sn')
-        if subscriber_code_filter:
-            smartcards = smartcards.filter(subscriberCode=subscriber_code_filter)
-        if sn_filter:
-            smartcards = smartcards.filter(sn=sn_filter)
-        if search:
-            search_q = (
-                Q(subscriberCode__icontains=search)
-                | Q(sn__icontains=search)
-                | Q(firstName__icontains=search)
-                | Q(lastName__icontains=search)
-            )
-            smartcards = smartcards.filter(search_q)
-        return smartcards
-
     def get(self, request):
         try:
             page_number = request.query_params.get('page', 1)
@@ -1183,32 +1114,61 @@ class SubscriberInfoListView(APIView):
             search = request.query_params.get('search', '').strip()
             subscriber_code_filter = request.query_params.get('subscriber_code', '').strip()
             sn_filter = request.query_params.get('sn', '').strip()
-            has_filters = bool(search or subscriber_code_filter or sn_filter)
 
-            subscribers = self._filter_subscriber_info(
-                subscriber_code_filter, sn_filter, search
-            )
-            results = [self._build_from_subscriber_info(subscriber) for subscriber in subscribers]
+            subscribers = SubscriberInfo.objects.all().order_by('subscriber_code')
 
-            if has_filters:
-                subscriber_sns = {subscriber.sn for subscriber in subscribers if subscriber.sn}
-                smartcards = self._filter_smartcards(
-                    subscriber_code_filter, sn_filter, search
-                )
-                if subscriber_sns:
-                    smartcards = smartcards.exclude(sn__in=subscriber_sns)
-                results.extend(
-                    self._build_from_smartcard(smartcard) for smartcard in smartcards
-                )
+            if subscriber_code_filter:
+                subscribers = subscribers.filter(subscriber_code__istartswith=subscriber_code_filter)
+            if sn_filter:
+                subscribers = subscribers.filter(sn__istartswith=sn_filter)
+            if search:
+                search_q = Q(subscriber_code__icontains=search) | Q(sn__icontains=search)
+                if search.isdigit():
+                    search_q |= Q(login1=int(search))
+                subscribers = subscribers.filter(search_q)
 
-            paginator = Paginator(results, page_size)
+            paginator = Paginator(subscribers, page_size)
             page_obj = paginator.get_page(page_number)
+
+            data = []
+            for subscriber in page_obj.object_list:
+                udid_info = UDIDAuthRequest.objects.filter(
+                    subscriber_code=subscriber.subscriber_code,
+                    sn=subscriber.sn,
+                    status__in=['validated', 'used', 'revoked']
+                ).order_by('-validated_at').first()
+
+                full_data = {
+                    "subscriber_code": subscriber.subscriber_code,
+                    "first_name": subscriber.first_name,
+                    "last_name": subscriber.last_name,
+                    "sn": subscriber.sn,
+                    "activated": subscriber.activated,
+                    "products": subscriber.products,
+                    "packages": subscriber.packages,
+                    "packageNames": subscriber.packageNames,
+                    "model": subscriber.model,
+                    "lastActivation": subscriber.lastActivation,
+                    "lastActivationIP": subscriber.lastActivationIP,
+                    "lastServiceListDownload": subscriber.lastServiceListDownload,
+                    "udid": udid_info.udid if udid_info else None,
+                    "udid_status": udid_info.status if udid_info else None,
+                    "created_at": udid_info.created_at if udid_info else None,
+                    "validated_at": udid_info.validated_at if udid_info else None,
+                    "user_agent": udid_info.user_agent if udid_info else None,
+                    "app_type": udid_info.app_type if udid_info else None,
+                    "app_version": udid_info.app_version if udid_info else None,
+                    "method": udid_info.method if udid_info else None,
+                    "validated_by_operator": udid_info.validated_by_operator if udid_info else None,
+                }
+                clean_data = {k: v for k, v in full_data.items() if v is not None and v != [] and v != ''}
+                data.append(clean_data)
 
             return Response({
                 "count": paginator.count,
                 "total_pages": paginator.num_pages,
                 "current_page": page_obj.number,
-                "results": list(page_obj.object_list),
+                "results": data
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
