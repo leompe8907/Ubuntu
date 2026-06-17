@@ -312,46 +312,46 @@ WSGI_APPLICATION = 'ubuntu.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
 # SQLite3
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': BASE_DIR / 'db.sqlite3',
-#         'OPTIONS': {
-#             'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
-#         },
-#     }
-# }
-
-# Docker Compose Postgres
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "udid"),
-        "USER": os.getenv("POSTGRES_USER", "udid_user"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'timeout': 30,  # Aumentar timeout para manejar mejor la concurrencia
+        },
     }
 }
 
+# Docker Compose Postgres
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": os.getenv("POSTGRES_DB", "udid"),
+#         "USER": os.getenv("POSTGRES_USER", "udid_user"),
+#         "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+#         "HOST": os.getenv("POSTGRES_HOST", "localhost"),  # o 'postgres' si corre en Docker
+#         "PORT": os.getenv("POSTGRES_PORT", "5432"),
+#         "CONN_MAX_AGE": 60,
+#     }
+# }
+
 # Xampp MariaDB
-#DATABASES = {
-#    'default': {
-#        'ENGINE': 'django.db.backends.mysql',
-#        'NAME': 'udid',
-#        'USER': 'root',
-#        'PASSWORD': '',
-#        'HOST': DatabaseConfig.MYSQL_HOST,  # cambia a "db" si usas docker-compose
-#        'PORT': DatabaseConfig.MYSQL_PORT,
-#        'OPTIONS': {
-#            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#        },
-#        # Optimizaciones para mejor rendimiento con carga alta
-#        'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
-#        'AUTOCOMMIT': True,
-#    }
-#}
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.mysql',
+#         'NAME': 'udid',
+#         'USER': 'root',
+#         'PASSWORD': '',
+#         'HOST': DatabaseConfig.MYSQL_HOST,  # cambia a "db" si usas docker-compose
+#         'PORT': DatabaseConfig.MYSQL_PORT,
+#         'OPTIONS': {
+#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+#         },
+#         # Optimizaciones para mejor rendimiento con carga alta
+#         'CONN_MAX_AGE': 1000,  # Mantener conexiones vivas por 5 minutos (reducir overhead)
+#         'AUTOCOMMIT': True,
+#     }
+# }
 
 # Heroku Postgres
 # DATABASES = {
@@ -461,7 +461,6 @@ else:
         "http://localhost:5173",
         "https://front-udid-eta.vercel.app",
         "https://smarttv10foot.herokuapp.com",
-        "https://bromteck.com",
     ]
 
 

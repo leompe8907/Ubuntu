@@ -24,6 +24,15 @@ def _csv(name, default=""):
         return []
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+
+def _csv_origins(name, default=""):
+    """
+    Como _csv pero normaliza orígenes CORS/CSRF: sin barra final.
+    El navegador envía Origin sin barra (ej: https://example.com).
+    """
+    values = _csv(name, default)
+    return [u.rstrip("/") if isinstance(u, str) else u for u in values]
+
 def _bool(name, default="False"):
     """Convierte una variable de entorno en booleano."""
     value = _getenv_or_default(name, default)

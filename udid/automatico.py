@@ -234,6 +234,13 @@ class ValidateUDIDView(APIView):
                 "error": "Subscriber code no válido."
             }, status=status.HTTP_404_NOT_FOUND)
 
+        # Limpiar SNs de UDIDs expirados del mismo subscriber antes de validar
+        UDIDAuthRequest.objects.filter(
+            subscriber_code=subscriber_code,
+            expires_at__lt=timezone.now(),
+            status__in=['validated', 'pending']
+        ).update(status='expired', sn=None)
+
         # Actualizar registro
         req.status = "validated"
         req.validated_at = timezone.now()
@@ -913,66 +920,6 @@ class SNUsageStatsView(APIView):
             }
         }, status=status.HTTP_200_OK)
 
-class ValidateUDIDView(APIView):
-    permission_classes = [AllowAny]
-    def post(self, request):
-        # Intentar obtener parámetros del body primero, luego de query params
-        udid = request.data.get('udid') or request.query_params.get('udid')
-        temp_token = request.data.get('temp_token') or request.query_params.get('temp_token')
-        subscriber_code = request.data.get('subscriber_code') or request.query_params.get('subscriber_code')
-        operator_id = request.data.get('operator_id') or request.query_params.get('operator_id')  # opcional
-
-        # Validaciones iniciales
-        if not all([udid, temp_token, subscriber_code]):
-            return Response({"error": "Parámetros incompletos."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            req = UDIDAuthRequest.objects.get(udid=udid, temp_token=temp_token)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({"error": "Solicitud inválida o token incorrecto."}, status=status.HTTP_404_NOT_FOUND)
-
-        if req.status != "pending":
-            return Response({"error": "El UDID ya fue validado, usado o revocado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if req.is_expired():
-            req.status = "expired"
-            req.save()
-            return Response({"error": "El token ha expirado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not ListOfSubscriber.objects.filter(code=subscriber_code).exists():
-            return Response({"error": "Subscriber code no válido."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Limpiar SNs de UDIDs expirados del mismo subscriber antes de validar
-        UDIDAuthRequest.objects.filter(
-            subscriber_code=subscriber_code,
-            expires_at__lt=timezone.now(),
-            status__in=['validated', 'pending']
-        ).update(status='expired', sn=None)
-
-        # Actualizar registro
-        req.status = "validated"
-        req.validated_at = timezone.now()
-        req.subscriber_code = subscriber_code
-        req.validated_by_operator = operator_id
-        req.save()
-
-        # Log de auditoría (asíncrono)
-        log_audit_async(
-            action_type='udid_validated',
-            udid=udid,
-            subscriber_code=subscriber_code,
-            operator_id=operator_id,
-            client_ip=request.META.get('REMOTE_ADDR'),
-            user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            details={"message": "UDID validado correctamente"}
-        )
-
-        return Response({
-            "message": "UDID validado exitosamente.",
-            "udid": udid,
-            "subscriber_code": subscriber_code,
-            "expires_at": req.expires_at
-        }, status=status.HTTP_200_OK)
 
 def validate_device_sn_association(udid, device_fingerprint=None, client_ip=None):
     """

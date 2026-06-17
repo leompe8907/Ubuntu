@@ -18,6 +18,7 @@ from .util import (
     check_device_fingerprint_rate_limit,
     get_client_token,
     check_token_bucket_lua,
+    increment_rate_limit_counter,
 )
 from .utils.server.metrics import record_request_latency, record_error, get_metrics
 from .models import APIKey
@@ -67,6 +68,9 @@ class RequestUDIDRateLimitMiddleware(MiddlewareMixin):
                 status=429,
                 headers={"Retry-After": str(retry_after)},
             )
+
+        # Incrementar contador de rate limiting
+        increment_rate_limit_counter('device_fp', device_fingerprint)
 
         return None
 
@@ -321,6 +325,7 @@ class BackpressureMiddleware(MiddlewareMixin):
             # La protección fuerte queda en GlobalConcurrencyMiddleware
             # (semáforo global). Aquí solo exponemos nivel de degradación.
             if degradation_level in ('high', 'critical'):
+                request._degradation_queue_bypassed = True
                 request._degradation_queue_bypassed = True
             
             # Agregar headers de degradación si aplica
