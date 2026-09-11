@@ -311,10 +311,7 @@ def CallSubscriberLoginInfo(session_id=None, subscriber_code=None):
         dict: La respuesta con la información de login
     """
     
-    logger.info(
-        "Llamando API Panaccess para obtener credenciales de %s (timeout=90s)",
-        subscriber_code,
-    )
+    logger.info(f"Llamando API Panaccess para obtener credenciales de {subscriber_code} (sin timeout)")
     
     try:
         # Usar el singleton de PanAccess
@@ -325,8 +322,9 @@ def CallSubscriberLoginInfo(session_id=None, subscriber_code=None):
             'subscriberCode': subscriber_code
         }
         
-        # Timeout finito para no bloquear workers indefinidamente si PanAccess cuelga
-        response = panaccess.call('getSubscriberLoginInfo', parameters, timeout=90)
+        # Hacer la llamada usando el singleton SIN timeout (None)
+        # Esto permite que la llamada espere indefinidamente hasta que Panaccess responda
+        response = panaccess.call('getSubscriberLoginInfo', parameters, timeout=None)
 
         if response.get('success'):
             result = response.get('answer', {})

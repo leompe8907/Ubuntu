@@ -13,6 +13,7 @@ from .exceptions import (
 from udid.models import ListOfSubscriber
 from ...serializers import ListOfSubscriberSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
+from config import PanaccessConfig
 
 logger = logging.getLogger(__name__)
 
@@ -332,76 +333,110 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
     """
     Descarga suscriptores nuevos desde el último registrado (modo incremental).
     Guarda cada lote inmediatamente.
-    
+
+    FIX (2026-09): esta función cortaba la paginación apenas encontraba, en la
+    respuesta de Panaccess, el código más alto que ya teníamos guardado
+    (`highest_code`) -- en vez de seguir leyendo lo que viene DESPUÉS de ese
+    código. Como Panaccess devuelve los suscriptores ordenados ASC por
+    'code', los realmente nuevos (code > highest_code) quedan justo después
+    del punto de corte, y la función se detenía ahí sin llegar a descargarlos
+    nunca (bug detectado comparando con la lógica de Wind, que tuvo el mismo
+    problema y lo documentó en su propio getSubscriber.py).
+
+    Ahora, una vez encontrado el código de referencia, la descarga CONTINÚA
+    guardando todas las filas siguientes (en la misma página y en las
+    páginas posteriores) hasta que Panaccess deja de devolver resultados.
+
+    Si el código de referencia no aparece en el catálogo remoto (por ejemplo,
+    porque esa cuenta fue cerrada/eliminada en Panaccess), nunca se activaría
+    el modo de guardado y se recorrería el catálogo entero en cada corrida de
+    5 minutos. Para evitar esa degradación silenciosa hay un tope de páginas
+    de seguridad (PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES): si se alcanza
+    sin encontrar el código de referencia, se aborta esta corrida con un
+    error explícito en el log en vez de seguir escaneando.
+
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
         timeout: Timeout en segundos para cada llamada
+
+    Returns:
+        dict con 'total_saved' y 'checkpoint_found' (False si se abortó por
+        el tope de seguridad sin encontrar el código de referencia).
     """
     logger.info("🔄 Iniciando descarga incremental de suscriptores desde Panaccess...")
     last = LastSubscriber()
     if not last:
         logger.warning("⚠️ No hay suscriptores registrados. Se recomienda usar descarga total.")
-        return {'total_saved': 0}
-    
+        return {'total_saved': 0, 'checkpoint_found': False}
+
     highest_code = last.code
-    logger.info(f"🔍 Buscando suscriptores posteriores al código: {highest_code}")
+    max_pages = PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES
+    logger.info(f"🔍 Buscando el punto de corte (código: {highest_code}) para descargar todo lo posterior...")
     offset = 0
     total_saved = 0
-    found = False
-    
+    checkpoint_found = False
+    pages_scanned_pre_checkpoint = 0
+
     while True:
         retry_count = 0
         batch_processed = False
-        
+        rows = []
+
         while retry_count < MAX_RETRIES:
             try:
                 result = CallListSubscribers(session_id, offset, limit, timeout=timeout)
                 rows = result.get("rows", [])
-                
+
                 if not rows:
-                    logger.info("✅ No hay más suscriptores nuevos.")
+                    logger.info("✅ Fin del catálogo remoto.")
+                    batch_processed = True
                     break
-                
+
                 # Procesar y guardar inmediatamente
                 batch_to_save = []
                 for row in rows:
                     if not isinstance(row.get("cell"), list) or len(row.get("cell", [])) < 12:
                         logger.warning(f"Fila inválida omitida: {row.get('id', 'unknown')}")
                         continue
-                    
+
                     cell = row["cell"]
                     code = cell[0] if len(cell) > 0 and cell[0] else None
-                    
-                    if code == highest_code:
-                        found = True
-                        logger.info(f"✅ Código {highest_code} encontrado. Fin de descarga incremental.")
-                        break
-                    
+
+                    if not checkpoint_found:
+                        if code == highest_code:
+                            checkpoint_found = True
+                            logger.info(
+                                f"✅ Código de referencia {highest_code} encontrado en offset {offset}. "
+                                f"A partir de aquí se guarda todo lo nuevo."
+                            )
+                        # Fila <= highest_code (ya la teníamos, o es el propio checkpoint): no se guarda.
+                        continue
+
+                    # checkpoint_found == True: todo lo que sigue en el orden ASC es nuevo.
                     batch_to_save.append(row)
-                
-                # Guardar lote inmediatamente
+
                 if batch_to_save:
                     saved_count = store_subscribers_batch(batch_to_save)
                     total_saved += saved_count
-                    logger.info(f"✅ Guardados {total_saved} suscriptores nuevos (offset: {offset})")
-                
+                    logger.info(f"✅ Guardados {total_saved} suscriptores nuevos hasta ahora (offset: {offset})")
+
                 batch_processed = True
                 break  # Salir del loop de reintentos
-                
+
             except (PanaccessTimeoutError, PanaccessSessionError) as e:
                 retry_count += 1
                 if retry_count >= MAX_RETRIES:
                     logger.error(f"❌ Error después de {MAX_RETRIES} reintentos: {str(e)}")
                     raise
-                
+
                 logger.warning(f"⚠️ Error en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}")
                 if isinstance(e, PanaccessSessionError):
                     panaccess = get_panaccess()
                     panaccess.reset_session()
                     panaccess.ensure_session()
                 time.sleep(RETRY_DELAY * retry_count)
-                
+
             except PanaccessAPIError as e:
                 # Manejar errores del servidor que pueden ser temporales
                 if hasattr(e, 'error_code') and e.error_code == 'unknown_error_serverside':
@@ -409,7 +444,7 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
                     if retry_count >= MAX_RETRIES:
                         logger.error(f"❌ Error del servidor después de {MAX_RETRIES} reintentos: {str(e)}")
                         raise
-                    
+
                     logger.warning(
                         f"⚠️ Error del servidor en offset {offset} (intento {retry_count}/{MAX_RETRIES}): {str(e)}. "
                         f"Reintentando después de {RETRY_DELAY * retry_count}s..."
@@ -423,18 +458,29 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
                     # Para otros errores de API, no reintentar
                     logger.error(f"❌ Error de API no recuperable: {str(e)}")
                     raise
-        
+
         if not batch_processed:
             logger.error(f"❌ No se pudo procesar el lote en offset {offset}")
             break
-        
-        if found or not rows:
+
+        if not rows:
             break
-        
+
+        if not checkpoint_found:
+            pages_scanned_pre_checkpoint += 1
+            if pages_scanned_pre_checkpoint >= max_pages:
+                logger.error(
+                    f"❌ Se alcanzó el tope de seguridad de {max_pages} páginas sin encontrar el código de "
+                    f"referencia {highest_code}. Es posible que ese suscriptor ya no exista en Panaccess "
+                    f"(cuenta cerrada/eliminada). Se aborta esta corrida en lugar de escanear el catálogo "
+                    f"completo cada vez; se recomienda revisar manualmente o ejecutar una sincronización completa."
+                )
+                return {'total_saved': total_saved, 'checkpoint_found': False}
+
         offset += limit
-    
-    logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos")
-    return {'total_saved': total_saved}
+
+    logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos. Checkpoint encontrado: {checkpoint_found}")
+    return {'total_saved': total_saved, 'checkpoint_found': checkpoint_found}
 
 def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """

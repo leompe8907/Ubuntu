@@ -1,14 +1,10 @@
-from functools import reduce
-import operator
-
 from rest_framework.views import APIView
 from rest_framework import status, filters
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny, IsAuthenticated, IsAdminUser
+from rest_framework.permissions import AllowAny, IsAuthenticated
 
 from django.db.models import Q
-from django.db import transaction, OperationalError
-from django.db.utils import IntegrityError
+from django.db import transaction
 from django.utils import timezone
 from django.core.cache import cache
 from django.core.paginator import Paginator
@@ -39,75 +35,8 @@ from .models import UDIDAuthRequest, SubscriberInfo, AppCredentials, EncryptedCr
 from .utils.server.log_buffer import log_audit_async
 from .utils.server.metrics import get_metrics, reset_metrics
 from .cron import execute_sync_tasks
-from .api_errors import (
-    handle_view_exception,
-    response_encryption_unavailable,
-)
 
 logger = logging.getLogger(__name__)
-
-UDID_STATUS_FOR_LIST = ("validated", "used", "revoked")
-
-
-def _latest_udid_map_for_subscribers(subscribers):
-    """
-    Una consulta batch para el último UDIDAuthRequest por (subscriber_code, sn)
-    en la página actual (evita N+1).
-    """
-    pairs = [(s.subscriber_code, s.sn) for s in subscribers]
-    if not pairs:
-        return {}
-    q_filter = reduce(
-        operator.or_,
-        (Q(subscriber_code=c, sn=sn) for c, sn in pairs),
-    )
-    candidates = (
-        UDIDAuthRequest.objects.filter(
-            q_filter,
-            status__in=UDID_STATUS_FOR_LIST,
-        )
-        .order_by("-validated_at")
-        .only(
-            "subscriber_code",
-            "sn",
-            "udid",
-            "status",
-            "created_at",
-            "validated_at",
-            "user_agent",
-            "app_type",
-            "app_version",
-            "method",
-            "validated_by_operator",
-        )
-    )
-    latest = {}
-    for u in candidates:
-        key = (u.subscriber_code, u.sn)
-        if key not in latest:
-            latest[key] = u
-    return latest
-
-
-def _parse_pagination_params(request):
-    """page y page_size enteros acotados; None + Response error si inválido."""
-    try:
-        raw_page = request.query_params.get("page", 1)
-        raw_size = request.query_params.get("page_size", 20)
-        page_number = int(raw_page) if raw_page not in (None, "") else 1
-        page_size = int(raw_size) if raw_size not in (None, "") else 20
-    except (TypeError, ValueError):
-        return None, None, Response(
-            {"error": "Invalid page or page_size"},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    if page_number < 1:
-        return None, None, Response(
-            {"error": "page must be >= 1"},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    page_size = max(1, min(page_size, 200))
-    return page_number, page_size, None
 
 def get_cached_app_credentials(app_type, app_version):
     """
@@ -150,7 +79,34 @@ class RequestUDIDManualView(APIView):
             # FAST-FAIL: Rate limiting ANTES de tocar la BD
             # ========================================================================
             
-            # Rate limiting por Device Fingerprint (Redis, sin BD)
+            # 1. Rate limiting con token bucket (Redis, sin BD)
+            client_token = get_client_token(request)
+            if client_token:
+                is_allowed, remaining, retry_after = check_token_bucket_lua(
+                    identifier=client_token,
+                    capacity=1,  # 1 token cada 5 min (ventana 5 min entre solicitudes)
+                    refill_rate=1,
+                    window_seconds=300,  # 5 min
+                    tokens_requested=1
+                )
+                
+                if not is_allowed:
+                    logger.warning(
+                        f"RequestUDIDManualView: Token bucket rate limit excedido - "
+                        f"token={client_token[:8] if len(client_token) > 8 else client_token}..., "
+                        f"ip={client_ip}, retry_after={retry_after}s"
+                    )
+                    retry_at = timezone.now() + timedelta(seconds=retry_after)
+                    return Response({
+                        "error_code": "RATE_LIMIT_EXCEEDED",
+                        "retry_after": retry_after,
+                        "retry_at": retry_at.isoformat(),
+                        "remaining": remaining
+                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+                        "Retry-After": str(retry_after)
+                    })
+            
+            # 2. Rate limiting por Device Fingerprint (Redis, sin BD)
             device_fingerprint = generate_device_fingerprint(request)
             
             is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
@@ -179,36 +135,17 @@ class RequestUDIDManualView(APIView):
             # AHORA SÍ: Operaciones de BD
             # ========================================================================
             
-            # 3. Generar UDID único (reintentos ante colisión / IntegrityError)
-            auth_request = None
-            udid = None
-            for _ in range(12):
-                candidate = secrets.token_hex(4)
-                try:
-                    auth_request = UDIDAuthRequest.objects.create(
-                        udid=candidate,
-                        status='pending',
-                        client_ip=client_ip,
-                        user_agent=request.META.get('HTTP_USER_AGENT', ''),
-                        device_fingerprint=device_fingerprint,
-                    )
-                    udid = candidate
-                    break
-                except IntegrityError:
-                    continue
-            if auth_request is None:
-                logger.error(
-                    "RequestUDIDManualView: agotados reintentos de UDID único ip=%s",
-                    client_ip,
-                )
-                return Response(
-                    {
-                        "error_code": "SERVICE_TEMPORARILY_UNAVAILABLE",
-                        "detail": "Could not allocate a unique UDID. Please retry.",
-                    },
-                    status=status.HTTP_429_TOO_MANY_REQUESTS,
-                    headers={"Retry-After": "2"},
-                )
+            # 3. Generar UDID único
+            udid = self.generate_unique_udid()
+            
+            # Crear solicitud con device_fingerprint
+            auth_request = UDIDAuthRequest.objects.create(
+                udid=udid,
+                status='pending',
+                client_ip=client_ip,
+                user_agent=request.META.get('HTTP_USER_AGENT', ''),
+                device_fingerprint=device_fingerprint
+            )
             
             # ✅ Verificar que se guardó correctamente (recargar desde BD)
             auth_request.refresh_from_db()
@@ -250,22 +187,21 @@ class RequestUDIDManualView(APIView):
                 }
             }, status=status.HTTP_201_CREATED)
             
-        except OperationalError as db_err:
+        except Exception as e:
             logger.error(
-                f"RequestUDIDManualView: Database timeout/lock - "
-                f"ip={client_ip}, error={str(db_err)}", exc_info=True
+                f"RequestUDIDManualView: Error interno - "
+                f"ip={client_ip}, error={str(e)}", exc_info=True
             )
             return Response({
-                "error_code": "SERVICE_TEMPORARILY_UNAVAILABLE",
-                "detail": "The service is currently experiencing high load. Please try again later."
-            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
-                "Retry-After": "5"
-            })
-        except Exception as e:
-            return handle_view_exception(
-                f"RequestUDIDManualView ip={client_ip}",
-                e,
-            )
+                "error": "Internal server error"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def generate_unique_udid(self):
+        """Generar UDID único de 8 caracteres"""
+        while True:
+            udid = secrets.token_hex(4)  # 8 caracteres hexadecimales
+            if not UDIDAuthRequest.objects.filter(udid=udid).exists():
+                return udid
 
 class ValidateAndAssociateUDIDView(APIView):
     permission_classes = [AllowAny]
@@ -314,15 +250,10 @@ class ValidateAndAssociateUDIDView(APIView):
                     "Retry-After": str(retry_after)
                 })
         
-        # 2. Validación básica de datos
-        # Nota: el serializer consulta BD; si SQLite está lockeada puede lanzar OperationalError.
-        try:
-            serializer = UDIDAssociationSerializer(data=request.data)
-            is_valid = serializer.is_valid()
-        except Exception as e:
-            return handle_view_exception("ValidateAndAssociateUDIDView:serializer", e)
-
-        if not is_valid:
+        # 2. Validación básica de datos (sin BD)
+        serializer = UDIDAssociationSerializer(data=request.data)
+        
+        if not serializer.is_valid():
             logger.warning(
                 f"ValidateAndAssociateUDIDView: Datos inválidos - "
                 f"ip={client_ip}, errors={serializer.errors}"
@@ -369,37 +300,34 @@ class ValidateAndAssociateUDIDView(APIView):
         # ========================================================================
         
         # 5. AHORA SÍ: select_for_update() - al final, después de todas las validaciones
-        try:
-            with transaction.atomic():
-                # Bloqueo optimista de la fila del request
-                udid_request = UDIDAuthRequest.objects.select_for_update().get(pk=udid_request.pk)
-                
-                # Asegurar que tenemos el UDID
-                udid = udid_request.udid
+        with transaction.atomic():
+            # Bloqueo optimista de la fila del request
+            udid_request = UDIDAuthRequest.objects.select_for_update().get(pk=udid_request.pk)
+            
+            # Asegurar que tenemos el UDID
+            udid = udid_request.udid
 
-                # Asociar y marcar como validated (auditoría adentro)
-                self.associate_udid_with_subscriber(
-                    udid_request, subscriber, sn, operator_id, method, request
-                )
+            # Asociar y marcar como validated (auditoría adentro)
+            self.associate_udid_with_subscriber(
+                udid_request, subscriber, sn, operator_id, method, request
+            )
 
-                # Notificar a los WebSockets que esperan este UDID: al commit
-                def _notify():
-                    try:
-                        channel_layer = get_channel_layer()
-                        if channel_layer:
-                            async_to_sync(channel_layer.group_send)(
-                                f"udid_{udid}",              # 👈 mismo group que usa el consumer
-                                {"type": "udid.validated", "udid": udid}  # 👈 llama a AuthWaitWS.udid_validated
-                            )
-                            logger.info("Notificado udid.validated para %s", udid)
-                        else:
-                            logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
-                    except Exception as e:
-                        logger.exception("Error notificando WebSocket para udid %s: %s", udid, e)
+            # Notificar a los WebSockets que esperan este UDID: al commit
+            def _notify():
+                try:
+                    channel_layer = get_channel_layer()
+                    if channel_layer:
+                        async_to_sync(channel_layer.group_send)(
+                            f"udid_{udid}",              # 👈 mismo group que usa el consumer
+                            {"type": "udid.validated", "udid": udid}  # 👈 llama a AuthWaitWS.udid_validated
+                        )
+                        logger.info("Notificado udid.validated para %s", udid)
+                    else:
+                        logger.warning("Channel layer no disponible; no se notificó udid %s", udid)
+                except Exception as e:
+                    logger.exception("Error notificando WebSocket para udid %s: %s", udid, e)
 
-                transaction.on_commit(_notify)
-        except Exception as e:
-            return handle_view_exception("ValidateAndAssociateUDIDView:atomic", e)
+            transaction.on_commit(_notify)
 
         logger.info(
             f"ValidateAndAssociateUDIDView: Asociación exitosa - "
@@ -590,7 +518,7 @@ class AuthenticateWithUDIDView(APIView):
                 "retry_at": retry_at.isoformat(),
                 "attempt": attempt_number,
                 "is_reconnection": is_reconnection
-            }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE, headers={
                 "Retry-After": str(retry_delay),
                 "X-Retry-After": str(retry_delay)
             })
@@ -657,7 +585,7 @@ class AuthenticateWithUDIDView(APIView):
                     return Response({
                         "error": f"No valid app credentials available for app_type='{app_type}'",
                         "solution": "Contact administrator"
-                    }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={"Retry-After": "10"})
+                    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
                 # Encriptar credenciales
                 try:
@@ -665,10 +593,10 @@ class AuthenticateWithUDIDView(APIView):
                         json_serialize_credentials(credentials_payload), app_type
                     )
                 except Exception as e:
-                    return response_encryption_unavailable(
-                        "AuthenticateWithUDIDView:encrypt",
-                        e,
-                    )
+                    return Response({
+                        "error": "Encryption failed",
+                        "details": str(e)
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
                 # Marcar como entregado
                 req.app_type = app_type
@@ -741,12 +669,20 @@ class AuthenticateWithUDIDView(APIView):
                 }, status=status.HTTP_200_OK)
 
         except Exception as e:
+            # En caso de error, incrementar retry info (para next retry)
             if is_reconnection:
-                get_retry_info(udid, "reconnection")
-            return handle_view_exception(
-                f"AuthenticateWithUDIDView udid={udid[:8] if udid and len(udid) > 8 else udid!r}",
-                e,
+                get_retry_info(udid, 'reconnection')  # Esto incrementa el contador
+            
+            logger.error(
+                f"AuthenticateWithUDIDView: Error interno - "
+                f"udid={udid[:8] if udid and len(udid) > 8 else udid}..., "
+                f"app_type={app_type}, ip={client_ip}, error={str(e)}", exc_info=True
             )
+            
+            return Response({
+                "error": "Internal server error",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class ValidateStatusUDIDView(APIView):
     permission_classes = [AllowAny]
@@ -834,8 +770,6 @@ class ValidateStatusUDIDView(APIView):
         
         try:
             req = UDIDAuthRequest.objects.get(udid=udid)
-        except OperationalError as e:
-            return handle_view_exception("ValidateStatusUDIDView:get", e)
         except UDIDAuthRequest.DoesNotExist:
             # ✅ Log del intento con UDID inválido (asíncrono)
             logger.warning(
@@ -1087,7 +1021,10 @@ class DisassociateUDIDView(APIView):
                 }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            return handle_view_exception("DisassociateUDIDView", e)
+            return Response({
+                "error": "Internal server error",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class ListSubscribersWithUDIDView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1097,9 +1034,8 @@ class ListSubscribersWithUDIDView(APIView):
     """
     def get(self, request):
         try:
-            page_number, page_size, err = _parse_pagination_params(request)
-            if err:
-                return err
+            page_number = request.query_params.get('page', 1)
+            page_size = request.query_params.get('page_size', 20)
 
             subscribers = (
                 SubscriberInfo.objects
@@ -1110,11 +1046,13 @@ class ListSubscribersWithUDIDView(APIView):
             paginator = Paginator(subscribers, page_size)
             page_obj = paginator.get_page(page_number)
 
-            udid_map = _latest_udid_map_for_subscribers(page_obj.object_list)
-
             data = []
             for subscriber in page_obj.object_list:
-                udid_info = udid_map.get((subscriber.subscriber_code, subscriber.sn))
+                udid_info = UDIDAuthRequest.objects.filter(
+                    subscriber_code=subscriber.subscriber_code,
+                    sn=subscriber.sn,
+                    status__in=['validated','used', 'revoked']
+                ).order_by('-validated_at').first()
 
                 # Construye el diccionario con todos los campos
                 full_data = {
@@ -1157,30 +1095,43 @@ class ListSubscribersWithUDIDView(APIView):
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            return handle_view_exception("ListSubscribersWithUDIDView", e)
+            return Response({
+                "error": "Error al obtener la información",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class SubscriberInfoListView(APIView):
     permission_classes = [IsAuthenticated]
     """
     Lista suscriptores con filtros (?subscriber_code=, ?sn=) y búsqueda (?search=).
+    Los filtros subscriber_code y sn hacen coincidencia por prefijo (istartswith).
     Devuelve los mismos parámetros que ListSubscribersWithUDIDView (incl. campos UDID).
     """
     def get(self, request):
         try:
-            page_number, page_size, err = _parse_pagination_params(request)
-            if err:
-                return err
-
+            page_number = request.query_params.get('page', 1)
+            page_size = request.query_params.get('page_size', 20)
             search = request.query_params.get('search', '').strip()
             subscriber_code_filter = request.query_params.get('subscriber_code', '').strip()
             sn_filter = request.query_params.get('sn', '').strip()
 
-            subscribers = SubscriberInfo.objects.all().order_by('subscriber_code')
+            subscribers = (
+                SubscriberInfo.objects
+                .exclude(sn__isnull=True)
+                .exclude(sn='')
+                .order_by('subscriber_code')
+            )
 
             if subscriber_code_filter:
-                subscribers = subscribers.filter(subscriber_code=subscriber_code_filter)
+                subscribers = subscribers.filter(subscriber_code__istartswith=subscriber_code_filter)
             if sn_filter:
-                subscribers = subscribers.filter(sn=sn_filter)
+                from .utils.panaccess.subscriberinfo import ensure_sn_searchable
+                # SN completa (10+ dígitos): consolidar al vuelo si falta en SubscriberInfo
+                if len(sn_filter) >= 10 and sn_filter.isdigit():
+                    ensure_sn_searchable(sn_filter)
+                    subscribers = subscribers.filter(sn=sn_filter)
+                else:
+                    subscribers = subscribers.filter(sn__istartswith=sn_filter)
             if search:
                 search_q = Q(subscriber_code__icontains=search) | Q(sn__icontains=search)
                 if search.isdigit():
@@ -1190,11 +1141,13 @@ class SubscriberInfoListView(APIView):
             paginator = Paginator(subscribers, page_size)
             page_obj = paginator.get_page(page_number)
 
-            udid_map = _latest_udid_map_for_subscribers(page_obj.object_list)
-
             data = []
             for subscriber in page_obj.object_list:
-                udid_info = udid_map.get((subscriber.subscriber_code, subscriber.sn))
+                udid_info = UDIDAuthRequest.objects.filter(
+                    subscriber_code=subscriber.subscriber_code,
+                    sn=subscriber.sn,
+                    status__in=['validated', 'used', 'revoked']
+                ).order_by('-validated_at').first()
 
                 full_data = {
                     "subscriber_code": subscriber.subscriber_code,
@@ -1230,14 +1183,17 @@ class SubscriberInfoListView(APIView):
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            return handle_view_exception("SubscriberInfoListView", e)
+            return Response({
+                "error": "Error al obtener la información",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class MetricsDashboardView(APIView):
     """
     Vista del dashboard de métricas del sistema (solo JSON para pruebas).
     Muestra métricas de latencia, errores, concurrencia, CPU, RAM, Redis y WebSockets.
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]  # En producción, usar IsAuthenticated o IsAdminUser
     
     def get(self, request):
         """
@@ -1294,4 +1250,9 @@ class ManualSyncView(APIView):
                 }, status=status.HTTP_207_MULTI_STATUS)  # 207 indica éxito parcial
             
         except Exception as e:
-            return handle_view_exception("ManualSyncView", e)
+            logger.error(f"ManualSyncView: Error inesperado: {str(e)}", exc_info=True)
+            return Response({
+                'success': False,
+                'message': f'Error al ejecutar sincronización: {str(e)}',
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

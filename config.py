@@ -65,6 +65,13 @@ class PanaccessConfig:
     SALT = os.getenv("salt")
     KEY = os.getenv("ENCRYPTION_KEY")
 
+    # Tope de páginas de seguridad para la descarga incremental de suscriptores
+    # (download_subscribers_since_last). Si no se encuentra el código de
+    # referencia dentro de este número de páginas, se aborta la corrida en vez
+    # de escanear todo el catálogo en cada ejecución (evita degradar la tarea
+    # periódica de cada 5 minutos si esa cuenta fue cerrada/eliminada).
+    INCREMENTAL_SYNC_MAX_PAGES = int(os.getenv("PANACCESS_INCREMENTAL_SYNC_MAX_PAGES", "200"))
+
     @classmethod
     def validate(cls):
         missing = []

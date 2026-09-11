@@ -64,13 +64,9 @@ class DegradationManager:
             elif level == 'medium':
                 level = 'high'
         
-        # rolling_error_rate (ventana reciente); no acumulado incoherente
-        if error_rate and error_rate > 0.35:
+        if error_rate and error_rate > 0.1:  # > 10% errores
             if level != 'critical':
                 level = 'critical'
-        elif error_rate and error_rate > 0.18:
-            if level in ('none', 'medium'):
-                level = 'high'
         
         if cpu_percent and cpu_percent > 90:  # > 90% CPU
             if level == 'none':
@@ -105,7 +101,7 @@ class DegradationManager:
                 'message': 'System is under extreme load. Please try again later.',
                 'retry_after': 60,
                 'degradation_level': 'critical'
-            }, 429
+            }, 503
         
         elif level == 'high':
             return {

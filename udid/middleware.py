@@ -19,9 +19,9 @@ from .util import (
     get_client_token,
     check_token_bucket_lua,
 )
-from .utils.server.metrics import record_request_outcome, get_metrics_for_degradation
+from .utils.server.metrics import record_request_latency, record_error, get_metrics
 from .models import APIKey
-from .utils.server.degradation import get_degradation_manager
+from .utils.server.degradation import get_degradation_manager, should_degrade
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +95,13 @@ class SystemLoadTrackingMiddleware(MiddlewareMixin):
         Registra latencia y errores después de procesar el request.
         """
         if hasattr(request, '_start_time'):
+            # Calcular latencia en milisegundos
             latency_ms = (time.time() - request._start_time) * 1000
-            record_request_outcome(latency_ms, response.status_code)
+            record_request_latency(latency_ms)
+            
+            # Registrar errores
+            if response.status_code >= 400:
+                record_error(response.status_code)
         
         return response
 
@@ -126,41 +131,33 @@ class GlobalConcurrencyMiddleware(MiddlewareMixin):
         )
         
         if not acquired:
-            # Requisito del proyecto: evitar 5xx → usar 429 con Retry-After
+            # Retornar respuesta 503 con Retry-After
             return JsonResponse({
                 "error": "Service temporarily unavailable",
                 "message": "System is handling high load. Please retry after the specified time.",
                 "retry_after": retry_after
-            }, status=429, headers={"Retry-After": str(retry_after)})
+            }, status=503, headers={"Retry-After": str(retry_after)})
         
         # Almacenar slot_id en request para liberarlo después
         request._semaphore_slot_id = slot_id
-        request._semaphore_slot_released = False
         return None
     
     def process_response(self, request, response):
         """
         Libera el slot del semáforo después de procesar el request.
         """
-        self._release_semaphore_slot_once(request)
+        # Liberar slot después de procesar request
+        if hasattr(request, '_semaphore_slot_id') and request._semaphore_slot_id:
+            release_global_semaphore(request._semaphore_slot_id)
         return response
     
     def process_exception(self, request, exception):
         """
         Asegura que el slot se libere incluso si hay una excepción.
         """
-        self._release_semaphore_slot_once(request)
+        if hasattr(request, '_semaphore_slot_id') and request._semaphore_slot_id:
+            release_global_semaphore(request._semaphore_slot_id)
         return None
-
-    def _release_semaphore_slot_once(self, request):
-        """Evita doble liberación y libera aunque slot_id sea None (no-op en release)."""
-        if getattr(request, "_semaphore_slot_released", False):
-            return
-        slot_id = getattr(request, "_semaphore_slot_id", None)
-        if slot_id:
-            release_global_semaphore(slot_id)
-            request._semaphore_slot_released = True
-            request._semaphore_slot_id = None
 
 
 class APIKeyAuthMiddleware(MiddlewareMixin):
@@ -252,16 +249,12 @@ class APIKeyAuthMiddleware(MiddlewareMixin):
             return None
             
         except Exception as e:
-            # Fail-closed: si el cliente envió API key, no omitir autenticación por error transitorio
+            # Log error pero no bloquear (fail-open)
+            import logging
+            logger = logging.getLogger(__name__)
             logger.error(f"Error in APIKeyAuthMiddleware: {e}", exc_info=True)
-            return JsonResponse(
-                {
-                    "error": "Service temporarily unavailable",
-                    "message": "Authentication service error. Please retry.",
-                },
-                status=429,
-                headers={"Retry-After": "30"},
-            )
+            # Continuar sin autenticación en caso de error
+            return None
 
 
 class BackpressureMiddleware(MiddlewareMixin):
@@ -285,12 +278,18 @@ class BackpressureMiddleware(MiddlewareMixin):
         
         # Obtener métricas actuales
         try:
-            metrics = get_metrics_for_degradation()
+            metrics = get_metrics()
             current_concurrency = metrics.get('concurrency_current', 0)
             latency_p95 = metrics.get('p95_ms', 0)
             cpu_percent = metrics.get('cpu_percent', 0)
-            # Ventana deslizante alineada con latencias (no usar contadores acumulados / ventana)
-            error_rate = float(metrics.get('rolling_error_rate', 0) or 0)
+            
+            # Calcular tasa de errores
+            total_requests = metrics.get('total_requests', 1)
+            error_429 = metrics.get('errors', {}).get('429', 0)
+            error_503 = metrics.get('errors', {}).get('503', 0)
+            error_500 = metrics.get('errors', {}).get('500', 0)
+            total_errors = error_429 + error_503 + error_500
+            error_rate = total_errors / total_requests if total_requests > 0 else 0
             
             # Determinar nivel de degradación
             degradation_manager = get_degradation_manager()

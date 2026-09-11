@@ -11,15 +11,7 @@ from .token_signing import (
 )
 from .log_buffer import log_audit_async, flush_logs, shutdown_log_buffer
 from .logging_handlers import SafeConsoleHandler, UnicodeSafeFilter
-from .metrics import (
-    MetricsCollector,
-    get_metrics,
-    get_metrics_for_degradation,
-    reset_metrics,
-    record_request_latency,
-    record_error,
-    record_request_outcome,
-)
+from .metrics import MetricsCollector, get_metrics, reset_metrics, record_request_latency, record_error
 from .degradation import DegradationManager, get_degradation_manager, should_degrade
 
 # Importación lazy de redis_ha para evitar errores si redis no está disponible
@@ -75,11 +67,9 @@ __all__ = [
     # Metrics
     'MetricsCollector',
     'get_metrics',
-    'get_metrics_for_degradation',
     'reset_metrics',
     'record_request_latency',
     'record_error',
-    'record_request_outcome',
     # Degradation
     'DegradationManager',
     'get_degradation_manager',
