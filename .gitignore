@@ -98,13 +98,20 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-# .env
+.env
+.env.backup
+.env.*.local
+!docs/env.example.txt
 # .envrc
 # venv/
 # env/
 # ENV/
 # env.bak/
 # venv.bak/
+
+# Backups y logs sueltos que no deben ir al repo
+*.backup
+nohup.out
 
 # macOS
 .DS_Store
