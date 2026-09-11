@@ -1,6 +1,7 @@
 import logging
 import time
 from django.db import transaction, connection
+from django.db.models import Max, DateField
 from django.db.utils import OperationalError, DatabaseError
 from typing import Optional
 from .singleton import get_panaccess
@@ -334,26 +335,40 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
     Descarga suscriptores nuevos desde el último registrado (modo incremental).
     Guarda cada lote inmediatamente.
 
-    FIX (2026-09): esta función cortaba la paginación apenas encontraba, en la
-    respuesta de Panaccess, el código más alto que ya teníamos guardado
-    (`highest_code`) -- en vez de seguir leyendo lo que viene DESPUÉS de ese
-    código. Como Panaccess devuelve los suscriptores ordenados ASC por
-    'code', los realmente nuevos (code > highest_code) quedan justo después
-    del punto de corte, y la función se detenía ahí sin llegar a descargarlos
-    nunca (bug detectado comparando con la lógica de Wind, que tuvo el mismo
-    problema y lo documentó en su propio getSubscriber.py).
+    FIX v2 (2026-09): el corte YA NO se decide por el 'code' más alto local.
+    Se detectó en producción que los 'code' de Panaccess no tienen un formato
+    uniforme: conviven códigos cortos (ej: '9', aparentemente datos viejos/de
+    prueba) con códigos reales largos (ej: '00073420L16'). Al comparar como
+    texto (que es como Django ordena un CharField), '9' resulta "mayor" que
+    '00073420L16' -- aunque este último sea un suscriptor real dado de alta
+    después. Con el criterio anterior (incluso ya con el fix v1 que seguía
+    paginando después del corte), cualquier código real que empezara con un
+    dígito del 0 al 8 quedaba "antes" del checkpoint y nunca se descargaba.
 
-    Ahora, una vez encontrado el código de referencia, la descarga CONTINÚA
-    guardando todas las filas siguientes (en la misma página y en las
-    páginas posteriores) hasta que Panaccess deja de devolver resultados.
+    Ahora el corte usa la fecha 'created' más reciente que ya tenemos en la
+    tabla local, pidiendo el catálogo a Panaccess ordenado por 'created' DESC
+    (los más nuevos primero) en vez de por 'code' (ver
+    CallListSubscribersOrderedByCreated). En cuanto aparece una fila con
+    'created' anterior a esa fecha, se asume que de ahí en adelante ya está
+    todo sincronizado.
 
-    Si el código de referencia no aparece en el catálogo remoto (por ejemplo,
-    porque esa cuenta fue cerrada/eliminada en Panaccess), nunca se activaría
-    el modo de guardado y se recorrería el catálogo entero en cada corrida de
-    5 minutos. Para evitar esa degradación silenciosa hay un tope de páginas
-    de seguridad (PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES): si se alcanza
-    sin encontrar el código de referencia, se aborta esta corrida con un
-    error explícito en el log en vez de seguir escaneando.
+    Precisión: el campo 'created' del modelo es un DateField (solo día, sin
+    hora) -- no hay 'created' con hora en este endpoint, a diferencia de Wind
+    que sí tiene DateTimeField. Por eso se vuelve a procesar (upsert seguro,
+    sin duplicar por 'id') todo lo que tenga la MISMA fecha que el corte, para
+    no perder altas del mismo día ocurridas después de la corrida anterior.
+
+    VALIDACIÓN DE SEGURIDAD: si la respuesta de Panaccess no viene realmente
+    en orden descendente por 'created' (por ejemplo, porque el endpoint no
+    soporta ese orderBy y lo ignora en silencio), se aborta esta corrida con
+    un error explícito en el log en vez de asumir un orden que no existe --
+    de lo contrario se podría marcar por error el fin de los nuevos y perder
+    suscriptores otra vez. Si esto llegara a pasar, revisar el log
+    'no viene ordenado por created DESC' y avisar para ajustar el criterio.
+
+    Si no hay ningún 'created' local confiable para anclar el corte (tabla
+    vacía de fechas, o recién migrada), se hace un fetch_all_subscribers()
+    completo en vez de arriesgar un corte mal calculado.
 
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
@@ -361,22 +376,31 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
         timeout: Timeout en segundos para cada llamada
 
     Returns:
-        dict con 'total_saved' y 'checkpoint_found' (False si se abortó por
-        el tope de seguridad sin encontrar el código de referencia).
+        dict con 'total_saved', 'checkpoint_found' y, si algo salió mal,
+        'order_error' (True si Panaccess no respetó el orden pedido).
     """
-    logger.info("🔄 Iniciando descarga incremental de suscriptores desde Panaccess...")
-    last = LastSubscriber()
-    if not last:
-        logger.warning("⚠️ No hay suscriptores registrados. Se recomienda usar descarga total.")
-        return {'total_saved': 0, 'checkpoint_found': False}
+    logger.info("🔄 Iniciando descarga incremental de suscriptores desde Panaccess (por fecha de creación)...")
 
-    highest_code = last.code
+    last_created = ListOfSubscriber.objects.exclude(created__isnull=True).aggregate(
+        latest=Max('created')
+    )['latest']
+
+    if last_created is None:
+        logger.warning(
+            "⚠️ No hay ninguna fecha 'created' local confiable para anclar el corte incremental "
+            "(tabla vacía de fechas). Se hace un fetch_all_subscribers() completo."
+        )
+        return fetch_all_subscribers(session_id, limit, timeout=timeout)
+
     max_pages = PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES
-    logger.info(f"🔍 Buscando el punto de corte (código: {highest_code}) para descargar todo lo posterior...")
+    logger.info(f"🔍 Corte por fecha de creación: se guarda todo con created >= {last_created}")
+
     offset = 0
     total_saved = 0
-    checkpoint_found = False
-    pages_scanned_pre_checkpoint = 0
+    pages_scanned = 0
+    reached_cutoff = False
+    order_checked = False
+    prev_created = None
 
     while True:
         retry_count = 0
@@ -385,7 +409,7 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
 
         while retry_count < MAX_RETRIES:
             try:
-                result = CallListSubscribers(session_id, offset, limit, timeout=timeout)
+                result = CallListSubscribersOrderedByCreated(session_id, offset, limit, timeout=timeout)
                 rows = result.get("rows", [])
 
                 if not rows:
@@ -393,28 +417,47 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
                     batch_processed = True
                     break
 
-                # Procesar y guardar inmediatamente
                 batch_to_save = []
+                order_error = False
                 for row in rows:
                     if not isinstance(row.get("cell"), list) or len(row.get("cell", [])) < 12:
                         logger.warning(f"Fila inválida omitida: {row.get('id', 'unknown')}")
                         continue
 
                     cell = row["cell"]
-                    code = cell[0] if len(cell) > 0 and cell[0] else None
+                    row_created = _parse_created_value(cell[10] if len(cell) > 10 else None)
 
-                    if not checkpoint_found:
-                        if code == highest_code:
-                            checkpoint_found = True
-                            logger.info(
-                                f"✅ Código de referencia {highest_code} encontrado en offset {offset}. "
-                                f"A partir de aquí se guarda todo lo nuevo."
-                            )
-                        # Fila <= highest_code (ya la teníamos, o es el propio checkpoint): no se guarda.
-                        continue
+                    # Validación de orden: la lista debe venir en 'created' DESC.
+                    # Si encontramos una fecha mayor que la anterior, Panaccess no
+                    # está respetando el orderBy pedido -- abortamos en vez de
+                    # asumir un corte que no es confiable.
+                    if not order_checked:
+                        order_checked = True
+                    elif prev_created is not None and row_created is not None and row_created > prev_created:
+                        logger.error(
+                            f"❌ La respuesta de Panaccess no viene ordenada por 'created' DESC "
+                            f"(fila con created={row_created} apareció después de otra con "
+                            f"created={prev_created}). Se aborta la descarga incremental para no "
+                            f"perder registros por un corte mal calculado -- revisar si el endpoint "
+                            f"soporta orderBy=created."
+                        )
+                        order_error = True
+                        break
+                    if row_created is not None:
+                        prev_created = row_created
 
-                    # checkpoint_found == True: todo lo que sigue en el orden ASC es nuevo.
+                    if row_created is not None and row_created < last_created:
+                        reached_cutoff = True
+                        logger.info(
+                            f"✅ Corte alcanzado en offset {offset}: fila con created={row_created} "
+                            f"anterior a {last_created}. A partir de aquí ya está todo sincronizado."
+                        )
+                        break
+
                     batch_to_save.append(row)
+
+                if order_error:
+                    return {'total_saved': total_saved, 'checkpoint_found': False, 'order_error': True}
 
                 if batch_to_save:
                     saved_count = store_subscribers_batch(batch_to_save)
@@ -463,24 +506,38 @@ def download_subscribers_since_last(session_id=None, limit=100, timeout=DEFAULT_
             logger.error(f"❌ No se pudo procesar el lote en offset {offset}")
             break
 
-        if not rows:
+        if not rows or reached_cutoff:
             break
 
-        if not checkpoint_found:
-            pages_scanned_pre_checkpoint += 1
-            if pages_scanned_pre_checkpoint >= max_pages:
-                logger.error(
-                    f"❌ Se alcanzó el tope de seguridad de {max_pages} páginas sin encontrar el código de "
-                    f"referencia {highest_code}. Es posible que ese suscriptor ya no exista en Panaccess "
-                    f"(cuenta cerrada/eliminada). Se aborta esta corrida en lugar de escanear el catálogo "
-                    f"completo cada vez; se recomienda revisar manualmente o ejecutar una sincronización completa."
-                )
-                return {'total_saved': total_saved, 'checkpoint_found': False}
+        pages_scanned += 1
+        if pages_scanned >= max_pages:
+            logger.error(
+                f"❌ Se alcanzó el tope de seguridad de {max_pages} páginas sin cruzar el corte por fecha "
+                f"({last_created}). Se aborta esta corrida para no escanear el catálogo completo cada vez; "
+                f"se recomienda revisar manualmente o ejecutar una sincronización completa."
+            )
+            return {'total_saved': total_saved, 'checkpoint_found': False}
 
         offset += limit
 
-    logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos. Checkpoint encontrado: {checkpoint_found}")
-    return {'total_saved': total_saved, 'checkpoint_found': checkpoint_found}
+    logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} suscriptores nuevos.")
+    return {'total_saved': total_saved, 'checkpoint_found': True}
+
+def _parse_created_value(value):
+    """
+    Convierte el valor crudo de 'created' que devuelve Panaccess (string) a un
+    objeto date/datetime usable para comparar, reutilizando el mismo parser
+    que usa el propio campo del modelo (django.db.models.DateField.to_python),
+    así no hace falta agregar una dependencia nueva (python-dateutil) y el
+    parseo queda consistente con lo que se guarda realmente en la BD.
+    """
+    if not value:
+        return None
+    try:
+        return DateField().to_python(value)
+    except Exception:
+        logger.warning(f"⚠️ No se pudo interpretar la fecha 'created' recibida: {value!r}")
+        return None
 
 def compare_and_update_all_subscribers(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
@@ -667,4 +724,59 @@ def CallListSubscribers(session_id=None, offset=0, limit=100, timeout=DEFAULT_TI
         raise
     except Exception as e:
         logger.error(f"💥 Fallo en la llamada a getListOfSubscribers: {str(e)}", exc_info=True)
+        raise PanaccessAPIError(f"Error inesperado: {str(e)}")
+
+def CallListSubscribersOrderedByCreated(session_id=None, offset=0, limit=100, timeout=DEFAULT_TIMEOUT):
+    """
+    Igual que CallListSubscribers, pero pide el catálogo ordenado por
+    'created' DESC en vez de por 'code' ASC.
+
+    Se usa solo para download_subscribers_since_last(): el 'code' de
+    Panaccess no sirve como indicador de antigüedad porque conviven formatos
+    distintos (ver el docstring de esa función). El resto de las funciones
+    (fetch_all_subscribers, compare_and_update_all_subscribers) siguen usando
+    CallListSubscribers sin cambios, porque a ellas el orden no les importa:
+    recorren el catálogo completo de punta a punta.
+    """
+    timeout_msg = f"{timeout}s" if timeout else "sin límite"
+    logger.info(f"📞 Llamando API Panaccess (orden por created DESC): offset={offset}, limit={limit} (timeout: {timeout_msg})")
+
+    try:
+        panaccess = get_panaccess()
+
+        parameters = {
+            'offset': offset,
+            'limit': limit,
+            'orderDir': 'DESC',
+            'orderBy': 'created'
+        }
+
+        response = panaccess.call('getListOfSubscribers', parameters, timeout=timeout)
+
+        if response.get('success'):
+            answer = response.get('answer', {})
+            rows = answer.get('rows', [])
+            logger.debug(f"✅ Respuesta recibida: {len(rows)} suscriptores")
+            return answer
+        else:
+            error_message = response.get('errorMessage', 'Error desconocido al obtener suscriptores')
+            error_code = response.get('errorCode', None)
+
+            if 'session' in error_message.lower() or 'logged' in error_message.lower():
+                logger.error(f"🔑 Error de sesión: {error_message}")
+                raise PanaccessSessionError(f"Sesión expirada o inválida: {error_message}")
+
+            if error_code == 'unknown_error_serverside':
+                logger.warning(f"⚠️ Error del servidor de PanAccess (puede ser temporal): {error_message}")
+                raise PanaccessAPIError(error_message, error_code=error_code)
+
+            logger.error(f"❌ Error en respuesta de PanAccess: {error_message} (código: {error_code})")
+            raise PanaccessAPIError(error_message, error_code=error_code)
+
+    except (PanaccessTimeoutError, PanaccessSessionError):
+        raise
+    except PanaccessException:
+        raise
+    except Exception as e:
+        logger.error(f"💥 Fallo en la llamada a getListOfSubscribers (orden created): {str(e)}", exc_info=True)
         raise PanaccessAPIError(f"Error inesperado: {str(e)}")
