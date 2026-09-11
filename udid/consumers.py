@@ -208,6 +208,7 @@ class AuthWaitWS(AsyncWebsocketConsumer):
             "subscriber_not_found",
             "no_app_credentials",
             "encryption_failed",
+            "no_login_credentials",
         }
         # OJO: "not_associated" NO es fatal; permite esperar a que complete la asociación.
         if res.get("code") in fatal_codes:
@@ -365,6 +366,7 @@ class AuthWaitWS(AsyncWebsocketConsumer):
                     "subscriber_not_found",
                     "no_app_credentials",
                     "encryption_failed",
+                    "no_login_credentials",
                 }
                 if res.get("code") in fatal_codes:
                     await self._send_result(res, status="error")

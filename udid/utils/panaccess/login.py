@@ -118,7 +118,17 @@ def store_logins_to_db(login_data_list):
 
 def fetch_new_logins_from_panaccess(session_id=None):
     """
-    Obtiene logins solo para nuevos suscriptores que no están aún en la base de datos.
+    Obtiene logins solo para suscriptores que no están aún en la base de datos.
+
+    IMPORTANTE: la detección de "nuevo" se hace exclusivamente por pertenencia al
+    conjunto de códigos que ya tienen SubscriberLoginInfo (existing_codes), NUNCA
+    por comparación alfabética de códigos (code > last_code). Los subscriberCode
+    son strings alfanuméricos (ej. '00073420L16') y su orden alfabético no refleja
+    el orden real de alta ni ningún otro criterio de "más nuevo" - comparar así
+    puede excluir para siempre suscriptores válidos que simplemente no ordenan
+    después del último código registrado (bug real detectado: el suscriptor
+    00073420L16 nunca sincronizó su login porque '00073420L16' > last_code daba
+    False, aunque Panaccess sí tenía sus credenciales disponibles).
 
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
@@ -128,27 +138,17 @@ def fetch_new_logins_from_panaccess(session_id=None):
     """
     logger.info("Obteniendo logins de nuevos suscriptores desde Panaccess...")
 
-    # Último registro guardado
-    last_record = LastSubscriberLoginInfo()
-    last_code = last_record.subscriberCode if last_record else None
-
     # Todos los códigos disponibles
-    all_codes = sorted(get_all_subscriber_codes())
+    all_codes = get_all_subscriber_codes()
 
-    # Filtrar códigos nuevos si hay un último código registrado
-    if last_code:
-        new_codes = [code for code in all_codes if code > last_code]
-    else:
-        new_codes = all_codes  # si no hay ningún registro previo, traer todos
-
-    logger.info(f"Nuevos códigos de suscriptores detectados: {len(new_codes)}")
-
-    # Filtrar códigos que ya existen en la BD
+    # Códigos que ya tienen login guardado
     existing_codes = set(
         SubscriberLoginInfo.objects.values_list('subscriberCode', flat=True)
     )
-    new_codes = [code for code in new_codes if code not in existing_codes]
-    logger.info(f"Códigos nuevos después de filtrar existentes: {len(new_codes)}")
+
+    # Nuevos = todos los que aún no tienen SubscriberLoginInfo, sin depender de orden alfabético
+    new_codes = sorted(code for code in all_codes if code not in existing_codes)
+    logger.info(f"Códigos nuevos detectados (sin login guardado): {len(new_codes)}")
 
     results = []
     for code in new_codes:

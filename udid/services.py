@@ -13,6 +13,7 @@ FATAL_CODES = {
     "subscriber_not_found",
     "no_app_credentials",
     "encryption_failed",
+    "no_login_credentials",
 }
 
 def authenticate_with_udid_service(
@@ -82,6 +83,16 @@ def authenticate_with_udid_service(
                     "ok": False,
                     "error": "Subscriber info not found or mismatched SN",
                     "code": "subscriber_not_found",
+                }
+
+            # ✅ NUEVO: si el suscriptor no tiene credenciales de login sincronizadas desde
+            # Panaccess, no continuar. Antes esto se enviaba igual (login1/password en null),
+            # el front no lo detectaba como error y la app se quedaba esperando para siempre.
+            if not subscriber.login1 or not subscriber.get_password():
+                return {
+                    "ok": False,
+                    "error": "Subscriber has no login credentials synced yet",
+                    "code": "no_login_credentials",
                 }
 
             # 4) Payload de credenciales
