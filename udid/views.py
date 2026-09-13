@@ -106,30 +106,20 @@ class RequestUDIDManualView(APIView):
                         "Retry-After": str(retry_after)
                     })
             
-            # 2. Rate limiting por Device Fingerprint (Redis, sin BD)
+            # 2. Device fingerprint: NO se vuelve a chequear el rate limit acá.
+            # RequestUDIDRateLimitMiddleware (udid/middleware.py) ya aplica este
+            # mismo límite (capacity=1 cada 5 min) sobre el mismo fingerprint,
+            # ANTES de llegar a esta vista. Volver a llamar
+            # check_device_fingerprint_rate_limit() con la misma identidad
+            # consumía el único token disponible por SEGUNDA vez dentro del
+            # mismo request -desde que ese check se hizo atómico (necesario
+            # para cerrar una condición de carrera), "chequear" también
+            # "gasta"-, así que esta vista siempre devolvía 429 incluso en el
+            # primer intento legítimo del ciclo de 5 min. Antes de ese fix esto
+            # no se notaba porque el chequeo viejo solo leía un contador; lo
+            # que de verdad lo incrementaba era increment_rate_limit_counter(),
+            # llamado una sola vez, al final, solo en el camino de éxito.
             device_fingerprint = generate_device_fingerprint(request)
-            
-            is_allowed, remaining, retry_after = check_device_fingerprint_rate_limit(
-                device_fingerprint,
-                max_requests=1,  # 1 request cada 5 min (ventana 5 min entre solicitudes)
-                window_minutes=5
-            )
-            
-            if not is_allowed:
-                logger.warning(
-                    f"RequestUDIDManualView: Rate limit excedido - "
-                    f"device_fingerprint={device_fingerprint[:8]}..., ip={client_ip}, "
-                    f"retry_after={retry_after}s"
-                )
-                retry_at = timezone.now() + timedelta(seconds=retry_after)
-                return Response({
-                    "error_code": "DEVICE_FP_RATE_LIMIT_EXCEEDED",
-                    "retry_after": retry_after,
-                    "retry_at": retry_at.isoformat(),
-                    "remaining_requests": remaining
-                }, status=status.HTTP_429_TOO_MANY_REQUESTS, headers={
-                    "Retry-After": str(retry_after)
-                })
 
             # ========================================================================
             # AHORA SÍ: Operaciones de BD
