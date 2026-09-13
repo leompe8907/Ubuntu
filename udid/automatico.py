@@ -514,17 +514,28 @@ class GetSubscriberInfoView(APIView):
             # ✅ ENCRIPTACIÓN SEGURA
             try:
                 plain_password = selected_subscriber.get_password()
-                if not plain_password:
-                    raise Exception("Password no disponible")
-            
-                # Crear payload con todas las credenciales
+                # Mismo criterio que AuthenticateWithUDIDView (views.py) y
+                # authenticate_with_udid_service (services.py): sin login1 o
+                # sin password no hay credenciales completas que entregar.
+                if not selected_subscriber.login1 or not plain_password:
+                    raise Exception("Password o login no disponible")
+
+                # Payload unificado con views.py/services.py: antes este flujo
+                # solo enviaba password/subscriber_code/sn, dejando afuera
+                # login1/login2/pin/packages/products que sí entregan los
+                # otros dos flujos de autenticación.
                 credentials_payload = {
-                    "password": plain_password,
                     "subscriber_code": subscriber_code,
                     "sn": selected_subscriber.sn,
+                    "login1": selected_subscriber.login1,
+                    "login2": selected_subscriber.login2,
+                    "password": plain_password,
+                    "pin": selected_subscriber.get_pin(),
+                    "packages": selected_subscriber.packages,
+                    "products": selected_subscriber.products,
                     "timestamp": timezone.now().isoformat()
                 }
-            
+
                 # Encriptar con sistema híbrido
                 encrypted_result = hybrid_encrypt_for_app(
                     json.dumps(credentials_payload),
