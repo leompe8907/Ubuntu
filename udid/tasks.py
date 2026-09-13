@@ -40,7 +40,7 @@ from .utils.panaccess.subscriberinfo import (
     compare_and_update_subscriber_data,
     get_all_subscriber_codes
 )
-from udid.models import ListOfSmartcards, ListOfSubscriber
+from udid.models import ListOfSmartcards, ListOfSubscriber, SubscriberInfo
 from .utils.panaccess.exceptions import (
     PanaccessException,
     PanaccessAuthenticationError,
@@ -767,16 +767,32 @@ def check_and_sync_subscribers_periodic(self):
                     exc_info=True
                 )
 
-            # Obtener último código antes de sincronizar (guardado en resultado)
-            last_code_before = result.get('last_code_before')
-            
-            # Obtener solo los nuevos suscriptores (código mayor al último que había antes)
-            if last_code_before:
-                new_subscribers = ListOfSubscriber.objects.filter(code__gt=last_code_before).order_by('code')
-            else:
-                # Si no había suscriptores antes, todos son nuevos
-                new_subscribers = ListOfSubscriber.objects.all().order_by('code')
-            
+            # Determinar suscriptores pendientes de asociar su smartcard SIN
+            # comparación alfabética de 'code' (CharField). El código anterior
+            # usaba code__gt=last_code_before para detectar "nuevos", el mismo
+            # patrón de bug ya corregido en fetch_new_logins_from_panaccess y
+            # compare_and_update_all_existing: un code como '00073420L16' puede
+            # dar False al compararlo con '>' aunque sea más reciente, dejando
+            # a ese suscriptor sin smartcard asociada para siempre.
+            #
+            # En vez de eso, se consideran "pendientes" los suscriptores que
+            # todavía no tienen ningún registro en SubscriberInfo (la tabla
+            # consolidada de la que se sirven las credenciales). Este criterio
+            # es auto-reparable -un suscriptor que quede pendiente en una
+            # corrida vuelve a intentarse en la siguiente, sin depender de
+            # haberse ejecutado sin huecos- y ataca directamente el problema
+            # real: que el suscriptor llegue a tener SubscriberInfo/credenciales.
+            associated_codes = SubscriberInfo.objects.values_list(
+                'subscriber_code', flat=True
+            ).distinct()
+            new_subscribers = ListOfSubscriber.objects.exclude(
+                code__isnull=True
+            ).exclude(
+                code=''
+            ).exclude(
+                code__in=associated_codes
+            ).order_by('code')
+
             new_subscribers_count = new_subscribers.count()
             smartcards_updated_count = 0
             smartcards_found_count = 0
