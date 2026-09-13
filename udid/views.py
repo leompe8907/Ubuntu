@@ -567,6 +567,15 @@ class AuthenticateWithUDIDView(APIView):
                 except SubscriberInfo.DoesNotExist:
                     return Response({"error": "Subscriber info not found or mismatched SN"}, status=status.HTTP_404_NOT_FOUND)
 
+                # Si el suscriptor aún no tiene credenciales de login sincronizadas desde
+                # Panaccess, no continuar: antes esto se entregaba igual (login1/password
+                # en null) cifrado con 200 OK, dejando al dispositivo con credenciales vacías.
+                if not subscriber.login1 or not subscriber.get_password():
+                    return Response({
+                        "error": "Subscriber has no login credentials synced yet",
+                        "error_code": "no_login_credentials"
+                    }, status=status.HTTP_409_CONFLICT)
+
                 credentials_payload = {
                     "subscriber_code": subscriber.subscriber_code,
                     "sn": subscriber.sn,
@@ -590,7 +599,7 @@ class AuthenticateWithUDIDView(APIView):
                 # Encriptar credenciales
                 try:
                     encrypted_result = hybrid_encrypt_for_app(
-                        json_serialize_credentials(credentials_payload), app_type
+                        json_serialize_credentials(credentials_payload), app_credentials
                     )
                 except Exception as e:
                     return Response({
@@ -978,7 +987,13 @@ class DisassociateUDIDView(APIView):
                 except UDIDAuthRequest.DoesNotExist:
                     return Response({"error": "UDID not found"}, status=status.HTTP_404_NOT_FOUND)
 
-                if req.status not in ['validated', 'used', 'expired']:
+                # Regla unificada con RevokeUDIDView/OperatorRevokeUDIDView/
+                # UserReleaseUDIDView: solo bloquear si ya está revocado o
+                # expirado (antes esta vista bloqueaba además 'pending', sin
+                # razón distinta de las otras tres). El requisito de que
+                # tenga un SN asociado se mantiene, ya que es específico de
+                # "desasociar" (no tendría sentido desasociar sin SN).
+                if req.status in ['revoked', 'expired']:
                     return Response({
                         "error": f"Cannot disassociate: UDID is in state '{req.status}'"
                     }, status=status.HTTP_400_BAD_REQUEST)
@@ -990,33 +1005,41 @@ class DisassociateUDIDView(APIView):
 
                 old_sn = req.sn
                 old_status = req.status
+                revoked_at = timezone.now()
 
                 # Cambiar estado y limpiar SN
+                # NOTA: UDIDAuthRequest no tiene campos 'revoked_at'/'revoked_reason'
+                # (esos existen en AppCredentials, otro modelo). Asignarlos aquí
+                # antes solo creaba atributos Python transitorios que .save() no
+                # persistía -aunque la respuesta parecía incluirlos, nunca
+                # quedaban en la base de datos-. Esa información va al audit log,
+                # igual que en las otras tres vistas de revocación/liberación.
                 req.sn = None
                 req.status = 'revoked'
-                req.revoked_at = timezone.now()
-                req.revoked_reason = reason
                 req.save()
 
-                # Log de auditoría (asíncrono)
+                # Log de auditoría (asíncrono) - mismo action_type que las otras
+                # tres vistas de revocación ('udid_revoked' no es un valor
+                # documentado en AuthAuditLog.ACTION_TYPES)
                 log_audit_async(
-                    action_type='udid_revoked',
+                    action_type='account_locked',
                     udid=req.udid,
                     subscriber_code=req.subscriber_code,
                     operator_id=operator_id,
                     client_ip=request.META.get('REMOTE_ADDR'),
                     user_agent=request.META.get('HTTP_USER_AGENT', ''),
                     details={
+                        "action": "disassociate",
                         "old_sn": old_sn,
                         "old_status": old_status,
-                        "revoked_at": timezone.now().isoformat(),
+                        "revoked_at": revoked_at.isoformat(),
                         "reason": reason
                     }
                 )
 
                 return Response({
                     "message": f"UDID {req.udid} was successfully disassociated",
-                    "revoked_at": req.revoked_at,
+                    "sn_released": old_sn,
                     "subscriber_code": req.subscriber_code,
                 }, status=status.HTTP_200_OK)
 

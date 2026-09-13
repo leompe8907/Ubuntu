@@ -37,14 +37,19 @@ def generate_rsa_key_pair(key_size=2048):
     
     return private_pem, public_pem
 
-def rsa_encrypt_for_app(plaintext: str, app_type: str) -> str:
+def rsa_encrypt_for_app(plaintext: str, app_credentials: AppCredentials) -> str:
     """
     Encripta datos usando la clave PRIVADA del backend
     La app usará la clave PÚBLICA para desencriptar
+
+    app_credentials: instancia de AppCredentials ya resuelta por el llamador
+    (filtrada por app_type + app_version, activa y no comprometida). No se
+    vuelve a resolver aquí por app_type para evitar que la clave usada diverja
+    de la que el llamador ya validó (AppCredentials.unique_together permite
+    varias app_version activas por app_type, así que resolver solo por
+    app_type es ambiguo).
     """
     try:
-        app_credentials = AppCredentials.objects.get(app_type=app_type, is_active=True)
-        
         # ✅ CORRECCIÓN: Usar clave PRIVADA para encriptar
         private_key = serialization.load_pem_private_key(
             app_credentials.private_key_pem.encode(),
@@ -65,23 +70,28 @@ def rsa_encrypt_for_app(plaintext: str, app_type: str) -> str:
         # Retornar como base64 para mejor compatibilidad
         import base64
         return base64.b64encode(encrypted).decode('utf-8')
-        
-    except AppCredentials.DoesNotExist:
-        raise Exception(f"⚠️ No se encontraron claves activas para app_type={app_type}")
+
     except Exception as e:
         raise Exception(f"❌ Error de encriptación: {str(e)}")
 
-def hybrid_encrypt_for_app(plaintext: str, app_type: str) -> dict:
+def hybrid_encrypt_for_app(plaintext: str, app_credentials: AppCredentials) -> dict:
     """
     🔐 ENCRIPTACIÓN HÍBRIDA SEGURA:
     1. Genera clave AES aleatoria
     2. Encripta datos con AES (rápido)
     3. Encripta clave AES con RSA pública del dispositivo (seguro)
     4. Solo el dispositivo con clave privada puede desencriptar
+
+    app_credentials: instancia de AppCredentials ya resuelta por el llamador
+    (filtrada por app_type + app_version, activa y no comprometida). No se
+    vuelve a resolver aquí por app_type para evitar que la clave usada diverja
+    de la que el llamador ya validó (AppCredentials.unique_together permite
+    varias app_version activas por app_type, así que resolver solo por
+    app_type es ambiguo y puede lanzar MultipleObjectsReturned).
     """
     try:
-        app_credentials = AppCredentials.objects.get(app_type=app_type, is_active=True)
-        
+        app_type = app_credentials.app_type
+
         # ✅ PASO 1: Cargar clave PÚBLICA del dispositivo
         public_key = serialization.load_pem_public_key(
             app_credentials.public_key_pem.encode(),
@@ -121,18 +131,13 @@ def hybrid_encrypt_for_app(plaintext: str, app_type: str) -> dict:
             "algorithm": "AES-256-CBC + RSA-OAEP",
             "app_type": app_type
         }
-        
-    except AppCredentials.DoesNotExist:
-        raise Exception(f"⚠️ No se encontraron claves activas para app_type={app_type}")
+
     except Exception as e:
         raise Exception(f"❌ Error de encriptación híbrida: {str(e)}")
 
-def verify_app_can_decrypt(app_type: str) -> bool:
+def verify_app_can_decrypt(app_credentials: AppCredentials) -> bool:
     """
-    Verifica que existan las claves necesarias para el tipo de app
+    Verifica que las credenciales ya resueltas por el llamador sigan siendo
+    utilizables (activas, no comprometidas, no expiradas).
     """
-    try:
-        app_credentials = AppCredentials.objects.get(app_type=app_type, is_active=True)
-        return True
-    except AppCredentials.DoesNotExist:
-        return False
+    return bool(app_credentials) and app_credentials.is_usable()

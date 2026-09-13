@@ -137,7 +137,7 @@ def authenticate_with_udid_service(
             # 6) Cifrado híbrido (usa tu helper actual)
             try:
                 encrypted_result = hybrid_encrypt_for_app(
-                    json_serialize_credentials(credentials_payload), app_type
+                    json_serialize_credentials(credentials_payload), app_credentials
                 )
             except Exception as e:
                 return {

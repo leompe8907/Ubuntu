@@ -57,20 +57,30 @@ TASK_LOCK_TIMEOUT = 3600 * 6  # 6 horas máximo (por si una tarea se cuelga)
 
 def acquire_task_lock(task_name, timeout=TASK_LOCK_TIMEOUT):
     """
-    Adquiere un lock para evitar que múltiples tareas se ejecuten simultáneamente.
-    
+    Adquiere un lock GLOBAL para evitar que cualquier combinación de las
+    tareas de sincronización de Panaccess se ejecute simultáneamente.
+
+    Antes la clave de lock incluía task_name (f"{TASK_LOCK_KEY}:{task_name}"),
+    así que cada tarea solo se bloqueaba a sí misma: dos tareas *distintas*
+    (ej. sync_all_data_automatic, que puede tardar varias horas, y
+    check_and_sync_subscribers_periodic, que corre cada 5 min) sí podían
+    correr en paralelo y escribir las mismas tablas (ListOfSubscriber,
+    ListOfSmartcards, SubscriberInfo) al mismo tiempo, contradiciendo el
+    docstring del módulo ("las demás esperarán hasta que termine"). Ahora
+    todas comparten una única clave de lock.
+
     Args:
         task_name: Nombre de la tarea que intenta adquirir el lock
         timeout: Tiempo máximo que el lock estará activo (en segundos)
-    
+
     Returns:
         bool: True si se adquirió el lock, False si otra tarea está en ejecución
     """
-    lock_key = f"{TASK_LOCK_KEY}:{task_name}"
-    
+    lock_key = TASK_LOCK_KEY
+
     # Intentar adquirir el lock (si no existe, lo crea con timeout)
     acquired = cache.add(lock_key, task_name, timeout)
-    
+
     if acquired:
         logger.info(f"🔒 [LOCK] Lock adquirido para tarea: {task_name}")
         return True
@@ -86,14 +96,27 @@ def acquire_task_lock(task_name, timeout=TASK_LOCK_TIMEOUT):
 
 def release_task_lock(task_name):
     """
-    Libera el lock de una tarea.
-    
+    Libera el lock GLOBAL, pero solo si sigue siendo el de esta tarea.
+
+    Con una clave compartida entre tareas, si esta tarea tardó más que
+    `timeout` y el lock ya expiró y fue tomado por otra tarea, liberar sin
+    condición borraría el lock de esa otra tarea (todavía en ejecución) en
+    vez de un lock ya inexistente. Por eso solo se borra si el valor
+    guardado sigue siendo task_name.
+
     Args:
         task_name: Nombre de la tarea que libera el lock
     """
-    lock_key = f"{TASK_LOCK_KEY}:{task_name}"
-    cache.delete(lock_key)
-    logger.info(f"🔓 [LOCK] Lock liberado para tarea: {task_name}")
+    lock_key = TASK_LOCK_KEY
+    current_task = cache.get(lock_key)
+    if current_task == task_name:
+        cache.delete(lock_key)
+        logger.info(f"🔓 [LOCK] Lock liberado para tarea: {task_name}")
+    else:
+        logger.warning(
+            f"⚠️ [LOCK] {task_name} no liberó el lock: ya pertenece a "
+            f"'{current_task}' (probablemente por timeout de esta tarea)."
+        )
 
 
 @shared_task(
@@ -728,7 +751,22 @@ def check_and_sync_subscribers_periodic(self):
         logger.info("📱 [CHECK_SUBSCRIBERS] Revisando smartcards de nuevos suscriptores y asociándolas...")
         try:
             from .utils.panaccess.smartcard import extract_sns_from_smartcards_field
-            
+
+            # Sincronizar smartcards nuevas ANTES de asociar. Antes este paso solo
+            # reasociaba smartcards que ya existían en ListOfSmartcards, y esa tabla
+            # solo se sincronizaba una vez al mes (check_and_sync_smartcards_monthly).
+            # Un suscriptor nuevo podía pasar semanas sin smartcard en BD y por lo
+            # tanto sin SubscriberInfo/credenciales. Al traer smartcards nuevas cada
+            # 5 minutos (igual que los suscriptores), la smartcard del suscriptor
+            # recién creado ya está disponible cuando se ejecuta esta asociación.
+            try:
+                sync_smartcards(session_id=None, limit=100)
+            except Exception as e:
+                logger.error(
+                    f"❌ [CHECK_SUBSCRIBERS] Error sincronizando smartcards nuevas: {str(e)}",
+                    exc_info=True
+                )
+
             # Obtener último código antes de sincronizar (guardado en resultado)
             last_code_before = result.get('last_code_before')
             

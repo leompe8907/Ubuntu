@@ -87,11 +87,21 @@ def store_logins_to_db(login_data_list):
 
                     try:
                         # CORRECCIÓN: Usar get_or_create para evitar duplicados
+                        # 'password' se excluye de los defaults genéricos: se cifra aparte
+                        # con set_login_password() para no guardarlo nunca en texto plano.
+                        raw_password = login_data.get('password')
+                        defaults = {
+                            k: v for k, v in login_data.items()
+                            if k not in ('subscriberCode', 'password')
+                        }
                         obj, created = SubscriberLoginInfo.objects.get_or_create(
                             subscriberCode=subscriber_code,
-                            defaults={k: v for k, v in login_data.items() if k != 'subscriberCode'}
+                            defaults=defaults
                         )
                         if created:
+                            if raw_password:
+                                obj.set_login_password(raw_password)
+                                obj.save(update_fields=['password'])
                             saved_count += 1
                             logger.debug(f"Nuevo registro creado para {subscriber_code}")
                         else:
@@ -203,10 +213,19 @@ def compare_and_update_all_existing(session_id=None):
             # Comparar campo por campo
             for key, remote_value in remote_login.items():
                 model_field = key
-                
+
+                # 'password' se compara/actualiza desencriptando el valor local:
+                # nunca comparar ni asignar el texto plano remoto directo al campo,
+                # porque el campo guarda el valor cifrado con Fernet.
+                if model_field == 'password':
+                    if remote_value and local_obj.get_login_password() != remote_value:
+                        local_obj.set_login_password(remote_value)
+                        changed_fields.append('password')
+                    continue
+
                 if hasattr(local_obj, model_field):
                     local_value = getattr(local_obj, model_field)
-                    
+
                     # Comparar valores, manejando None y listas
                     if isinstance(local_value, list) and isinstance(remote_value, list):
                         if local_value != remote_value:

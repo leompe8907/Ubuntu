@@ -74,8 +74,14 @@ class SubscriberLoginInfo(models.Model):
     login1 = models.IntegerField(null=True, blank=True)
     login2 = models.CharField(max_length=100, null=True, blank=True)
     additionalLogins = models.JSONField(null=True, blank=True)
-    password = models.CharField(max_length=100, null=True, blank=True)
+    password = models.CharField(max_length=255, null=True, blank=True)  # cifrado con Fernet, nunca texto plano
     licenses = models.JSONField(null=True, blank=True)
+
+    def set_login_password(self, raw_password):
+        self.password = encrypt_value(raw_password) if raw_password else None
+
+    def get_login_password(self):
+        return decrypt_value(self.password) if self.password else None
 
     def __str__(self):
         return self.data

@@ -27,6 +27,19 @@ def get_client_ip(request):
         return x_forwarded_for.split(',')[0]
     return request.META.get('REMOTE_ADDR')
 
+
+def _get_client_ip_any(source):
+    """
+    Obtiene la IP del cliente desde un request (HTTP, tiene .META) o un
+    scope de Channels (WebSocket, tiene ['client']). Señal observada por el
+    servidor, no autorreportada por el dispositivo.
+    """
+    if hasattr(source, 'META'):
+        return get_client_ip(source) or ''
+    if isinstance(source, dict):
+        return (source.get('client') or [''])[0] or ''
+    return ''
+
 def compute_encrypted_hash(encrypted_data):
     """Generar hash SHA256 para payloads cifrados"""
     return hashlib.sha256(encrypted_data.encode()).hexdigest()
@@ -161,7 +174,13 @@ def generate_device_fingerprint(request_or_scope):
         # Validar que sea hexadecimal válido
         try:
             int(direct_fingerprint, 16)
-            return direct_fingerprint  # Usar fingerprint del dispositivo
+            # No usar el valor autorreportado tal cual: un cliente podría
+            # enviar un fingerprint aleatorio distinto en cada request para
+            # obtener siempre un rate limit nuevo (bucket vacío). Se ata a la
+            # IP de origen -señal que el cliente no controla- para que solo
+            # cambie de "bucket" si también cambia de red, no en cada request.
+            client_ip = _get_client_ip_any(request_or_scope)
+            return hashlib.sha256(f"{direct_fingerprint}:{client_ip}".encode()).hexdigest()[:32]
         except ValueError:
             # Si no es válido, continuar con generación normal
             pass
@@ -202,134 +221,130 @@ def generate_device_fingerprint(request_or_scope):
 
 def check_device_fingerprint_rate_limit(device_fingerprint, max_requests=3, window_minutes=5):
     """
-    Verifica el rate limit por device fingerprint.
-    Versión optimizada: siempre intenta cache primero. Solo consulta BD si es absolutamente necesario.
+    Verifica el rate limit por device fingerprint, de forma atómica.
     CAPA 1: Protege /request-udid/ (primera solicitud)
-    
+
+    Antes esto se hacía leyendo un contador de cache, decidiendo si permitir,
+    y recién incrementando el contador en otro punto posterior del código
+    (increment_rate_limit_counter, llamado solo si la solicitud tenía éxito).
+    Entre esa lectura y ese incremento no había atomicidad: varias
+    solicitudes concurrentes del mismo fingerprint podían leer el mismo
+    valor y pasar todas el check antes de que cualquiera lo incrementara,
+    permitiendo más requests que el límite configurado durante una ráfaga.
+    Se reutiliza aquí el mismo script Lua atómico que ya protege el token
+    bucket de client_token (check_token_bucket_lua) en vez de repetir el
+    patrón no atómico.
+
     Args:
         device_fingerprint: Fingerprint único del dispositivo
         max_requests: Máximo de requests permitidos
         window_minutes: Ventana de tiempo en minutos
-        
+
     Returns:
         tuple: (is_allowed: bool, remaining_requests: int, retry_after_seconds: int)
     """
     if not device_fingerprint:
         return False, 0, 0
-    
-    # Intentar usar cache primero (optimización)
-    cache_key = f"rate_limit:device_fp:{device_fingerprint}"
-    cached_count = cache.get(cache_key)
-    
-    if cached_count is not None:
-        remaining = max(0, max_requests - cached_count)
-        if cached_count >= max_requests:
-            # Obtener tiempo restante real hasta que expire la ventana (TTL)
-            ttl_fn = getattr(cache, 'ttl', None)
-            if callable(ttl_fn):
-                remaining_seconds = ttl_fn(cache_key)
-                retry_after = max(1, int(remaining_seconds)) if remaining_seconds and remaining_seconds > 0 else window_minutes * 60
-            else:
-                retry_after = window_minutes * 60
-            logger.warning(
-                f"Rate limit exceeded: device_fingerprint={device_fingerprint[:8]}..., "
-                f"count={cached_count}, limit={max_requests}, "
-                f"window={window_minutes}min, retry_after={retry_after}s"
-            )
-            return False, remaining, retry_after
-        return True, remaining, 0
-    
-    # Si no está en cache, inicializar con 0
-    # Esto evita consulta a BD en primera llamada (optimización)
-    cache.set(cache_key, 0, timeout=window_minutes * 60)
-    return True, max_requests, 0
+
+    window_seconds = window_minutes * 60
+    is_allowed, remaining, retry_after = check_token_bucket_lua(
+        identifier=f"devicefp:{device_fingerprint}",
+        capacity=max_requests,
+        refill_rate=max_requests,
+        window_seconds=window_seconds,
+        tokens_requested=1,
+    )
+
+    if is_allowed:
+        # Compat: los llamadores existentes asumen que "remaining" es el
+        # disponible ANTES de que esta solicitud consuma un token (ellos
+        # mismos restan 1 al mostrarlo). El script Lua ya consumió el token
+        # y devuelve el remanente posterior, así que se compensa sumando 1.
+        remaining += 1
+    else:
+        logger.warning(
+            f"Rate limit exceeded: device_fingerprint={device_fingerprint[:8]}..., "
+            f"limit={max_requests}, window={window_minutes}min, retry_after={retry_after}s"
+        )
+
+    return is_allowed, remaining, retry_after
 
 
 def check_udid_rate_limit(udid, max_requests=20, window_minutes=60):
     """
-    Verifica el rate limit por UDID.
-    Versión optimizada: siempre intenta cache primero. Solo consulta BD si es absolutamente necesario.
+    Verifica el rate limit por UDID, de forma atómica (ver check_device_fingerprint_rate_limit
+    para el detalle de la condición de carrera que esto reemplaza).
     CAPA 3: Protege /get-subscriber-info/, /authenticate-with-udid/, /validate/
-    
+
     Args:
         udid: UDID único del dispositivo
         max_requests: Máximo de requests permitidos
         window_minutes: Ventana de tiempo en minutos
-        
+
     Returns:
         tuple: (is_allowed: bool, remaining_requests: int, retry_after_seconds: int)
     """
     if not udid:
         return False, 0, 0
-    
-    # Intentar usar cache primero (optimización)
-    cache_key = f"rate_limit:udid:{udid}"
-    cached_count = cache.get(cache_key)
-    
-    if cached_count is not None:
-        remaining = max(0, max_requests - cached_count)
-        if cached_count >= max_requests:
-            # Obtener tiempo restante real hasta que expire la ventana (TTL)
-            ttl_fn = getattr(cache, 'ttl', None)
-            if callable(ttl_fn):
-                remaining_seconds = ttl_fn(cache_key)
-                retry_after = max(1, int(remaining_seconds)) if remaining_seconds and remaining_seconds > 0 else window_minutes * 60
-            else:
-                retry_after = window_minutes * 60
-            logger.warning(
-                f"Rate limit exceeded: udid={udid[:8] if len(udid) > 8 else udid}..., "
-                f"count={cached_count}, limit={max_requests}, "
-                f"window={window_minutes}min, retry_after={retry_after}s"
-            )
-            return False, remaining, retry_after
-        return True, remaining, 0
-    
-    # Si no está en cache, inicializar con 0
-    # Esto evita consulta a BD en primera llamada (optimización)
-    cache.set(cache_key, 0, timeout=window_minutes * 60)
-    return True, max_requests, 0
+
+    window_seconds = window_minutes * 60
+    is_allowed, remaining, retry_after = check_token_bucket_lua(
+        identifier=f"udidrl:{udid}",
+        capacity=max_requests,
+        refill_rate=max_requests,
+        window_seconds=window_seconds,
+        tokens_requested=1,
+    )
+
+    if is_allowed:
+        # Compat: ver nota en check_device_fingerprint_rate_limit.
+        remaining += 1
+    else:
+        logger.warning(
+            f"Rate limit exceeded: udid={udid[:8] if len(udid) > 8 else udid}..., "
+            f"limit={max_requests}, window={window_minutes}min, retry_after={retry_after}s"
+        )
+
+    return is_allowed, remaining, retry_after
 
 
 def check_temp_token_rate_limit(temp_token, max_requests=10, window_minutes=5):
     """
-    Verifica el rate limit por temp_token.
+    Verifica el rate limit por temp_token, de forma atómica (ver
+    check_device_fingerprint_rate_limit para el detalle de la condición de
+    carrera que esto reemplaza).
     CAPA 2: Protege /validate-udid/
-    
+
     Args:
         temp_token: Token temporal único
         max_requests: Máximo de requests permitidos
         window_minutes: Ventana de tiempo en minutos
-        
+
     Returns:
         tuple: (is_allowed: bool, remaining_requests: int, retry_after_seconds: int)
     """
-    # Importar aquí para evitar imports circulares
-    from .models import UDIDAuthRequest
-    
     if not temp_token:
         return False, 0, 0
-    
-    # Intentar usar cache primero
-    cache_key = f"rate_limit:temp_token:{temp_token}"
-    cached_count = cache.get(cache_key)
-    
-    if cached_count is not None:
-        remaining = max(0, max_requests - cached_count)
-        if cached_count >= max_requests:
-            retry_after = window_minutes * 60
-            # Log de rate limit excedido
-            logger.warning(
-                f"Rate limit exceeded: temp_token={temp_token[:8] if len(temp_token) > 8 else temp_token}..., "
-                f"count={cached_count}, limit={max_requests}, "
-                f"window={window_minutes}min, retry_after={retry_after}s"
-            )
-            return False, remaining, retry_after
-        return True, remaining, 0
-    
-    # Si no está en cache, inicializar con 0
-    # Esto evita consulta a BD en primera llamada (optimización)
-    cache.set(cache_key, 0, timeout=window_minutes * 60)
-    return True, max_requests, 0
+
+    window_seconds = window_minutes * 60
+    is_allowed, remaining, retry_after = check_token_bucket_lua(
+        identifier=f"temptok:{temp_token}",
+        capacity=max_requests,
+        refill_rate=max_requests,
+        window_seconds=window_seconds,
+        tokens_requested=1,
+    )
+
+    if is_allowed:
+        # Compat: ver nota en check_device_fingerprint_rate_limit.
+        remaining += 1
+    else:
+        logger.warning(
+            f"Rate limit exceeded: temp_token={temp_token[:8] if len(temp_token) > 8 else temp_token}..., "
+            f"limit={max_requests}, window={window_minutes}min, retry_after={retry_after}s"
+        )
+
+    return is_allowed, remaining, retry_after
 
 
 def check_combined_rate_limit(udid, temp_token, max_requests=10, window_minutes=5):
@@ -374,19 +389,19 @@ def check_combined_rate_limit(udid, temp_token, max_requests=10, window_minutes=
 
 def increment_rate_limit_counter(identifier_type, identifier):
     """
-    Incrementa el contador de rate limiting en cache.
-    Útil para actualizar contadores después de operaciones exitosas.
-    
+    OBSOLETO / NO-OP: check_device_fingerprint_rate_limit, check_udid_rate_limit
+    y check_temp_token_rate_limit ahora incrementan su contador de forma
+    atómica dentro del propio check (vía check_token_bucket_lua), en vez de
+    exponer un paso "incrementar después" separado. Esta función se deja como
+    no-op -en vez de eliminarla y actualizar sus ~14 llamadas en
+    views.py/automatico.py- para no romper esos call sites. Si se vuelve a
+    incrementar aquí, cada solicitud aceptada se contaría dos veces.
+
     Args:
         identifier_type: 'device_fp', 'udid', o 'temp_token'
         identifier: El valor del identificador
     """
-    cache_key = f"rate_limit:{identifier_type}:{identifier}"
-    try:
-        cache.incr(cache_key)
-    except ValueError:
-        # Si no existe, inicializar
-        cache.set(cache_key, 1, timeout=3600)  # 1 hora por defecto
+    return
 
 
 def check_websocket_rate_limit(udid, device_fingerprint, max_connections=5, window_minutes=5):
@@ -1596,21 +1611,31 @@ def check_token_bucket_lua(identifier, capacity=10, refill_rate=1,
 def get_client_token(request):
     """
     Obtiene token del cliente desde header X-Client-Token o UDID.
-    
+
+    Siempre devuelve un identificador no vacío: si el cliente no envía
+    X-Client-Token ni udid, se usa la IP de origen como último fallback.
+    Antes, devolver None aquí hacía que las capas de rate limiting que
+    condicionan el check con "if client_token:" (ver views.py/automatico.py)
+    se saltaran por completo con solo omitir el header.
+
     Args:
         request: Request object de Django
-        
+
     Returns:
-        str: Token del cliente o None
+        str: Token del cliente (nunca None/vacío)
     """
     # Intentar obtener desde header X-Client-Token
     token = request.META.get('HTTP_X_CLIENT_TOKEN')
-    
+
     if not token:
         # Fallback a UDID si está disponible
         if hasattr(request, 'data') and request.data:
             token = request.data.get('udid')
         if not token and hasattr(request, 'query_params') and request.query_params:
             token = request.query_params.get('udid')
-    
+
+    if not token:
+        # Última señal: IP de origen (el cliente no la controla libremente)
+        token = f"ip:{get_client_ip(request)}"
+
     return token

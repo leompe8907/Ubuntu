@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 
 from django.utils import timezone
+from django.db import transaction
 
 from datetime import timedelta
 
@@ -234,6 +235,13 @@ class ValidateUDIDView(APIView):
                 "error": "Subscriber code no válido."
             }, status=status.HTTP_404_NOT_FOUND)
 
+        # Limpiar SNs de UDIDs expirados del mismo subscriber antes de validar
+        UDIDAuthRequest.objects.filter(
+            subscriber_code=subscriber_code,
+            expires_at__lt=timezone.now(),
+            status__in=['validated', 'pending']
+        ).update(status='expired', sn=None)
+
         # Actualizar registro
         req.status = "validated"
         req.validated_at = timezone.now()
@@ -344,196 +352,202 @@ class GetSubscriberInfoView(APIView):
                 "received": app_type
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ VERIFICAR UDID
-        try:
-            req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({
-                "error": "UDID no encontrado."
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        # ✅ VALIDAR CREDENCIALES DE APLICACIÓN
-        try:
-            app_credentials = AppCredentials.objects.get(
-                app_type=app_type,
-                app_version=app_version,
-                is_active=True
-            )
-            
-            if not app_credentials.is_usable():
-                raise AppCredentials.DoesNotExist("Credenciales no utilizables")
-                
-        except AppCredentials.DoesNotExist:
-            # Intentar con cualquier versión activa del mismo tipo
+        with transaction.atomic():
+            # ✅ VERIFICAR UDID
             try:
-                app_credentials = AppCredentials.objects.filter(
-                    app_type=app_type,
-                    is_active=True
-                ).exclude(
-                    is_compromised=True
-                ).order_by('-created_at').first()
-                
-                if not app_credentials:
-                    raise AppCredentials.DoesNotExist()
-                    
-            except:
+                req = UDIDAuthRequest.objects.select_for_update().get(udid=udid)
+            except UDIDAuthRequest.DoesNotExist:
                 return Response({
-                    "error": f"No hay credenciales seguras disponibles para app_type='{app_type}'",
-                    "details": {
-                        "requested_version": app_version,
-                        "app_type": app_type,
-                        "solution": "Contacte al administrador para generar nuevas credenciales"
-                    }
-                }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+                    "error": "UDID no encontrado."
+                }, status=status.HTTP_404_NOT_FOUND)
 
-        # ✅ ACTUALIZAR INFO DE APP EN UDID
-        req.app_type = app_type
-        req.app_version = app_version
-        req.app_credentials_used = app_credentials
-        req.save()
+            # ✅ VALIDAR CREDENCIALES DE APLICACIÓN
+            try:
+                app_credentials = AppCredentials.objects.get(
+                    app_type=app_type,
+                    app_version=app_version,
+                    is_active=True
+                )
+            
+                if not app_credentials.is_usable():
+                    raise AppCredentials.DoesNotExist("Credenciales no utilizables")
+                
+            except AppCredentials.DoesNotExist:
+                # Intentar con cualquier versión activa del mismo tipo
+                try:
+                    app_credentials = AppCredentials.objects.filter(
+                        app_type=app_type,
+                        is_active=True
+                    ).exclude(
+                        is_compromised=True
+                    ).order_by('-created_at').first()
+                
+                    if not app_credentials:
+                        raise AppCredentials.DoesNotExist()
+                    
+                except:
+                    return Response({
+                        "error": f"No hay credenciales seguras disponibles para app_type='{app_type}'",
+                        "details": {
+                            "requested_version": app_version,
+                            "app_type": app_type,
+                            "solution": "Contacte al administrador para generar nuevas credenciales"
+                        }
+                    }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        #✅ Verificar si el token ha expirado
-        if req.is_expired():
-            req.status = "expired"
+            # ✅ ACTUALIZAR INFO DE APP EN UDID
+            req.app_type = app_type
+            req.app_version = app_version
+            req.app_credentials_used = app_credentials
             req.save()
-            return Response({"error": "El token ha expirado."}, status=status.HTTP_403_FORBIDDEN)
 
-        # ✅ LIMPIAR UDIDS EXPIRADOS
-        UDIDAuthRequest.objects.filter(
-            expires_at__lt=timezone.now(),
-            status__in=['validated', 'pending']
-        ).update(status='expired', sn=None)
+            #✅ Verificar si el token ha expirado
+            if req.is_expired():
+                req.status = "expired"
+                req.save()
+                return Response({"error": "El token ha expirado."}, status=status.HTTP_403_FORBIDDEN)
 
-        #✅ PASO 1: Buscar subscriber code
-        subscriber_code = req.subscriber_code
+            # ✅ LIMPIAR UDIDS EXPIRADOS
+            UDIDAuthRequest.objects.filter(
+                expires_at__lt=timezone.now(),
+                status__in=['validated', 'pending']
+            ).update(status='expired', sn=None)
 
-        #✅ PASO 2: Filtrar todas las SNs del subscriber con productos asociados
-        subscriber_infos = SubscriberInfo.objects.filter(
-            subscriber_code=subscriber_code
-        ).exclude(
-            products__isnull=True
-        ).exclude(
-            products=[]
-        )
+            #✅ PASO 1: Buscar subscriber code
+            subscriber_code = req.subscriber_code
 
-        if not subscriber_infos.exists():
-            self._log_failed_attempt(req, "No smartcards with products", request)
-            req.mark_as_used()
-            return Response({
-                "error": "El usuario no tiene productos asociados a su cuenta."
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        #✅ PASO 3: Validar qué SNs están asociados a UDIDs activos (CUALQUIER APP_TYPE)
-        used_sns_via_udid = UDIDAuthRequest.objects.filter(
-            status__in=['validated', 'used'],
-            subscriber_code=subscriber_code,
-            expires_at__gte=timezone.now(),
-            sn__isnull=False
-            # ❌ NO filtrar por app_type - queremos ALL SNs ocupadas
-        ).exclude(
-            udid=udid  # Excluir el UDID actual
-        ).values_list('sn', flat=True)
-
-        # ✅ OBTENER DETALLES DE SNs EN USO PARA DEBUG
-        used_sns_with_app_type = UDIDAuthRequest.objects.filter(
-            status__in=['validated', 'used'],
-            subscriber_code=subscriber_code,
-            expires_at__gte=timezone.now(),
-            sn__isnull=False
-        ).exclude(
-            udid=udid
-        ).values('sn', 'app_type', 'udid')
-
-        print(f"🔍 DEBUG - Subscriber: {subscriber_code}")
-        print(f"🔍 DEBUG - App Type solicitado: {app_type}")
-        print(f"🔍 DEBUG - SNs ocupados (todos los tipos): {list(used_sns_via_udid)}")
-        print(f"🔍 DEBUG - Detalles de SNs ocupados:")
-        for usage in used_sns_with_app_type:
-            print(f"    SN {usage['sn']} → {usage['app_type']} (UDID: {usage['udid'][:8]}...)")
-        print(f"🔍 DEBUG - Total SNs disponibles: {subscriber_infos.count()}")
-
-        #✅ PASO 4: Buscar SN disponible (que NO esté en uso por NINGÚN tipo de app)
-        selected_subscriber = None
-        available_sns = []
-        
-        for sub in subscriber_infos:
-            if sub.sn not in used_sns_via_udid:
-                available_sns.append(sub.sn)
-                if not selected_subscriber:
-                    selected_subscriber = sub
-        
-        print(f"🔍 DEBUG - SNs completamente disponibles: {available_sns}")
-        
-        #✅ PASO 5: Si no hay SNs disponibles, mostrar detalles específicos
-        if not selected_subscriber:
-            # Crear información detallada del uso de SNs
-            usage_details = {}
-            for usage in used_sns_with_app_type:
-                sn = usage['sn']
-                app_type_used = usage['app_type']
-                if sn not in usage_details:
-                    usage_details[sn] = []
-                usage_details[sn].append(app_type_used)
-            
-            self._log_failed_attempt(req, "All SNs occupied by different app types", request, {
-                "total_sns": subscriber_infos.count(),
-                "sn_usage_details": usage_details,
-                "requested_app_type": app_type
-            })
-            req.mark_as_used()
-            
-            return Response({
-                "error": f"❌ El usuario {subscriber_code} no tiene smartcards disponibles. Todas están en uso por otros dispositivos.",
-                "details": {
-                    "subscriber_code": subscriber_code,
-                    "requested_app_type": app_type,
-                    "total_smartcards": subscriber_infos.count(),
-                    "smartcards_in_use": len(used_sns_via_udid),
-                    "available_smartcards": 0,
-                    "usage_breakdown": usage_details,
-                    "message": "Cada smartcard solo puede estar activa en un tipo de dispositivo a la vez",
-                    "retry_after_minutes": 15
-                }
-            }, status=status.HTTP_409_CONFLICT)
-
-        #✅ PASO 6: Asignar el SN seleccionado al UDIDAuthRequest
-        req.sn = selected_subscriber.sn
-        req.save()
-
-        print(f"✅ DEBUG - SN asignado: {selected_subscriber.sn} a UDID: {udid}")
-
-        # ✅ ENCRIPTACIÓN SEGURA
-        try:
-            plain_password = selected_subscriber.get_password()
-            if not plain_password:
-                raise Exception("Password no disponible")
-            
-            # Crear payload con todas las credenciales
-            credentials_payload = {
-                "password": plain_password,
-                "subscriber_code": subscriber_code,
-                "sn": selected_subscriber.sn,
-                "timestamp": timezone.now().isoformat()
-            }
-            
-            # Encriptar con sistema híbrido
-            encrypted_result = hybrid_encrypt_for_app(
-                json.dumps(credentials_payload), 
-                app_type
+            #✅ PASO 2: Filtrar todas las SNs del subscriber con productos asociados
+            subscriber_infos = SubscriberInfo.objects.filter(
+                subscriber_code=subscriber_code
+            ).exclude(
+                products__isnull=True
+            ).exclude(
+                products=[]
             )
+
+            if not subscriber_infos.exists():
+                self._log_failed_attempt(req, "No smartcards with products", request)
+                req.mark_as_used()
+                return Response({
+                    "error": "El usuario no tiene productos asociados a su cuenta."
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            #✅ PASO 3: Validar qué SNs están asociados a UDIDs activos (CUALQUIER APP_TYPE)
+            used_sns_via_udid = UDIDAuthRequest.objects.filter(
+                status__in=['validated', 'used'],
+                subscriber_code=subscriber_code,
+                expires_at__gte=timezone.now(),
+                sn__isnull=False
+                # ❌ NO filtrar por app_type - queremos ALL SNs ocupadas
+            ).exclude(
+                udid=udid  # Excluir el UDID actual
+            ).values_list('sn', flat=True)
+
+            # ✅ OBTENER DETALLES DE SNs EN USO PARA DEBUG
+            used_sns_with_app_type = UDIDAuthRequest.objects.filter(
+                status__in=['validated', 'used'],
+                subscriber_code=subscriber_code,
+                expires_at__gte=timezone.now(),
+                sn__isnull=False
+            ).exclude(
+                udid=udid
+            ).values('sn', 'app_type', 'udid')
+
+            print(f"🔍 DEBUG - Subscriber: {subscriber_code}")
+            print(f"🔍 DEBUG - App Type solicitado: {app_type}")
+            print(f"🔍 DEBUG - SNs ocupados (todos los tipos): {list(used_sns_via_udid)}")
+            print(f"🔍 DEBUG - Detalles de SNs ocupados:")
+            for usage in used_sns_with_app_type:
+                print(f"    SN {usage['sn']} → {usage['app_type']} (UDID: {usage['udid'][:8]}...)")
+            print(f"🔍 DEBUG - Total SNs disponibles: {subscriber_infos.count()}")
+
+            #✅ PASO 4: Buscar SN disponible (que NO esté en uso por NINGÚN tipo de app)
+            selected_subscriber = None
+            available_sns = []
+        
+            for sub in subscriber_infos:
+                if sub.sn not in used_sns_via_udid:
+                    available_sns.append(sub.sn)
+                    if not selected_subscriber:
+                        selected_subscriber = sub
+        
+            print(f"🔍 DEBUG - SNs completamente disponibles: {available_sns}")
+        
+            #✅ PASO 5: Si no hay SNs disponibles, mostrar detalles específicos
+            if not selected_subscriber:
+                # Crear información detallada del uso de SNs
+                usage_details = {}
+                for usage in used_sns_with_app_type:
+                    sn = usage['sn']
+                    app_type_used = usage['app_type']
+                    if sn not in usage_details:
+                        usage_details[sn] = []
+                    usage_details[sn].append(app_type_used)
             
-            # ✅ MARCAR ENTREGA EXITOSA
-            req.mark_credentials_delivered(app_credentials)
+                self._log_failed_attempt(req, "All SNs occupied by different app types", request, {
+                    "total_sns": subscriber_infos.count(),
+                    "sn_usage_details": usage_details,
+                    "requested_app_type": app_type
+                })
+                req.mark_as_used()
             
-        except Exception as e:
-            self._log_failed_attempt(req, f"Encryption error: {str(e)}", request)
-            return Response({
-                "error": "Error en encriptación de credenciales",
-                "details": {
-                    "app_type": app_type,
-                    "solution": "Contacte al administrador del sistema"
+                return Response({
+                    "error": f"❌ El usuario {subscriber_code} no tiene smartcards disponibles. Todas están en uso por otros dispositivos.",
+                    "details": {
+                        "subscriber_code": subscriber_code,
+                        "requested_app_type": app_type,
+                        "total_smartcards": subscriber_infos.count(),
+                        "smartcards_in_use": len(used_sns_via_udid),
+                        "available_smartcards": 0,
+                        "usage_breakdown": usage_details,
+                        "message": "Cada smartcard solo puede estar activa en un tipo de dispositivo a la vez",
+                        "retry_after_minutes": 15
+                    }
+                }, status=status.HTTP_409_CONFLICT)
+
+            #✅ PASO 6: Asignar el SN seleccionado al UDIDAuthRequest
+            req.sn = selected_subscriber.sn
+            req.save()
+
+            print(f"✅ DEBUG - SN asignado: {selected_subscriber.sn} a UDID: {udid}")
+
+            # ✅ ENCRIPTACIÓN SEGURA
+            try:
+                plain_password = selected_subscriber.get_password()
+                if not plain_password:
+                    raise Exception("Password no disponible")
+            
+                # Crear payload con todas las credenciales
+                credentials_payload = {
+                    "password": plain_password,
+                    "subscriber_code": subscriber_code,
+                    "sn": selected_subscriber.sn,
+                    "timestamp": timezone.now().isoformat()
                 }
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+                # Encriptar con sistema híbrido
+                encrypted_result = hybrid_encrypt_for_app(
+                    json.dumps(credentials_payload),
+                    app_credentials
+                )
+            
+                # ✅ MARCAR ENTREGA EXITOSA
+                req.mark_credentials_delivered(app_credentials)
+            
+            except Exception as e:
+                self._log_failed_attempt(req, f"Encryption error: {str(e)}", request)
+                # Liberar la SN reservada en el PASO 6: si no se libera, esta
+                # smartcard queda bloqueada para el suscriptor indefinidamente
+                # (is_expired() nunca vuelve True con status='validated').
+                req.sn = None
+                req.save(update_fields=['sn'])
+                return Response({
+                    "error": "Error en encriptación de credenciales",
+                    "details": {
+                        "app_type": app_type,
+                        "solution": "Contacte al administrador del sistema"
+                    }
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # ✅ PREPARAR RESPUESTA SEGURA
         response_data = {
@@ -699,10 +713,17 @@ class RevokeUDIDView(APIView):
         except UDIDAuthRequest.DoesNotExist:
             return Response({"error": "UDID no encontrado."}, status=status.HTTP_404_NOT_FOUND)
 
-        if req.status in ['revoked', 'expired', 'used']:
+        # Regla unificada con OperatorRevokeUDIDView/UserReleaseUDIDView/
+        # DisassociateUDIDView: solo bloquear si ya está revocado o expirado.
+        # Antes esta vista además bloqueaba 'used' (las otras tres no), y no
+        # liberaba el SN al revocar (las otras tres sí), dejando la smartcard
+        # marcada como en uso para consultas que sí filtran por 'revoked'.
+        if req.status in ['revoked', 'expired']:
             return Response({"error": f"No se puede revocar. Estado actual: {req.status}"}, status=status.HTTP_403_FORBIDDEN)
 
+        original_sn = req.sn
         req.status = 'revoked'
+        req.sn = None
         req.validated_by_operator = operator
         req.save()
 
@@ -714,7 +735,7 @@ class RevokeUDIDView(APIView):
             operator_id=operator,
             details={
                 "reason": reason,
-                "sn": req.sn  # Incluir el SN en los detalles
+                "sn": original_sn  # Incluir el SN liberado en los detalles
             },
             client_ip=request.META.get('REMOTE_ADDR'),
             user_agent=request.META.get('HTTP_USER_AGENT', '')
@@ -723,7 +744,7 @@ class RevokeUDIDView(APIView):
         return Response({
             "message": "UDID revocado correctamente.",
             "udid": udid,
-            "sn": req.sn  # Incluir SN en la respuesta
+            "sn_released": original_sn
         }, status=status.HTTP_200_OK)
 
 class ListUDIDRequestsView(APIView):
@@ -911,67 +932,6 @@ class SNUsageStatsView(APIView):
                 "remaining": remaining - 1,
                 "reset_in_seconds": 5 * 60
             }
-        }, status=status.HTTP_200_OK)
-
-class ValidateUDIDView(APIView):
-    permission_classes = [AllowAny]
-    def post(self, request):
-        # Intentar obtener parámetros del body primero, luego de query params
-        udid = request.data.get('udid') or request.query_params.get('udid')
-        temp_token = request.data.get('temp_token') or request.query_params.get('temp_token')
-        subscriber_code = request.data.get('subscriber_code') or request.query_params.get('subscriber_code')
-        operator_id = request.data.get('operator_id') or request.query_params.get('operator_id')  # opcional
-
-        # Validaciones iniciales
-        if not all([udid, temp_token, subscriber_code]):
-            return Response({"error": "Parámetros incompletos."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            req = UDIDAuthRequest.objects.get(udid=udid, temp_token=temp_token)
-        except UDIDAuthRequest.DoesNotExist:
-            return Response({"error": "Solicitud inválida o token incorrecto."}, status=status.HTTP_404_NOT_FOUND)
-
-        if req.status != "pending":
-            return Response({"error": "El UDID ya fue validado, usado o revocado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if req.is_expired():
-            req.status = "expired"
-            req.save()
-            return Response({"error": "El token ha expirado."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not ListOfSubscriber.objects.filter(code=subscriber_code).exists():
-            return Response({"error": "Subscriber code no válido."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Limpiar SNs de UDIDs expirados del mismo subscriber antes de validar
-        UDIDAuthRequest.objects.filter(
-            subscriber_code=subscriber_code,
-            expires_at__lt=timezone.now(),
-            status__in=['validated', 'pending']
-        ).update(status='expired', sn=None)
-
-        # Actualizar registro
-        req.status = "validated"
-        req.validated_at = timezone.now()
-        req.subscriber_code = subscriber_code
-        req.validated_by_operator = operator_id
-        req.save()
-
-        # Log de auditoría (asíncrono)
-        log_audit_async(
-            action_type='udid_validated',
-            udid=udid,
-            subscriber_code=subscriber_code,
-            operator_id=operator_id,
-            client_ip=request.META.get('REMOTE_ADDR'),
-            user_agent=request.META.get('HTTP_USER_AGENT', ''),
-            details={"message": "UDID validado correctamente"}
-        )
-
-        return Response({
-            "message": "UDID validado exitosamente.",
-            "udid": udid,
-            "subscriber_code": subscriber_code,
-            "expires_at": req.expires_at
         }, status=status.HTTP_200_OK)
 
 def validate_device_sn_association(udid, device_fingerprint=None, client_ip=None):

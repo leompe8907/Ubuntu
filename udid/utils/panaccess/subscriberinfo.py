@@ -84,7 +84,7 @@ def get_login_data(subscriber_code):
         return {
             'login1': login.login1,
             'login2': login.login2,
-            'password': login.password,
+            'password': login.get_login_password(),
         }
     except SubscriberLoginInfo.DoesNotExist:
         logger.warning(f"[get_login_data] No se encontró login para {subscriber_code}")
