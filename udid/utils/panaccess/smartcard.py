@@ -642,6 +642,118 @@ def extract_sns_from_smartcards_field(smartcards_data):
     # Filtrar SNs vacíos y duplicados
     return list(set([sn for sn in sns if sn]))
 
+def sync_smartcard_assignments_from_subscribers():
+    """
+    Igual que update_smartcards_from_subscribers() (propaga subscriberCode/
+    lastName/firstName/hcId desde ListOfSubscriber.smartcards hacia
+    ListOfSmartcards), pero SIN cargar el catálogo completo de smartcards
+    en memoria.
+
+    update_smartcards_from_subscribers() hace:
+        existing_smartcards = {obj.sn: obj for obj in ListOfSmartcards.objects.all() ...}
+    Eso trae las ~400k+ filas de ListOfSmartcards completas como objetos
+    Django. Al llamarla desde el ciclo de 5 minutos (check_and_sync_
+    subscribers_periodic, PASO 4B) el worker de Celery murió por
+    SIGKILL (OOM-killer) a los ~90s de esa corrida.
+
+    Esta versión solo consulta las SN que efectivamente referencian los
+    suscriptores locales (subscriber.smartcards), vía sn__in -acotado al
+    catálogo de suscriptores, muchísimo más chico que el de smartcards-
+    en vez de traer la tabla entera.
+
+    Returns:
+        dict: mismo formato que update_smartcards_from_subscribers()
+    """
+    logger.info("[SYNC_SMARTCARD_ASSIGNMENTS] Iniciando propagación acotada de asignaciones...")
+
+    result = {
+        'total_subscribers_processed': 0,
+        'total_sns_found': 0,
+        'total_smartcards_created': 0,
+        'total_smartcards_updated': 0,
+        'total_errors': 0
+    }
+
+    try:
+        subscribers = list(
+            ListOfSubscriber.objects.exclude(code__isnull=True).exclude(code='')
+        )
+        result['total_subscribers_processed'] = len(subscribers)
+
+        # Última asignación gana si (por inconsistencia de datos) una SN
+        # apareciera bajo más de un suscriptor.
+        subscriber_by_sn = {}
+        for subscriber in subscribers:
+            for sn in extract_sns_from_smartcards_field(subscriber.smartcards):
+                subscriber_by_sn[sn] = subscriber
+
+        result['total_sns_found'] = len(subscriber_by_sn)
+
+        if not subscriber_by_sn:
+            logger.info("[SYNC_SMARTCARD_ASSIGNMENTS] Ningún suscriptor tiene smartcards asociadas")
+            return result
+
+        existing_smartcards = {
+            obj.sn: obj
+            for obj in ListOfSmartcards.objects.filter(sn__in=subscriber_by_sn.keys())
+        }
+
+        with transaction.atomic():
+            for sn, subscriber in subscriber_by_sn.items():
+                try:
+                    if sn in existing_smartcards:
+                        smartcard = existing_smartcards[sn]
+                        changed_fields = []
+
+                        if str(smartcard.subscriberCode) != str(subscriber.code):
+                            smartcard.subscriberCode = subscriber.code
+                            changed_fields.append('subscriberCode')
+                        if str(smartcard.lastName) != str(subscriber.lastName):
+                            smartcard.lastName = subscriber.lastName
+                            changed_fields.append('lastName')
+                        if str(smartcard.firstName) != str(subscriber.firstName):
+                            smartcard.firstName = subscriber.firstName
+                            changed_fields.append('firstName')
+                        if str(smartcard.hcId) != str(subscriber.hcId):
+                            smartcard.hcId = subscriber.hcId
+                            changed_fields.append('hcId')
+
+                        if changed_fields:
+                            smartcard.save(update_fields=changed_fields)
+                            result['total_smartcards_updated'] += 1
+                    else:
+                        ListOfSmartcards.objects.create(
+                            sn=sn,
+                            subscriberCode=subscriber.code,
+                            lastName=subscriber.lastName,
+                            firstName=subscriber.firstName,
+                            hcId=subscriber.hcId
+                        )
+                        result['total_smartcards_created'] += 1
+
+                except Exception as e:
+                    result['total_errors'] += 1
+                    logger.error(
+                        f"[SYNC_SMARTCARD_ASSIGNMENTS] Error procesando SN {sn} "
+                        f"del suscriptor {subscriber.code}: {str(e)}"
+                    )
+
+        logger.info(
+            f"[SYNC_SMARTCARD_ASSIGNMENTS] Completado. "
+            f"Suscriptores: {result['total_subscribers_processed']}, "
+            f"SNs revisadas: {result['total_sns_found']}, "
+            f"Creadas: {result['total_smartcards_created']}, "
+            f"Actualizadas: {result['total_smartcards_updated']}, "
+            f"Errores: {result['total_errors']}"
+        )
+
+    except Exception as e:
+        logger.error(f"[SYNC_SMARTCARD_ASSIGNMENTS] Error inesperado: {str(e)}", exc_info=True)
+        result['error'] = str(e)
+
+    return result
+
+
 def update_smartcards_from_subscribers():
     """
     Actualiza la tabla ListOfSmartcards con información de los suscriptores.

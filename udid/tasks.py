@@ -28,7 +28,7 @@ from .utils.panaccess.smartcard import (
     sync_smartcards,
     sync_new_smartcards_only,
     CallListSmartcards,
-    update_smartcards_from_subscribers,
+    sync_smartcard_assignments_from_subscribers,
     compare_and_update_all_smartcards
 )
 from .utils.panaccess.login import (
@@ -938,12 +938,21 @@ def check_and_sync_subscribers_periodic(self):
         # compare_and_update_all_subscribers() ya recibe el campo `smartcards`
         # (la lista de SN del suscriptor) en la MISMA llamada paginada que usa
         # para comparar nombre/dirección/etc. -sin ninguna llamada extra a
-        # Panaccess-. Encadenando update_smartcards_from_subscribers() justo
-        # después (100% local, no llama a Panaccess) se propaga cualquier
-        # reasignación a ListOfSmartcards.subscriberCode sin recorrer el
-        # catálogo completo de smartcards, solo el de suscriptores (mucho más
-        # chico). Debe correr ANTES de PASO 5 para que el merge de este mismo
-        # ciclo ya vea la reasignación.
+        # Panaccess-. Encadenando sync_smartcard_assignments_from_subscribers()
+        # justo después (no llama a Panaccess) se propaga cualquier reasignación
+        # a ListOfSmartcards.subscriberCode sin recorrer el catálogo completo de
+        # smartcards, solo el de suscriptores (mucho más chico). Debe correr
+        # ANTES de PASO 5 para que el merge de este mismo ciclo ya vea la
+        # reasignación.
+        #
+        # ⚠️ CORREGIDO: la primera versión de este paso usaba
+        # update_smartcards_from_subscribers(), que carga TODO ListOfSmartcards
+        # (~400k+ filas) en memoria como objetos Django. En producción eso hizo
+        # que el worker de Celery muriera por SIGKILL (OOM-killer) a los ~90s de
+        # ejecutar este paso, dejando además el lock global trabado hasta su
+        # timeout de 6hs (el proceso murió antes de poder liberarlo).
+        # sync_smartcard_assignments_from_subscribers() solo consulta (sn__in)
+        # las SN que los suscriptores locales realmente referencian.
         step4b_start = time.time()
         logger.info(
             "🔁 [CHECK_SUBSCRIBERS] Revisando reasignaciones de smartcards en "
@@ -951,7 +960,7 @@ def check_and_sync_subscribers_periodic(self):
         )
         try:
             compare_and_update_all_subscribers(session_id=None, limit=100, timeout=30)
-            propagation_result = update_smartcards_from_subscribers()
+            propagation_result = sync_smartcard_assignments_from_subscribers()
             result['reassignment_check'] = propagation_result
             logger.info(
                 f"✅ [CHECK_SUBSCRIBERS] Reasignaciones revisadas: "
