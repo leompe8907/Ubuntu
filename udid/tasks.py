@@ -693,24 +693,27 @@ def check_and_sync_subscribers_periodic(self):
             database_total_after = ListOfSubscriber.objects.count()
             result['database_total_after'] = database_total_after
             new_subscribers_count = database_total_after - database_total_before
-            
+
             if new_subscribers_count > 0:
                 logger.info(
                     f"✅ [CHECK_SUBSCRIBERS] Se encontraron y descargaron {new_subscribers_count} nuevos suscriptores"
                 )
             else:
                 logger.info(
-                    f"ℹ️ [CHECK_SUBSCRIBERS] No hay nuevos suscriptores. BD está actualizada."
+                    f"ℹ️ [CHECK_SUBSCRIBERS] No hay suscriptores completamente nuevos en este ciclo. "
+                    f"Continuando de todas formas: PASO 4/5 también detectan smartcards "
+                    f"nuevas o reasignadas en suscriptores YA existentes, no solo altas nuevas."
                 )
-                # Si no hay nuevos, terminar aquí
-                result['success'] = True
-                result['message'] = 'No hay nuevos suscriptores. BD está actualizada.'
-                result['total_time_seconds'] = int(time.time() - start_time)
-                return result
-                
+                # BUG CORREGIDO: antes se hacía `return result` acá si no había
+                # suscriptores nuevos. Eso significaba que el PASO 4
+                # (sync_smartcards) y el PASO 5 (merge en SubscriberInfo) NUNCA
+                # se ejecutaban en el caso más común en operación normal: un
+                # suscriptor YA existente al que le agregan/reasignan una
+                # smartcard, sin que se cree ningún ListOfSubscriber nuevo.
+
             # Guardar last_code_before para usar en pasos siguientes
             result['last_code_before'] = last_code_before
-                
+
         except Exception as e:
             error_msg = f"Error durante sincronización de suscriptores: {str(e)}"
             logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
@@ -719,17 +722,21 @@ def check_and_sync_subscribers_periodic(self):
             database_total_after = ListOfSubscriber.objects.count()
             result['database_total_after'] = database_total_after
             # Continuar con el siguiente paso aunque este falle
-        
+        step1_elapsed = time.time() - start_time
+        result['step1_subscribers_seconds'] = round(step1_elapsed, 2)
+        logger.info(f"⏱️ [CHECK_SUBSCRIBERS] PASO 1 (suscriptores) tomó {step1_elapsed:.2f}s")
+
         # ========================================================================
         # PASO 3: OBTENER CREDENCIALES DE LOGIN DE NUEVOS SUSCRIPTORES
         # ========================================================================
+        step3_start = time.time()
         logger.info("🔑 [CHECK_SUBSCRIBERS] Obteniendo credenciales de login de nuevos suscriptores...")
         try:
             # fetch_new_logins_from_panaccess() obtiene credenciales solo de nuevos suscriptores
             # que no están aún en SubscriberLoginInfo y las almacena en la BD
             credentials_count = fetch_new_logins_from_panaccess(session_id=None)
             result['credentials_downloaded'] = credentials_count if isinstance(credentials_count, int) else 0
-            
+
             if result['credentials_downloaded'] > 0:
                 logger.info(
                     f"✅ [CHECK_SUBSCRIBERS] {result['credentials_downloaded']} credenciales "
@@ -744,10 +751,14 @@ def check_and_sync_subscribers_periodic(self):
             logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
             result['credentials_downloaded'] = 0
             # No marcar como fallo total si solo falla la descarga de credenciales
-        
+        step3_elapsed = time.time() - step3_start
+        result['step3_logins_seconds'] = round(step3_elapsed, 2)
+        logger.info(f"⏱️ [CHECK_SUBSCRIBERS] PASO 3 (logins) tomó {step3_elapsed:.2f}s")
+
         # ========================================================================
         # PASO 4: ACTUALIZAR SMARTCARDS EXISTENTES CON INFORMACIÓN DE NUEVOS SUSCRIPTORES
         # ========================================================================
+        step4_start = time.time()
         logger.info("📱 [CHECK_SUBSCRIBERS] Revisando smartcards de nuevos suscriptores y asociándolas...")
         try:
             from .utils.panaccess.smartcard import extract_sns_from_smartcards_field
@@ -759,6 +770,13 @@ def check_and_sync_subscribers_periodic(self):
             # tanto sin SubscriberInfo/credenciales. Al traer smartcards nuevas cada
             # 5 minutos (igual que los suscriptores), la smartcard del suscriptor
             # recién creado ya está disponible cuando se ejecuta esta asociación.
+            #
+            # ⏱️ Este paso incluye compare_and_update_all_smartcards(), que compara
+            # TODAS las smartcards contra Panaccess (antes corría una vez al mes,
+            # ahora cada 5 min). Si el catálogo es grande, este es el sospechoso
+            # número uno de que el ciclo tarde más de lo esperado - por eso se mide
+            # aparte del resto del PASO 4.
+            sync_smartcards_start = time.time()
             try:
                 sync_smartcards(session_id=None, limit=100)
             except Exception as e:
@@ -766,6 +784,12 @@ def check_and_sync_subscribers_periodic(self):
                     f"❌ [CHECK_SUBSCRIBERS] Error sincronizando smartcards nuevas: {str(e)}",
                     exc_info=True
                 )
+            sync_smartcards_elapsed = time.time() - sync_smartcards_start
+            result['sync_smartcards_seconds'] = round(sync_smartcards_elapsed, 2)
+            logger.info(
+                f"⏱️ [CHECK_SUBSCRIBERS] sync_smartcards() (descarga + compare_and_update_all_smartcards) "
+                f"tomó {sync_smartcards_elapsed:.2f}s"
+            )
 
             # Determinar suscriptores pendientes de asociar su smartcard SIN
             # comparación alfabética de 'code' (CharField). El código anterior
@@ -892,19 +916,25 @@ def check_and_sync_subscribers_periodic(self):
             logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
             result['smartcards_updated'] = {'error': error_msg}
             # No marcar como fallo total si solo falla la actualización de smartcards
-        
+        step4_elapsed = time.time() - step4_start
+        result['step4_smartcards_seconds'] = round(step4_elapsed, 2)
+        logger.info(f"⏱️ [CHECK_SUBSCRIBERS] PASO 4 completo (smartcards) tomó {step4_elapsed:.2f}s")
+
         # ========================================================================
-        # PASO 5: HACER MERGE DE NUEVOS SUSCRIPTORES EN SUBSCRIBERINFO
+        # PASO 5: HACER MERGE DE TODOS LOS SUSCRIPTORES EN SUBSCRIBERINFO
         # ========================================================================
-        logger.info("🔄 [CHECK_SUBSCRIBERS] Haciendo merge de nuevos suscriptores en SubscriberInfo...")
+        step5_start = time.time()
+        logger.info("🔄 [CHECK_SUBSCRIBERS] Haciendo merge de suscriptores en SubscriberInfo...")
         try:
-            # sync_merge_all_subscribers() detecta automáticamente los nuevos suscriptores
-            # (mayores al último código en SubscriberInfo) y hace merge de sus datos
+            # sync_merge_all_subscribers() recorre TODOS los códigos de suscriptor
+            # (no solo los nuevos) y hace merge de sus datos - así es como una
+            # smartcard nueva/reasignada en un suscriptor YA existente también
+            # termina reflejada en SubscriberInfo.
             sync_merge_all_subscribers()
             result['merge_executed'] = True
             logger.info(
                 f"✅ [CHECK_SUBSCRIBERS] Merge completado. "
-                f"Nuevos suscriptores consolidados en SubscriberInfo"
+                f"Suscriptores consolidados en SubscriberInfo"
             )
         except Exception as e:
             error_msg = f"Error haciendo merge en SubscriberInfo: {str(e)}"
@@ -912,14 +942,27 @@ def check_and_sync_subscribers_periodic(self):
             result['merge_executed'] = False
             result['merge_error'] = error_msg
             # No marcar como fallo total si solo falla el merge
-        
+        step5_elapsed = time.time() - step5_start
+        result['step5_merge_seconds'] = round(step5_elapsed, 2)
+        logger.info(f"⏱️ [CHECK_SUBSCRIBERS] PASO 5 (merge) tomó {step5_elapsed:.2f}s")
+
         # ========================================================================
         # VERIFICACIÓN FINAL
         # ========================================================================
         elapsed_time = time.time() - start_time
         result['total_time_seconds'] = int(elapsed_time)
         result['success'] = True
-        
+
+        logger.info(
+            f"⏱️ [CHECK_SUBSCRIBERS] Duración por paso — "
+            f"suscriptores: {result.get('step1_subscribers_seconds', 0):.2f}s, "
+            f"logins: {result.get('step3_logins_seconds', 0):.2f}s, "
+            f"smartcards (total): {result.get('step4_smartcards_seconds', 0):.2f}s "
+            f"(de los cuales sync_smartcards: {result.get('sync_smartcards_seconds', 0):.2f}s), "
+            f"merge: {result.get('step5_merge_seconds', 0):.2f}s, "
+            f"TOTAL: {elapsed_time:.2f}s"
+        )
+
         new_subscribers = result['database_total_after'] - result['database_total_before']
         
         if new_subscribers > 0:
