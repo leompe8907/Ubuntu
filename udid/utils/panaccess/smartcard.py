@@ -398,16 +398,66 @@ def compare_and_update_all_smartcards(session_id=None, limit=100, timeout=DEFAUL
     
     logger.info(f"Actualización completa. Total modificados: {total_updated}")
 
+def sync_new_smartcards_only(session_id=None, limit=100):
+    """
+    Igual que sync_smartcards() pero SIN el paso de comparar/actualizar todas
+    las smartcards existentes (compare_and_update_all_smartcards). Ese paso
+    pagina TODO el catálogo de Panaccess y, con catálogos grandes, puede
+    tardar mucho más de 5 minutos (en producción se vio una sola corrida
+    seguir corriendo más de 10 minutos, bloqueando los 2 ciclos siguientes
+    vía el lock global de tareas y sin siquiera llegar a completar).
+
+    Pensada para llamarse desde tareas de alta frecuencia (cada 5 min) donde
+    solo importa detectar smartcards NUEVAS rápido (para que suscriptores
+    -nuevos o existentes- que reciben una tarjeta recién habiliten
+    credenciales pronto). La comparación completa (que además detecta
+    reasignaciones de tarjetas ya existentes a otro suscriptor) se sigue
+    corriendo en check_and_sync_smartcards_monthly y en
+    validate_and_sync_all_data_daily, que sí toleran ese costo por su baja
+    frecuencia.
+
+    Args:
+        session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
+        limit: Cantidad máxima de registros por página
+
+    Returns:
+        Resultado de la descarga (nuevo o completo si la base estaba vacía)
+    """
+    logger.info("Iniciando sincronización incremental de smartcards (solo nuevas)")
+
+    try:
+        if DataBaseEmpty():
+            logger.info("Base vacía: descarga completa")
+            return fetch_all_smartcards(session_id, limit)
+        else:
+            last = LastSmartcard()
+            logger.info(f"Último SN: {last.sn if last else None}")
+            logger.info("Descargando smartcards nuevas desde el último registrado...")
+            new_result = download_smartcards_since_last(session_id, limit)
+            logger.info("Descarga de smartcards nuevas completada.")
+            return new_result
+
+    except PanaccessException as e:
+        logger.error(f"Error de PanAccess durante sincronización: {str(e)}")
+        raise
+    except (ConnectionError, ValueError) as e:
+        logger.error(f"Error específico durante sincronización: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error inesperado: {str(e)}", exc_info=True)
+        raise
+
+
 def sync_smartcards(session_id=None, limit=100):
     """
     Ejecuta el proceso de sincronización de smartcards:
     - Si la base está vacía, descarga todos los registros.
     - Si no, descarga solo los nuevos desde el último sn.
-    
+
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
-    
+
     Returns:
         Resultado de la sincronización
     """
@@ -421,13 +471,13 @@ def sync_smartcards(session_id=None, limit=100):
             last = LastSmartcard()
             highest_sn = last.sn if last else None
             logger.info(f"Último SN: {highest_sn}")
-            
+
             logger.info("Base existente: descarga incremental + actualización")
             # 1. Nuevos registros
             logger.info("Inicio de Descarga de smartcards nuevos desde el último registrado")
             new_result = download_smartcards_since_last(session_id, limit)
             logger.info(f"Fin de Descarga de smartcards nuevos completada.")
-            
+
             # 2. Actualizar existentes
             logger.info("Inicio de Actualización de smartcards existentes")
             compare_and_update_all_smartcards(session_id, limit)

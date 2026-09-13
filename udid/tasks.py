@@ -25,8 +25,9 @@ from .utils.panaccess.subscriber import (
     compare_and_update_all_subscribers
 )
 from .utils.panaccess.smartcard import (
-    sync_smartcards, 
-    CallListSmartcards, 
+    sync_smartcards,
+    sync_new_smartcards_only,
+    CallListSmartcards,
     update_smartcards_from_subscribers,
     compare_and_update_all_smartcards
 )
@@ -771,14 +772,17 @@ def check_and_sync_subscribers_periodic(self):
             # 5 minutos (igual que los suscriptores), la smartcard del suscriptor
             # recién creado ya está disponible cuando se ejecuta esta asociación.
             #
-            # ⏱️ Este paso incluye compare_and_update_all_smartcards(), que compara
-            # TODAS las smartcards contra Panaccess (antes corría una vez al mes,
-            # ahora cada 5 min). Si el catálogo es grande, este es el sospechoso
-            # número uno de que el ciclo tarde más de lo esperado - por eso se mide
-            # aparte del resto del PASO 4.
+            # ⚠️ CORREGIDO: se usa sync_new_smartcards_only() (solo descarga
+            # incremental) en vez de sync_smartcards(), que además hacía
+            # compare_and_update_all_smartcards() -paginar TODO el catálogo de
+            # Panaccess- en cada corrida. En producción se vio una sola corrida
+            # de eso tardar más de 10 minutos sin terminar, bloqueando (vía el
+            # lock global) los 2 ciclos de 5 min siguientes. La comparación
+            # completa sigue corriendo en check_and_sync_smartcards_monthly y
+            # en validate_and_sync_all_data_daily, que sí toleran ese costo.
             sync_smartcards_start = time.time()
             try:
-                sync_smartcards(session_id=None, limit=100)
+                sync_new_smartcards_only(session_id=None, limit=100)
             except Exception as e:
                 logger.error(
                     f"❌ [CHECK_SUBSCRIBERS] Error sincronizando smartcards nuevas: {str(e)}",
@@ -787,7 +791,7 @@ def check_and_sync_subscribers_periodic(self):
             sync_smartcards_elapsed = time.time() - sync_smartcards_start
             result['sync_smartcards_seconds'] = round(sync_smartcards_elapsed, 2)
             logger.info(
-                f"⏱️ [CHECK_SUBSCRIBERS] sync_smartcards() (descarga + compare_and_update_all_smartcards) "
+                f"⏱️ [CHECK_SUBSCRIBERS] sync_new_smartcards_only() (solo descarga incremental) "
                 f"tomó {sync_smartcards_elapsed:.2f}s"
             )
 
