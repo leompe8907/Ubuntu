@@ -925,6 +925,52 @@ def check_and_sync_subscribers_periodic(self):
         logger.info(f"⏱️ [CHECK_SUBSCRIBERS] PASO 4 completo (smartcards) tomó {step4_elapsed:.2f}s")
 
         # ========================================================================
+        # PASO 4B: REASIGNACIONES DE SMARTCARDS EN SUSCRIPTORES YA EXISTENTES
+        # ========================================================================
+        # PASO 4 (arriba) solo asocia smartcards de suscriptores NUEVOS (sin
+        # SubscriberInfo todavía). Si un cliente le reasigna una smartcard
+        # "sin uso" a un suscriptor que YA tenía otras (caso real reportado),
+        # ese suscriptor queda excluido de PASO 4 y la reasignación no se
+        # detectaba hasta la corrida diaria (validate_and_sync_all_data_daily,
+        # 22:00) o mensual, porque solo compare_and_update_all_smartcards()
+        # -que pagina TODO el catálogo de ~400k smartcards- la agarraba.
+        #
+        # compare_and_update_all_subscribers() ya recibe el campo `smartcards`
+        # (la lista de SN del suscriptor) en la MISMA llamada paginada que usa
+        # para comparar nombre/dirección/etc. -sin ninguna llamada extra a
+        # Panaccess-. Encadenando update_smartcards_from_subscribers() justo
+        # después (100% local, no llama a Panaccess) se propaga cualquier
+        # reasignación a ListOfSmartcards.subscriberCode sin recorrer el
+        # catálogo completo de smartcards, solo el de suscriptores (mucho más
+        # chico). Debe correr ANTES de PASO 5 para que el merge de este mismo
+        # ciclo ya vea la reasignación.
+        step4b_start = time.time()
+        logger.info(
+            "🔁 [CHECK_SUBSCRIBERS] Revisando reasignaciones de smartcards en "
+            "suscriptores existentes..."
+        )
+        try:
+            compare_and_update_all_subscribers(session_id=None, limit=100, timeout=30)
+            propagation_result = update_smartcards_from_subscribers()
+            result['reassignment_check'] = propagation_result
+            logger.info(
+                f"✅ [CHECK_SUBSCRIBERS] Reasignaciones revisadas: "
+                f"{propagation_result.get('total_smartcards_updated', 0)} smartcards actualizadas, "
+                f"{propagation_result.get('total_smartcards_created', 0)} creadas "
+                f"(de {propagation_result.get('total_subscribers_processed', 0)} suscriptores)"
+            )
+        except Exception as e:
+            error_msg = f"Error revisando reasignaciones de smartcards: {str(e)}"
+            logger.error(f"❌ [CHECK_SUBSCRIBERS] {error_msg}", exc_info=True)
+            result['reassignment_check'] = {'error': error_msg}
+            # No marcar como fallo total si solo falla este chequeo
+        step4b_elapsed = time.time() - step4b_start
+        result['step4b_reassignment_seconds'] = round(step4b_elapsed, 2)
+        logger.info(
+            f"⏱️ [CHECK_SUBSCRIBERS] PASO 4B (reasignaciones) tomó {step4b_elapsed:.2f}s"
+        )
+
+        # ========================================================================
         # PASO 5: HACER MERGE DE TODOS LOS SUSCRIPTORES EN SUBSCRIBERINFO
         # ========================================================================
         step5_start = time.time()
@@ -963,6 +1009,7 @@ def check_and_sync_subscribers_periodic(self):
             f"logins: {result.get('step3_logins_seconds', 0):.2f}s, "
             f"smartcards (total): {result.get('step4_smartcards_seconds', 0):.2f}s "
             f"(de los cuales sync_smartcards: {result.get('sync_smartcards_seconds', 0):.2f}s), "
+            f"reasignaciones: {result.get('step4b_reassignment_seconds', 0):.2f}s, "
             f"merge: {result.get('step5_merge_seconds', 0):.2f}s, "
             f"TOTAL: {elapsed_time:.2f}s"
         )
