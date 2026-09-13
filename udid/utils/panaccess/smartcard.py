@@ -14,6 +14,7 @@ from .exceptions import (
 from udid.models import ListOfSmartcards, ListOfSubscriber
 from ...serializers import ListOfSmartcardsSerializer
 from ...utils.db_utils import is_connection_error, reconnect_database
+from config import PanaccessConfig
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +254,20 @@ def download_smartcards_since_last(session_id=None, limit=100, timeout=DEFAULT_T
     """
     Descarga smartcards nuevos desde el último registrado (modo incremental).
     Guarda cada lote inmediatamente.
-    
+
+    LÍMITE DE SEGURIDAD: se detectó en producción que esta descarga puede no
+    encontrar `highest_sn` en el orden ASC que devuelve Panaccess (se observó
+    un caso escaneando 18.000+ páginas -de un catálogo de ~400.000 smartcards-
+    sin cruzarlo nunca), degradando esta llamada "incremental" a un escaneo
+    casi completo en cada corrida de 5 minutos. ListOfSmartcards no tiene un
+    campo de fecha de creación (a diferencia de ListOfSubscriber, que sí lo
+    tiene y por eso pudo migrar a un corte por 'created' DESC), así que acá
+    se aplica el mismo límite de páginas (PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES)
+    que ya usa esa descarga de suscriptores: si se llega al tope sin cruzar
+    el corte, se aborta la corrida en vez de seguir escaneando el catálogo
+    completo. Lo que quede sin sincronizar por esta vía lo toma igual el
+    compare_and_update_all_smartcards() de la tarea diaria/mensual.
+
     Args:
         session_id: ID de sesión (opcional, se usa el singleton si no se proporciona)
         limit: Cantidad máxima de registros por página
@@ -264,13 +278,15 @@ def download_smartcards_since_last(session_id=None, limit=100, timeout=DEFAULT_T
     if not last:
         logger.warning("⚠️ No hay smartcards registradas. Se recomienda usar descarga total.")
         return {'total_saved': 0}
-    
+
     highest_sn = last.sn
-    logger.info(f"🔍 Buscando smartcards posteriores al SN: {highest_sn}")
+    max_pages = PanaccessConfig.INCREMENTAL_SYNC_MAX_PAGES
+    logger.info(f"🔍 Buscando smartcards posteriores al SN: {highest_sn} (tope: {max_pages} páginas)")
     offset = 0
     total_saved = 0
+    pages_scanned = 0
     found = False
-    
+
     while True:
         retry_count = 0
         batch_processed = False
@@ -325,14 +341,24 @@ def download_smartcards_since_last(session_id=None, limit=100, timeout=DEFAULT_T
         if not batch_processed:
             logger.error(f"❌ No se pudo procesar el lote en offset {offset}")
             break
-        
+
         if found or not smartcard_entries:
             break
-        
+
+        pages_scanned += 1
+        if pages_scanned >= max_pages:
+            logger.error(
+                f"❌ Se alcanzó el tope de seguridad de {max_pages} páginas sin encontrar "
+                f"el SN de corte ({highest_sn}). Se aborta esta corrida para no escanear "
+                f"el catálogo completo cada vez; compare_and_update_all_smartcards() "
+                f"(tarea diaria/mensual) sincronizará lo que falte."
+            )
+            return {'total_saved': total_saved, 'checkpoint_found': False}
+
         offset += limit
-    
+
     logger.info(f"✅ Descarga incremental completada. Total guardados: {total_saved} smartcards nuevos")
-    return {'total_saved': total_saved}
+    return {'total_saved': total_saved, 'checkpoint_found': found}
 
 def compare_and_update_all_smartcards(session_id=None, limit=100, timeout=DEFAULT_TIMEOUT):
     """
